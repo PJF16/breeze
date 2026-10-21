@@ -137,6 +137,8 @@ const DEFAULT_CANDIDATE = {
   deviceOrgId: 'org-1',
   deviceStatus: 'online',
   orgType: 'customer',
+  deviceIncarnation: 1,
+  deviceInstallIncarnation: 1,
 };
 let candidateFor: ReturnType<typeof vi.fn>;
 function stubSingleClaimCandidate(
@@ -276,7 +278,7 @@ describe('command dispatch helpers', () => {
     expect(rejectWhere).toHaveBeenCalledTimes(1);
     expect(vi.mocked(notInArray)).toHaveBeenCalledWith(
       'deviceCommands.type',
-      ['peripheral_policy_sync_v2', 'agent_rollback_v1', 'pam_apply_v2', 'pam_cleanup_v2'],
+      ['peripheral_policy_sync_v2', 'agent_rollback_v1', 'pam_apply_v2', 'pam_cleanup_v2', 'pam_reconcile_v2'],
     );
   });
 
@@ -295,7 +297,7 @@ describe('command dispatch helpers', () => {
 
     expect(vi.mocked(notInArray)).toHaveBeenCalledWith(
       'deviceCommands.type',
-      ['agent_rollback_v1'],
+      ['agent_rollback_v1', 'pam_reconcile_v2'],
     );
   });
 
@@ -314,8 +316,19 @@ describe('command dispatch helpers', () => {
 
     expect(vi.mocked(notInArray)).toHaveBeenCalledWith(
       'deviceCommands.type',
-      ['pam_apply_v2', 'pam_cleanup_v2'],
+      ['pam_apply_v2', 'pam_cleanup_v2', 'pam_reconcile_v2'],
     );
+  });
+
+  it.each([undefined, 0, 2, 1])('gates reset on its independent protocol capability %s while PAM is unavailable', async (resetVersion) => {
+    const tx = { select: selectChain([]), update: vi.fn() };
+    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
+    await claimPendingCommandsForDevice('dev-1', 10, 'agent', undefined, {
+      peripheralPolicyProtocolVersion: 2, rollbackProtocolVersion: 1,
+      pamLifetimeProtocolVersion: 0, pamReconciliationResetProtocolVersion: resetVersion,
+    });
+    expect(vi.mocked(notInArray)).toHaveBeenCalledWith('deviceCommands.type',
+      resetVersion === 1 ? ['pam_apply_v2', 'pam_cleanup_v2'] : ['pam_apply_v2', 'pam_cleanup_v2', 'pam_reconcile_v2']);
   });
 
   it('expires a refused claim so no heartbeat claims it again and the reaper reports why', async () => {
@@ -557,7 +570,7 @@ describe('command dispatch helpers', () => {
       expect(partitionClaimableMock).toHaveBeenCalledTimes(1);
       const [tx, device, rows] = partitionClaimableMock.mock.calls[0]!;
       expect(tx).toBe(db);
-      expect(device).toEqual({ id: 'dev-1', orgId: 'org-2', status: 'online', orgType: 'customer' });
+      expect(device).toEqual({ id: 'dev-1', orgId: 'org-2', status: 'online', orgType: 'customer', installIncarnation: 1 });
       expect(rows).toEqual([
         expect.objectContaining({ id: 'cmd-1', type: 'script', createdBy: 'user-1', submittedOrgId: 'org-1' }),
       ]);

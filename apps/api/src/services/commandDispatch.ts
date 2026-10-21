@@ -10,6 +10,7 @@ import {
 import { isTransientLockError, pgErrorCode } from '../utils/pgErrors';
 import { terminalPayloadErasureSet } from './sensitiveCommandPayload';
 import { isUnassignedPoolOrgType } from './unassignedPool/orgType';
+import { commandIncarnationIsCurrentCondition } from './commandIncarnation';
 // Side-effect import: registers the `network_diagnostic` delivery
 // revalidation. Both delivery legs live in this module, so this is the one
 // place that guarantees it is loaded. `REVALIDATION_REQUIRED_TYPES` still
@@ -111,8 +112,10 @@ async function claimInSavepoint(commandId: string, executedAt: Date): Promise<Pu
         submittedOrgId: deviceCommands.submittedOrgId,
         deliverBy: deviceCommands.deliverBy,
         targetRole: deviceCommands.targetRole,
+        deviceIncarnation: deviceCommands.deviceIncarnation,
         deviceOrgId: devices.orgId,
         deviceStatus: devices.status,
+        deviceInstallIncarnation: devices.installIncarnation,
         orgType: organizations.type,
       })
       .from(deviceCommands)
@@ -154,11 +157,13 @@ async function claimInSavepoint(commandId: string, executedAt: Date): Promise<Pu
         orgId: candidate.deviceOrgId,
         status: candidate.deviceStatus,
         orgType: candidate.orgType,
+        installIncarnation: candidate.deviceInstallIncarnation,
       },
       [
         {
           id: candidate.id,
           type: candidate.type,
+          deviceIncarnation: candidate.deviceIncarnation,
           createdBy: candidate.createdBy,
           submittedOrgId: candidate.submittedOrgId,
           deliverBy: candidate.deliverBy,
@@ -184,6 +189,9 @@ async function claimInSavepoint(commandId: string, executedAt: Date): Promise<Pu
           // whose deadline has passed stays `pending` for the reaper to
           // terminalise with `reason: not_delivered_before_deadline`.
           or(isNull(deviceCommands.deliverBy), gt(deviceCommands.deliverBy, executedAt)),
+          // #8318: the incarnation, re-read in the flip itself, so a reattach
+          // that committed after the eligibility read above still wins.
+          commandIncarnationIsCurrentCondition(),
         ),
       )
       .returning({ id: deviceCommands.id });
@@ -308,6 +316,7 @@ export async function claimPendingCommandsForDevice(
     peripheralPolicyProtocolVersion?: number;
     rollbackProtocolVersion?: number;
     pamLifetimeProtocolVersion?: number;
+    pamReconciliationResetProtocolVersion?: number;
   },
 ): Promise<DeviceCommandRow[]> {
   // Only HTTP delivery paths (heartbeat responses) claim batches; the agent
@@ -359,6 +368,11 @@ export async function claimPendingCommandsForDevice(
     if (targetRole === 'agent' && capabilities?.pamLifetimeProtocolVersion !== 2) {
       unsupportedProtocolTypes.push('pam_apply_v2', 'pam_cleanup_v2');
     }
+    // Recovery must remain deliverable while the normal PAM capability is 0,
+    // but only builds implementing the evidence-preserving reset may claim it.
+    if (targetRole === 'agent' && capabilities?.pamReconciliationResetProtocolVersion !== 1) {
+      unsupportedProtocolTypes.push('pam_reconcile_v2');
+    }
 
     // A device parked in a holding org is claimed under the removal allowlist
     // (agentAuth narrows it), so the scan below never sees its other rows —
@@ -374,6 +388,7 @@ export async function claimPendingCommandsForDevice(
           orgId: devices.orgId,
           status: devices.status,
           orgType: organizations.type,
+          installIncarnation: devices.installIncarnation,
         })
         .from(devices)
         .innerJoin(organizations, eq(organizations.id, devices.orgId))
@@ -437,6 +452,7 @@ export async function claimPendingCommandsForDevice(
           orgId: devices.orgId,
           status: devices.status,
           orgType: organizations.type,
+          installIncarnation: devices.installIncarnation,
         })
         .from(devices)
         .innerJoin(organizations, eq(organizations.id, devices.orgId))
@@ -476,6 +492,8 @@ export async function claimPendingCommandsForDevice(
             eq(deviceCommands.deviceId, deviceId),
             eq(deviceCommands.status, 'pending'),
             eq(deviceCommands.targetRole, targetRole),
+            // #8318: re-read in the flip itself (see claimInSavepoint).
+            commandIncarnationIsCurrentCondition(),
           ),
         )
         .returning();

@@ -51,12 +51,33 @@ import { sanitizeAuditPayload, summarizePayload, summarizeToolResult } from '../
 import { compactToolResultForChat, redactAiToolOutputText } from '../services/aiToolOutput';
 import { redactToolOutputFields } from '../services/logRedaction';
 import { sanitizeThrownToolError } from '../services/aiToolErrors';
+import { callerRefusal } from '../services/callerVerification/refusal';
 import { resolveDeprecatedToolAlias } from '../services/aiToolAliases';
 import { MCP_SERVER_INSTRUCTIONS, listMcpPrompts, getMcpPrompt, hasMcpPrompt } from '../services/mcpGuidance';
 import { API_VERSION } from '../version';
 import { buildMcpToolPresentation } from '../services/mcpToolPresentation';
+import {
+  boundDeniedName,
+  buildDomainNotGrantedError,
+  isDomainGranted,
+  isMcpToolGranted,
+  MCP_TENANT_TOOL_DOMAIN,
+  mcpResourceDomain,
+  mcpToolDomain,
+  parseStoredMcpDomains,
+  type McpDomainGrant,
+} from '../services/mcpDomains';
+import type { AiToolDomain } from '@breeze/shared';
+import { MCP_WHOAMI_TOOL_NAME } from '../services/aiToolNames';
+import { isToolEnvGatedOff } from '../services/aiToolEnvGates';
+import { buildWhoamiResult, MCP_WHOAMI_TOOL_LIST_ENTRY } from '../services/mcpWhoami';
+import { applyInsufficientScopeChallenge, buildBearerChallenge } from '../services/mcpAuthChallenge';
 import { isToolWhollyMfaGated, mfaGateRefusesCaller, mfaGatedActionsForTool } from '../services/aiToolMfaGate';
-import { computeToolsListCatalogFingerprint, decodeToolsListCursor, encodeToolsListCursor, mcpToolsListPageSize, negotiateMcpProtocolVersion, parseMcpProtocolVersionHeader } from '../services/mcpProtocol';
+import { computeToolsListCatalogFingerprint, decodeToolsListCursor, encodeToolsListCursor, isModernMcpProtocolVersion, mcpStatelessEnabled, mcpToolsListPageSize, negotiateMcpProtocolVersion, parseMcpProtocolVersionHeader, type McpProtocolVersion } from '../services/mcpProtocol';
+import { classifyMcpRequest, validateJsonRpcEnvelope, type McpRejection, type ModernRequestMeta } from '../services/mcpModernEnvelope';
+import { buildDiscoverResult, decorateModernResult, recordMcpEraRejection, resolveMcpHttpStatus } from '../services/mcpModernResult';
+import { buildMcpRequestCorrelation, correlationAuditDetails, type McpRequestCorrelation } from '../services/mcpRequestCorrelation';
+import { checkMcpOrigin } from '../services/corsPolicy';
 import {
   beginMcpToolExecutionLedger,
   completeMcpToolExecutionLedger,
@@ -151,8 +172,8 @@ const MCP_MESSAGE_MAX_BODY_BYTES = envInt('MCP_MESSAGE_MAX_BODY_BYTES', 64 * 102
 
 function setWwwAuthenticate(c: Context) {
   if (!MCP_OAUTH_ENABLED) return;
-  const resourceUrl = `${OAUTH_ISSUER}/.well-known/oauth-protected-resource`;
-  c.header('WWW-Authenticate', `Bearer realm="breeze", resource_metadata="${resourceUrl}"`);
+  // B-W02 (#6156, D-B7): the challenge also names the mcp scopes.
+  c.header('WWW-Authenticate', buildBearerChallenge());
 }
 
 function requestIp(c: Context | undefined): string | null {
@@ -365,6 +386,10 @@ type McpApiKeyContext = {
   // Partner service principal (`brz_sp_` key) this request authenticated as;
   // `id` is then its partner_service_principal_keys row id.
   partnerServicePrincipalId?: string | null;
+  // B-W02 (#6156): MCP tool domains. `null` = unrestricted. REQUIRED: every
+  // MCP auth middleware sets it explicitly, and a value that is somehow
+  // missing at runtime fails CLOSED to core-only (parseStoredMcpDomains).
+  mcpDomains: readonly string[] | null;
 };
 
 type McpApiKeyWithAuthFields = McpApiKeyContext & {
@@ -419,10 +444,28 @@ function mcpPrincipalKey(apiKey: {
 
 const sseSessionQueues = new Map<string, { queue: Array<JsonRpcResponse>; principalKey: string; createdAt: number }>();
 
+/**
+ * B-W03 (#6157, D-B22): the 2024-11-05 HTTP+SSE transport (`GET /sse` +
+ * `POST /message`) is announced for removal. Deprecated by the spec since
+ * protocol 2025-03-26 (RFC 9745 `@<epoch>`); the Sunset (RFC 8594) is
+ * PROVISIONAL — recompute at release as the latest of release+90d,
+ * SEP-2596 Final+3 months, and this date. Legacy *Streamable HTTP*
+ * (`POST /sse`) is not deprecated and gets neither header.
+ */
+export const MCP_HTTP_SSE_DEPRECATION = '@1742947200';
+export const MCP_HTTP_SSE_SUNSET = 'Sun, 31 Jan 2027 23:59:59 GMT';
+
+function setHttpSseDeprecationHeaders(c: Context): void {
+  c.header('Deprecation', MCP_HTTP_SSE_DEPRECATION);
+  c.header('Sunset', MCP_HTTP_SSE_SUNSET);
+}
+
 mcpServerRoutes.get(
   '/sse',
   requireApiKeyScope('ai:read'),
   async (c) => {
+    setHttpSseDeprecationHeaders(c);
+    checkMcpOrigin(c, 'legacy');
     const apiKey = c.get('apiKey');
     const principalKey = mcpPrincipalKey(apiKey);
 
@@ -464,6 +507,26 @@ mcpServerRoutes.get(
 
     // Initialize queue for this session with ownership info
     sseSessionQueues.set(sessionId, { queue: [], principalKey, createdAt: Date.now() });
+
+    // D-B22: count usage at stream establishment — an idle legacy client
+    // never reaches dispatch, so per-request rows alone would miss it. The
+    // removal gate is 30 consecutive days of zero of these rows.
+    const openAuditOrgId =
+      apiKey.orgId ?? (apiKey.partnerId ? await resolveDefaultOrgId(apiKey.partnerId) : null);
+    writeAuditEvent(c, {
+      orgId: openAuditOrgId,
+      // Explicit: this route runs no auth-context middleware, so the audit
+      // writer could not derive the partner, and a partner-scoped key whose
+      // default org fails to resolve would otherwise write an unattributed row.
+      partnerId: apiKey.partnerId ?? null,
+      actorType: 'api_key',
+      actorId: apiKey.id,
+      action: 'mcp.transport.http_sse.open',
+      resourceType: 'mcp_transport',
+      resourceId: sessionId,
+      details: { transport: 'http_sse', principalKey, sunset: MCP_HTTP_SSE_SUNSET },
+      result: 'success',
+    });
 
     return streamSSE(c, async (stream) => {
       let alive = true;
@@ -583,13 +646,21 @@ async function preflightMcpRequest(
   if (parsedBody.parseError) {
     return { kind: 'response', status: 400, body: { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error: invalid JSON' } } };
   }
-  const body = parsedBody.body as JsonRpcRequest;
-
-  if (!body.jsonrpc || body.jsonrpc !== '2.0' || !body.method) {
-    return { kind: 'response', status: 400, body: { jsonrpc: '2.0', id: body?.id ?? null, error: { code: -32600, message: 'Invalid JSON-RPC request' } } satisfies JsonRpcResponse };
+  // B-W03 (#6157, D-B15): full envelope check before any field is
+  // dereferenced. JSON `null`, arrays, non-string/empty methods, object/null
+  // ids and non-object params used to throw (500) or slip through.
+  const envelope = validateJsonRpcEnvelope(parsedBody.body);
+  if (!envelope.ok) {
+    return { kind: 'response', status: 400, body: { jsonrpc: '2.0', id: envelope.id, error: { code: -32600, message: 'Invalid JSON-RPC request' } } satisfies JsonRpcResponse };
   }
+  const body = envelope.body as JsonRpcRequest;
 
   if (!apiKey || !apiKey.scopes.includes('ai:read')) {
+    // B-W02 (#6156, D-B7): a bearer learns which scope to re-authorize for.
+    // Additive (the status was already 403) and independent of the step-up flag.
+    if (apiKey?.oauthGrantId) {
+      c.header('WWW-Authenticate', buildBearerChallenge({ error: 'insufficient_scope', scope: ['mcp:read'] }));
+    }
     return { kind: 'response', status: 403, body: { jsonrpc: '2.0', id: body.id ?? null, error: { code: -32001, message: 'API key missing required scope: ai:read' } } satisfies JsonRpcResponse };
   }
 
@@ -650,14 +721,37 @@ async function buildCheckedAuthFromApiKey(
   return auth;
 }
 
+/**
+ * B-W02 (#6156, D-B11): a domain denial records WHAT was refused — the
+ * canonical tool (after alias resolution) or the resource URI — and its
+ * domain, so "who keeps hitting a domain they were not granted" is a query.
+ */
+function domainDenialAuditDetails(body: JsonRpcRequest, response: JsonRpcResponse): Record<string, unknown> {
+  const data = response.error?.data as { reason?: unknown; domain?: unknown } | undefined;
+  if (data?.reason !== 'domain_not_granted') return {};
+  const params = body.params ?? {};
+  const target = body.method === 'resources/read'
+    ? { resourceUri: typeof params.uri === 'string' ? boundDeniedName(params.uri) : null }
+    : { canonicalTool: typeof params.name === 'string' ? boundDeniedName(resolveDeprecatedToolAlias(params.name)) : null };
+  return { ...target, domain: data.domain, deniedReason: 'domain_not_granted' };
+}
+
+/**
+ * B-W03 (#6157, D-B19): per-request dispatch context. `correlation` replaces
+ * the bare transport session id: it carries a server-minted request UUID
+ * (the audit `resourceId`) plus the verified legacy session, if any.
+ */
+type McpDispatchContext = { era: 'legacy' | 'modern'; correlation: McpRequestCorrelation };
+
 async function dispatchAndAudit(
   c: Context,
   body: JsonRpcRequest,
-  sessionId: string | undefined,
+  ctx: McpDispatchContext,
   auth: AuthContext,
   apiKey: McpApiKeyWithAuthFields,
 ): Promise<JsonRpcResponse> {
-  const response = await handleJsonRpc(body, auth, apiKey.scopes, apiKey, c, sessionId);
+  const response = await handleJsonRpc(body, auth, apiKey.scopes, apiKey, c, ctx);
+  const sessionId = ctx.correlation.sessionId;
 
   // OAuth-bearer callers carry partner-scope tokens with apiKey.orgId=null
   // by design (partner admins span every org). Without the fallback, every
@@ -671,14 +765,22 @@ async function dispatchAndAudit(
     actorId: apiKey.id,
     action: buildMcpAuditAction(body.method),
     resourceType: 'mcp_request',
-    resourceId: sessionId,
+    resourceId: ctx.correlation.requestId,
     details: {
       method: body.method,
       hasSession: Boolean(sessionId),
-      hasParams: Boolean(body.params),
+      // Kept for legacy triage queries; the modern era never has one.
+      ...(sessionId ? { sessionId } : {}),
+      // The stateless era always sends `params._meta`; count only real params
+      // there so the field means the same thing in both eras (D-B16 parity).
+      hasParams: ctx.era === 'modern'
+        ? Object.keys(body.params ?? {}).some((key) => key !== '_meta')
+        : Boolean(body.params),
       ...(apiKey.partnerServicePrincipalId
         ? { principalType: 'partner_service_principal', partnerServicePrincipalId: apiKey.partnerServicePrincipalId }
         : {}),
+      ...domainDenialAuditDetails(body, response),
+      ...correlationAuditDetails(ctx.correlation),
     },
     result: response.error ? 'failure' : 'success',
     errorMessage: response.error?.message,
@@ -687,12 +789,51 @@ async function dispatchAndAudit(
   return response;
 }
 
+/** SEP-2243 routing headers, raw (decoding happens in the classifier). */
+function readMcpRequestHeaders(c: Context) {
+  return {
+    protocolVersion: c.req.header('MCP-Protocol-Version'),
+    method: c.req.header('Mcp-Method'),
+    name: c.req.header('Mcp-Name'),
+  };
+}
+
+/** Body carries the stateless `_meta` version, or the header names a modern version. */
+function presentsAsStateless(c: Context, body: JsonRpcRequest): boolean {
+  const meta = body.params?._meta;
+  const metaHasVersion = typeof meta === 'object' && meta !== null && !Array.isArray(meta)
+    && (meta as Record<string, unknown>)['io.modelcontextprotocol/protocolVersion'] !== undefined;
+  return metaHasVersion || isModernMcpProtocolVersion(c.req.header('MCP-Protocol-Version'));
+}
+
+/** A pre-dispatch era rejection (D-B13/D-B15): its own status, never dispatched. */
+function mcpRejectionResponse(c: Context, body: JsonRpcRequest, rejection: McpRejection): Response {
+  recordMcpEraRejection(rejection.reason);
+  return c.json({ jsonrpc: '2.0', id: body.id ?? null, error: rejection.error }, rejection.status);
+}
+
 mcpServerRoutes.post(
   '/message',
   async (c) => {
+    setHttpSseDeprecationHeaders(c);
+    checkMcpOrigin(c, 'legacy');
     const sessionIdFromQuery = c.req.query('sessionId');
     const pre = await preflightMcpRequest(c, sessionIdFromQuery);
     if (pre.kind === 'response') return c.json(pre.body, pre.status as 400 | 403 | 413 | 429 | 503);
+
+    // B-W03 (#6157): the legacy HTTP+SSE endpoint never serves a stateless
+    // envelope (D-B13 row 3); before this, one would dispatch unvalidated.
+    const decision = classifyMcpRequest({
+      body: pre.body,
+      headers: readMcpRequestHeaders(c),
+      statelessEnabled: mcpStatelessEnabled(),
+      endpoint: 'legacy_message',
+    });
+    if (decision.era === 'reject') return mcpRejectionResponse(c, pre.body, decision.rejection);
+    if (decision.era !== 'legacy') {
+      // Unreachable by the decision table; fail closed rather than dispatch.
+      return c.json({ jsonrpc: '2.0', id: pre.body.id ?? null, error: { code: -32600, message: 'Invalid request for this endpoint' } }, 400);
+    }
 
     const apiKey = c.get('apiKey') as McpApiKeyWithAuthFields;
     const principalKey = mcpPrincipalKey(apiKey);
@@ -738,7 +879,17 @@ mcpServerRoutes.post(
     const auth = await buildCheckedAuthFromApiKey(c, apiKey);
     if (auth instanceof Response) return auth;
 
-    const response = await dispatchAndAudit(c, pre.body, trustedSessionId, auth, apiKey);
+    const headerVersion = parseMcpProtocolVersionHeader(c.req.header('MCP-Protocol-Version'));
+    const correlation = buildMcpRequestCorrelation({
+      era: 'legacy',
+      // HTTP+SSE is the 2024-11-05 transport; honour an explicit header only.
+      protocolVersion: headerVersion.ok && !headerVersion.assumed ? headerVersion.version : '2024-11-05',
+      transport: 'http_sse',
+      sessionId: trustedSessionId ?? null,
+      principalKey,
+      apiKeyId: apiKey.id,
+    });
+    const response = await dispatchAndAudit(c, pre.body, { era: 'legacy', correlation }, auth, apiKey);
 
     // Legacy SSE transport: if the request carries a verified-owned sessionId
     // pointing at an active SSE stream, push the response into that stream
@@ -747,12 +898,15 @@ mcpServerRoutes.post(
     if (trustedSessionId) {
       const session = sseSessionQueues.get(trustedSessionId);
       if (session && session.principalKey === principalKey) {
+        // The 2024-11-05 HTTP+SSE transport predates MCP authorization: the
+        // error is delivered on the stream and the POST stays 202, never a
+        // step-up 403 (plan Open Decision 2, default A).
         session.queue.push(response);
         return c.json({ status: 'accepted' }, 202);
       }
     }
 
-    return c.json(response);
+    return c.json(response, applyInsufficientScopeChallenge(c, apiKey, response));
   }
 );
 
@@ -857,6 +1011,25 @@ mcpServerRoutes.post(
     const pre = await preflightMcpRequest(c, undefined);
     if (pre.kind === 'response') return c.json(pre.body, pre.status as 400 | 403 | 413 | 429 | 503);
 
+    // D-B23: an invalid Origin is 403 for anything that presents as the
+    // stateless era — checked BEFORE classification so a malformed stateless
+    // request from a bad Origin still gets 403, not a 400. Legacy-looking
+    // requests are log-only (Open Decision 4, default A).
+    const originDenied = checkMcpOrigin(c, presentsAsStateless(c, pre.body) ? 'modern' : 'legacy');
+    if (originDenied) return originDenied;
+
+    // B-W03 (#6157, D-B13): one era decision per request. The flag is read
+    // once here and that snapshot drives both classification and every
+    // advertised version list.
+    const decision = classifyMcpRequest({
+      body: pre.body,
+      headers: readMcpRequestHeaders(c),
+      statelessEnabled: mcpStatelessEnabled(),
+      endpoint: 'streamable',
+    });
+    if (decision.era === 'reject') return mcpRejectionResponse(c, pre.body, decision.rejection);
+    if (decision.era === 'modern') return handleModernStreamableRequest(c, pre.body, decision.meta);
+
     const apiKey = c.get('apiKey') as McpApiKeyWithAuthFields;
     const principalKey = mcpPrincipalKey(apiKey);
     const isInitialize = pre.body.method === 'initialize';
@@ -864,7 +1037,10 @@ mcpServerRoutes.post(
     // on every request after initialize; an unsupported value is a 400. Absent
     // = assume 2025-03-26 (backwards compatibility). Initialize itself carries
     // the version in params, so the header is not checked there.
-    if (!isInitialize) {
+    let legacyProtocolVersion: McpProtocolVersion;
+    if (isInitialize) {
+      legacyProtocolVersion = negotiateMcpProtocolVersion(pre.body.params?.protocolVersion);
+    } else {
       const parsed = parseMcpProtocolVersionHeader(c.req.header('MCP-Protocol-Version'));
       if (!parsed.ok) {
         return c.json(
@@ -872,6 +1048,7 @@ mcpServerRoutes.post(
           400,
         );
       }
+      legacyProtocolVersion = parsed.version;
     }
     const redis = getRedis();
 
@@ -995,17 +1172,68 @@ mcpServerRoutes.post(
     const auth = await buildCheckedAuthFromApiKey(c, apiKey);
     if (auth instanceof Response) return auth;
 
+    const correlation = buildMcpRequestCorrelation({
+      era: 'legacy',
+      protocolVersion: legacyProtocolVersion,
+      transport: 'streamable_http',
+      sessionId: trustedSessionId ?? null,
+      principalKey,
+      apiKeyId: apiKey.id,
+      rawClientInfo: isInitialize ? pre.body.params?.clientInfo : undefined,
+    });
+    const dispatchCtx: McpDispatchContext = { era: 'legacy', correlation };
+
     if (pre.body.id === undefined) {
-      void dispatchAndAudit(c, pre.body, trustedSessionId, auth, apiKey).catch((err) => {
+      void dispatchAndAudit(c, pre.body, dispatchCtx, auth, apiKey).catch((err) => {
         console.error('[MCP] notification handler error:', err);
       });
       return c.body(null, 202);
     }
 
-    const response = await dispatchAndAudit(c, pre.body, trustedSessionId, auth, apiKey);
-    return c.json(response);
+    const response = await dispatchAndAudit(c, pre.body, dispatchCtx, auth, apiKey);
+    return c.json(response, applyInsufficientScopeChallenge(c, apiKey, response));
   }
 );
+
+/**
+ * B-W03 (#6157): the stateless `2026-07-28` era on `POST /sse`.
+ *
+ * Same gates as legacy — `buildCheckedAuthFromApiKey` (creator authority,
+ * partner IP allowlist) and the audited dispatcher — so every denial is
+ * byte-identical across eras (D-B16). It never reads, mints or echoes
+ * `Mcp-Session-Id` and never touches the session store; correlation is the
+ * principal plus a server-minted request id (D-B19).
+ */
+async function handleModernStreamableRequest(
+  c: Context,
+  body: JsonRpcRequest,
+  meta: ModernRequestMeta,
+): Promise<Response> {
+  const apiKey = c.get('apiKey') as McpApiKeyWithAuthFields;
+  const correlation = buildMcpRequestCorrelation({
+    era: 'modern',
+    protocolVersion: meta.protocolVersion,
+    transport: 'streamable_http',
+    sessionId: null,
+    principalKey: mcpPrincipalKey(apiKey),
+    apiKeyId: apiKey.id,
+    rawClientInfo: meta.clientInfo,
+  });
+
+  const auth = await buildCheckedAuthFromApiKey(c, apiKey);
+  if (auth instanceof Response) return auth;
+
+  // A notification has no response; nothing in the modern method set has a
+  // side effect worth dispatching one for (D-B17).
+  if (body.id === undefined) return c.body(null, 202);
+
+  const response = await dispatchAndAudit(c, body, { era: 'modern', correlation }, auth, apiKey);
+  const status = resolveMcpHttpStatus('modern', response, applyInsufficientScopeChallenge(c, apiKey, response));
+  const decorated: JsonRpcResponse = response.result !== undefined
+    ? { ...response, result: decorateModernResult(body.method, response.result as Record<string, unknown>) }
+    : response;
+  return c.json(decorated, status);
+}
 
 mcpServerRoutes.delete('/sse', (c) => {
   // Streamable HTTP DELETE — terminate session. Stateless server, so 204.
@@ -1037,30 +1265,41 @@ async function handleJsonRpc(
   req: JsonRpcRequest,
   auth: AuthContext,
   scopes: string[],
-  apiKey?: McpApiKeyContext,
-  c?: Context,
-  sessionId?: string,
+  apiKey: McpApiKeyContext | undefined,
+  c: Context | undefined,
+  ctx: McpDispatchContext,
 ): Promise<JsonRpcResponse> {
   try {
+    // B-W03 (#6157, D-B17): lifecycle methods are per era. In the stateless
+    // era `initialize` / `notifications/initialized` do not exist and
+    // `server/discover` replaces them; each falls through to -32601 in the
+    // other era (still audited by the caller).
+    if (ctx.era === 'legacy' && req.method === 'initialize') {
+      return jsonRpcResult(req.id, buildInitializeResult((req.params as { protocolVersion?: unknown } | undefined)?.protocolVersion));
+    }
+    if (ctx.era === 'legacy' && req.method === 'notifications/initialized') {
+      // Client acknowledgment — no response needed but return empty result
+      return jsonRpcResult(req.id, {});
+    }
+    if (ctx.era === 'modern' && req.method === 'server/discover') {
+      return jsonRpcResult(req.id, buildDiscoverResult());
+    }
+
     switch (req.method) {
-      case 'initialize':
-        return jsonRpcResult(req.id, buildInitializeResult((req.params as { protocolVersion?: unknown } | undefined)?.protocolVersion));
-
-      case 'notifications/initialized':
-        // Client acknowledgment — no response needed but return empty result
-        return jsonRpcResult(req.id, {});
-
       case 'tools/list':
         return await handleToolsList(req.id, scopes, auth, req.params, apiKey);
 
       case 'tools/call':
-        return await handleToolsCall(req.id, req.params ?? {}, auth, scopes, apiKey, c, sessionId);
+        return await handleToolsCall(req.id, req.params ?? {}, auth, scopes, apiKey, c, ctx.correlation);
 
       case 'resources/list':
-        return handleResourcesList(req.id);
+        return handleResourcesList(req.id, parseStoredMcpDomains(apiKey?.mcpDomains));
+
+      case 'resources/templates/list':
+        return handleResourceTemplatesList(req.id, parseStoredMcpDomains(apiKey?.mcpDomains));
 
       case 'resources/read':
-        return await handleResourcesRead(req.id, req.params ?? {}, auth);
+        return await handleResourcesRead(req.id, req.params ?? {}, auth, parseStoredMcpDomains(apiKey?.mcpDomains));
 
       case 'prompts/list':
         return handlePromptsList(req.id);
@@ -1310,6 +1549,10 @@ async function handleToolsList(
   apiKey?: McpApiKeyContext,
 ): Promise<JsonRpcResponse> {
   const unattendedPrincipal = isUnattendedTier3PrincipalOverMcp(apiKey);
+  // B-W02 (#6156): per-grant tool domains — a second axis on the SAME filter,
+  // applied after every existing gate. Listed ⇒ callable: handleToolsCall
+  // applies the identical predicate to the canonical name.
+  const domainGrant = parseStoredMcpDomains(apiKey?.mcpDomains);
   const allTools = getToolDefinitions();
   const hasExecute = scopes.includes('ai:execute');
   const requireExecuteAdmin = shouldRequireExecuteAdminInProd();
@@ -1330,6 +1573,8 @@ async function handleToolsList(
 
   // Filter tools based on API key scopes.
   const scopedTools = allTools.filter((tool) => {
+    // Deployment kill switch (e.g. FLOWS_ENABLED): never listed when off.
+    if (isToolEnvGatedOff(tool.name)) return false;
     // A wholly-gated tool (every possible invocation resolves to a gated
     // tier — see isToolWhollyGatedOverMcp) is never advertised: every call to
     // it would be denied by the tools/call gate below, so listing it is
@@ -1341,6 +1586,8 @@ async function handleToolsList(
     const registryTier = getToolTier(tool.name);
     if (registryTier === undefined) return false;
     const tier = Math.max(registryTier, mcpTierFloor(tool.name));
+
+    if (!isMcpToolGranted(domainGrant, tool.name)) return false;
 
     // Tier 1 (read-only) = ai:read is enough
     if (tier <= 1) return true;
@@ -1385,6 +1632,11 @@ async function handleToolsList(
     };
   });
 
+  // B-W02 (#6156, #2550): `whoami` is server-intrinsic, tier 1 and domain
+  // `core` — listed for every principal (including a core-only grant) and
+  // sorted with the registry tools below.
+  result.push({ ...MCP_WHOAMI_TOOL_LIST_ENTRY });
+
   // Bootstrap auth tools (send_deployment_invites, configure_defaults) live
   // outside the main registry and carry a FIXED Tier 3 classification, so
   // `isMcpApprovalRequired(name, 3)` is unconditionally true for every one of
@@ -1416,6 +1668,8 @@ async function handleToolsList(
       // (MCP_UNATTENDED_TIER3_PRINCIPALS does not apply to tenant tools — see
       // handleTenantToolCall.)
       .filter((d) => d.tier <= 1 || (d.tier === 2 && hasWrite))
+      // B-W02 (#6156): tenant (BYO MCP) tools are the `integrations` domain.
+      .filter(() => isDomainGranted(domainGrant, MCP_TENANT_TOOL_DOMAIN))
       .map((d) => ({
         ...buildMcpToolPresentation(d.definition, d.tier, 'integrations', { external: true }),
         name: d.definition.name,
@@ -1506,14 +1760,20 @@ function structuredFromSafeText(safeText: string): Record<string, unknown> | und
   }
 }
 
+// B-W02 (#6156, D-B7): ONLY the two tier-scope denials carry this reason —
+// the one thing a client can fix by re-authorizing with a wider mcp scope.
+// ai:execute_admin, approval, MFA, RBAC, allowlist and domain denials never do.
+const INSUFFICIENT_SCOPE_EXECUTE = { reason: 'insufficient_scope', requiredScope: 'ai:execute' } as const;
+const INSUFFICIENT_SCOPE_WRITE = { reason: 'insufficient_scope', requiredScope: 'ai:write' } as const;
+
 async function handleToolsCall(
   id: string | number,
   params: Record<string, unknown>,
   auth: AuthContext,
   scopes: string[],
-  apiKey?: McpApiKeyContext,
-  c?: Context,
-  sessionId?: string,
+  apiKey: McpApiKeyContext | undefined,
+  c: Context | undefined,
+  correlation: McpRequestCorrelation,
 ): Promise<JsonRpcResponse> {
   const requestedToolName = params.name as string;
   const toolInput = (params.arguments ?? {}) as Record<string, unknown>;
@@ -1522,13 +1782,16 @@ async function handleToolsCall(
     return jsonRpcError(id, -32602, 'Missing required parameter: name');
   }
 
+  // B-W02 (#6156): parsed once per call; a missing value fails closed.
+  const domainGrant = parseStoredMcpDomains(apiKey?.mcpDomains);
+
   // Tenant (BYO MCP) tools — Task A10. Named `<slug>__<name>` (never true of
   // any core registry name — asserted by aiToolsRegistryParity.test.ts), so
   // the dispatch is unambiguous by name shape alone. Handled by its own path
   // entirely: it never touches getToolTier/checkGuardrails/checkToolPermission,
   // which know nothing about tenant tools.
   if (isTenantToolName(requestedToolName)) {
-    return handleTenantToolCall(id, requestedToolName, toolInput, auth, scopes, apiKey, c, sessionId);
+    return handleTenantToolCall(id, requestedToolName, toolInput, auth, scopes, domainGrant, apiKey, c, correlation);
   }
 
   // Resolve deprecated tool names ONCE, here, before any name-keyed gate below
@@ -1544,11 +1807,38 @@ async function handleToolsCall(
     );
   }
 
+  // Deployment kill switch (e.g. FLOWS_ENABLED): answered exactly like an
+  // unknown tool, before the domain gate, so it is not an existence oracle.
+  if (isToolEnvGatedOff(toolName)) return jsonRpcError(id, -32602, `Unknown tool: ${toolName}`);
+
+  // B-W02 (#6156, #2550): `whoami` is core (always domain-granted) and tier 1
+  // (any principal that got past the ai:read preflight may call it). Pure:
+  // it reports what the gates below would decide, it does not bypass them.
+  if (toolName === MCP_WHOAMI_TOOL_NAME) {
+    return handleWhoamiCall(id, auth, scopes, domainGrant, apiKey);
+  }
+
   // Bootstrap auth tools (send_deployment_invites, configure_defaults) live
   // outside the main aiTools registry but dispatch through this authed path.
   const bootstrapAuthTool = bootstrapModule?.authTools.find(
     (t) => t.definition.name === toolName,
   );
+
+  // B-W02 (#6156) domain gate, on the CANONICAL name (so a deprecated alias
+  // cannot reach a domain its grant lacks) and BEFORE the bootstrap branch,
+  // guardrails and every other gate — a restricted principal learns nothing
+  // about a tool outside its grant. It only ever adds a denial; the approval,
+  // scope, allowlist, RBAC and rate-limit gates below still run for anything
+  // it lets through. A name no registry knows keeps today's "Unknown tool"
+  // answer, so the gate is never an oracle for which tool names exist.
+  if (domainGrant.restricted && (bootstrapAuthTool || getToolTier(toolName) !== undefined)) {
+    const domain = mcpToolDomain(toolName);
+    if (!isDomainGranted(domainGrant, domain)) {
+      const denial = buildDomainNotGrantedError(toolName, domain);
+      return jsonRpcError(id, denial.code, denial.message, denial.data);
+    }
+  }
+
   if (bootstrapAuthTool) {
     // Onboarding-only tools: the unattended opt-in does not apply (they are
     // never listed, so listed ⇒ callable holds).
@@ -1566,7 +1856,7 @@ async function handleToolsCall(
       scopes,
       apiKey,
       c,
-      sessionId,
+      correlation,
     );
   }
 
@@ -1640,13 +1930,13 @@ async function handleToolsCall(
   const hasWrite = hasExecute || scopes.includes('ai:write');
 
   if (tier >= 3 && !hasExecute) {
-    return jsonRpcError(id, -32603, `Tool "${toolName}" requires ai:execute scope`);
+    return jsonRpcError(id, -32603, `Tool "${toolName}" requires ai:execute scope`, INSUFFICIENT_SCOPE_EXECUTE);
   }
   if (tier >= 3 && requireExecuteAdmin && !hasExecuteAdmin) {
     return jsonRpcError(id, -32603, `Tool "${toolName}" requires ai:execute_admin scope in production`);
   }
   if (tier === 2 && !hasWrite) {
-    return jsonRpcError(id, -32603, `Tool "${toolName}" requires ai:write scope`);
+    return jsonRpcError(id, -32603, `Tool "${toolName}" requires ai:write scope`, INSUFFICIENT_SCOPE_WRITE);
   }
 
   // In production, enforce tool allowlist for tier 3+ (destructive) tools
@@ -1799,8 +2089,11 @@ async function handleToolsCall(
 
       return { status: 'success', ledgerResult: safeResult, response };
     } catch (err) {
-      const message = sanitizeThrownToolError(toolName, err);
-      const safeError = compactToolResultForChat(toolName, JSON.stringify({ error: message }));
+      // Typed caller-verification refusal: emit the gate's payload intact (no
+      // message/stack, so nothing to sanitise) instead of a generic error.
+      const refusal = callerRefusal(err);
+      const message = refusal ? refusal.error : sanitizeThrownToolError(toolName, err);
+      const safeError = compactToolResultForChat(toolName, JSON.stringify(refusal ?? { error: message }));
       return {
         status: 'failure',
         error: err,
@@ -1815,7 +2108,7 @@ async function handleToolsCall(
       c,
       auth,
       apiKey,
-      sessionId,
+      correlation,
       orgId: executionOrgId,
       toolName,
       requestedToolName,
@@ -1825,6 +2118,38 @@ async function handleToolsCall(
     },
     execute,
   );
+}
+
+function handleWhoamiCall(
+  id: string | number,
+  auth: AuthContext,
+  scopes: string[],
+  domainGrant: McpDomainGrant,
+  apiKey?: McpApiKeyContext,
+): JsonRpcResponse {
+  const name = (apiKey as { name?: unknown } | undefined)?.name;
+  const principal = apiKey?.oauthGrantId
+    ? { kind: 'oauth' as const, id: apiKey.oauthGrantId, clientId: apiKey.oauthClientId ?? null }
+    : apiKey?.partnerServicePrincipalId
+      ? { kind: 'partner_service_principal' as const, id: apiKey.partnerServicePrincipalId, clientId: null }
+      : { kind: 'api_key' as const, id: apiKey?.id ?? 'unknown', clientId: null };
+  const unattendedPrincipal = isUnattendedTier3PrincipalOverMcp(apiKey);
+  const result = buildWhoamiResult({
+    principal: { ...principal, name: typeof name === 'string' ? name : null },
+    tenant: {
+      scope: auth.scope === 'partner' ? 'partner' : 'organization',
+      partnerId: auth.partnerId ?? apiKey?.partnerId ?? null,
+      orgId: auth.orgId ?? apiKey?.orgId ?? null,
+    },
+    scopes: scopes.filter((scope) => scope.startsWith('ai:')),
+    domainGrant,
+    approvalGate: { tier3RequiresWebApp: !unattendedPrincipal, unattendedPrincipal },
+    mfaGatedActionsUnavailable: mfaGateRefusesCaller(auth),
+  });
+  return jsonRpcResult(id, {
+    content: [{ type: 'text', text: JSON.stringify(result) }],
+    structuredContent: result,
+  });
 }
 
 /**
@@ -1846,10 +2171,19 @@ async function handleTenantToolCall(
   toolInput: Record<string, unknown>,
   auth: AuthContext,
   scopes: string[],
-  apiKey?: McpApiKeyContext,
-  c?: Context,
-  sessionId?: string,
+  domainGrant: McpDomainGrant,
+  apiKey: McpApiKeyContext | undefined,
+  c: Context | undefined,
+  correlation: McpRequestCorrelation,
 ): Promise<JsonRpcResponse> {
+  // B-W02 (#6156): tenant tools are the `integrations` domain. Checked first,
+  // before any resolution: the answer depends only on the name SHAPE, so it
+  // reveals nothing about which tenant tools exist.
+  if (!isDomainGranted(domainGrant, MCP_TENANT_TOOL_DOMAIN)) {
+    const denial = buildDomainNotGrantedError(toolName, MCP_TENANT_TOOL_DOMAIN);
+    return jsonRpcError(id, denial.code, denial.message, denial.data);
+  }
+
   // Authoritative execution org — same resolver core tools use. Tenant tools
   // have no `deviceArgs` of their own, so device-target resolution is a no-op
   // and this always falls back to the attribution-only path. Resolved FIRST
@@ -1924,13 +2258,13 @@ async function handleTenantToolCall(
   const hasWrite = hasExecute || scopes.includes('ai:write');
 
   if (tier >= 3 && !hasExecute) {
-    return jsonRpcError(id, -32603, `Tool "${toolName}" requires ai:execute scope`);
+    return jsonRpcError(id, -32603, `Tool "${toolName}" requires ai:execute scope`, INSUFFICIENT_SCOPE_EXECUTE);
   }
   if (tier >= 3 && requireExecuteAdmin && !hasExecuteAdmin) {
     return jsonRpcError(id, -32603, `Tool "${toolName}" requires ai:execute_admin scope in production`);
   }
   if (tier === 2 && !hasWrite) {
-    return jsonRpcError(id, -32603, `Tool "${toolName}" requires ai:write scope`);
+    return jsonRpcError(id, -32603, `Tool "${toolName}" requires ai:write scope`, INSUFFICIENT_SCOPE_WRITE);
   }
   // RBAC permission check
   try {
@@ -1964,7 +2298,7 @@ async function handleTenantToolCall(
   writeMcpToolAuditEvent(c, {
     apiKey,
     auth,
-    sessionId,
+    correlation,
     orgId: executionOrgId,
     toolName,
     tier,
@@ -2020,7 +2354,7 @@ function writeMcpToolAuditEvent(
   event: {
     apiKey?: McpApiKeyContext;
     auth: AuthContext;
-    sessionId?: string;
+    correlation: McpRequestCorrelation;
     orgId?: string | null;
     toolName: string;
     /** Deprecated alias the client sent, when it differed from `toolName`. */
@@ -2049,11 +2383,13 @@ function writeMcpToolAuditEvent(
     actorId: event.apiKey.id,
     action: `mcp.tool.${event.toolName}`.slice(0, 100),
     resourceType: 'mcp_tool_execution',
-    resourceId: event.sessionId,
+    // B-W03 (#6157, D-B19): the server-minted request id, shared with the
+    // request audit row and both ledger representations.
+    resourceId: event.correlation.requestId,
     result: event.status === 'success' ? 'success' : 'failure',
     errorMessage: error ? redactAiToolOutputText(error.message).slice(0, 1000) : undefined,
     details: {
-      sessionId: event.sessionId ?? null,
+      sessionId: event.correlation.sessionId,
       approvalId: null,
       ...(event.approvalBypassPrincipal
         ? { approvalBypass: 'unattended_principal', approvalBypassPrincipal: event.approvalBypassPrincipal }
@@ -2074,6 +2410,7 @@ function writeMcpToolAuditEvent(
       durationMs: event.durationMs,
       ...(event.result ? { result: summarizeToolResult(event.result, { maxStringLength: 500 }) } : {}),
       ...(error ? { errorClass: error.name } : {}),
+      ...correlationAuditDetails(event.correlation),
     },
   });
 }
@@ -2087,7 +2424,7 @@ interface Tier3LifecycleContext {
   c: Context | undefined;
   auth: AuthContext;
   apiKey: McpApiKeyContext | undefined;
-  sessionId: string | undefined;
+  correlation: McpRequestCorrelation;
   /** Authoritative execution org (resolveMcpExecutionContext / bootstrap default). */
   orgId: string | null;
   toolName: string;
@@ -2156,7 +2493,9 @@ async function runTier3ToolLifecycle(
         toolName: ctx.toolName,
         tier: ctx.tier,
         toolInput: ctx.toolInput,
-        transportSessionId: ctx.sessionId ?? null,
+        transportSessionId: ctx.correlation.sessionId,
+        transportRequestId: ctx.correlation.requestId,
+        era: ctx.correlation.era,
         principal: {
           apiKeyId: ctx.apiKey.id,
           oauthGrantId: ctx.apiKey.oauthGrantId ?? null,
@@ -2216,7 +2555,7 @@ async function finalizeTier3ToolLifecycle(
   writeMcpToolAuditEvent(ctx.c, {
     apiKey: ctx.apiKey,
     auth: ctx.auth,
-    sessionId: ctx.sessionId,
+    correlation: ctx.correlation,
     orgId: ctx.orgId,
     toolName: ctx.toolName,
     requestedToolName: ctx.requestedToolName,
@@ -2277,7 +2616,7 @@ async function dispatchBootstrapAuthTool(
   scopes: string[],
   apiKey: McpApiKeyContext | undefined,
   c: Context | undefined,
-  sessionId: string | undefined,
+  correlation: McpRequestCorrelation,
 ): Promise<JsonRpcResponse> {
   const hasExecute = scopes.includes('ai:execute');
   const requireExecuteAdmin = shouldRequireExecuteAdminInProd();
@@ -2446,7 +2785,7 @@ async function dispatchBootstrapAuthTool(
       c,
       auth,
       apiKey,
-      sessionId,
+      correlation,
       orgId: resolvedOrgId,
       toolName: tool.definition.name,
       tier: BOOTSTRAP_TOOL_TIER,
@@ -2460,36 +2799,57 @@ async function dispatchBootstrapAuthTool(
 // resources/list
 // ============================================
 
-function handleResourcesList(id: string | number): JsonRpcResponse {
+function handleResourcesList(id: string | number, domainGrant: McpDomainGrant): JsonRpcResponse {
   return jsonRpcResult(id, {
-    resources: [
-      {
-        uri: 'breeze://devices',
-        name: 'Device Inventory',
-        description: 'List of all managed devices',
-        mimeType: 'application/json'
-      },
-      {
-        uri: 'breeze://alerts',
-        name: 'Active Alerts',
-        description: 'Currently active alerts across all devices',
-        mimeType: 'application/json'
-      },
-      {
-        uri: 'breeze://scripts',
-        name: 'Script Library',
-        description: 'Available scripts for execution',
-        mimeType: 'application/json'
-      },
-      {
-        uri: 'breeze://automations',
-        name: 'Automation Rules',
-        description: 'Configured automation rules',
-        mimeType: 'application/json'
-      }
-    ]
+    // B-W02 (#6156): filtered by resource domain; resources/read applies the
+    // same predicate (listed ⇒ readable).
+    resources: MCP_RESOURCE_LIST.filter((r) => isDomainGranted(domainGrant, mcpResourceDomain(r.uri))),
   });
 }
+
+/**
+ * B-W03 (#6157, D-B17): additive in both eras. Each template carries its
+ * domain so the list is filtered with the same predicate `resources/read`
+ * applies (listed ⇒ readable); the domain is never sent to the client.
+ */
+const MCP_RESOURCE_TEMPLATE_LIST: ReadonlyArray<{ uriTemplate: string; name: string; mimeType: string; domain: AiToolDomain }> = [
+  { uriTemplate: 'breeze://devices/{id}', name: 'Device Detail', mimeType: 'application/json', domain: 'devices' },
+];
+
+function handleResourceTemplatesList(id: string | number, domainGrant: McpDomainGrant): JsonRpcResponse {
+  return jsonRpcResult(id, {
+    resourceTemplates: MCP_RESOURCE_TEMPLATE_LIST
+      .filter((t) => isDomainGranted(domainGrant, t.domain))
+      .map(({ domain: _domain, ...template }) => template),
+  });
+}
+
+const MCP_RESOURCE_LIST = [
+  {
+    uri: 'breeze://devices',
+    name: 'Device Inventory',
+    description: 'List of all managed devices',
+    mimeType: 'application/json'
+  },
+  {
+    uri: 'breeze://alerts',
+    name: 'Active Alerts',
+    description: 'Currently active alerts across all devices',
+    mimeType: 'application/json'
+  },
+  {
+    uri: 'breeze://scripts',
+    name: 'Script Library',
+    description: 'Available scripts for execution',
+    mimeType: 'application/json'
+  },
+  {
+    uri: 'breeze://automations',
+    name: 'Automation Rules',
+    description: 'Configured automation rules',
+    mimeType: 'application/json'
+  }
+];
 
 // ============================================
 // prompts/list, prompts/get
@@ -2649,7 +3009,8 @@ export function dualAxisResourceCondition(
 async function handleResourcesRead(
   id: string | number,
   params: Record<string, unknown>,
-  auth: AuthContext
+  auth: AuthContext,
+  domainGrant: McpDomainGrant,
 ): Promise<JsonRpcResponse> {
   const uri = params.uri as string;
   if (!uri) {
@@ -2663,6 +3024,14 @@ async function handleResourcesRead(
   const requiredPermission = findMcpResourcePermission(uri);
   if (!requiredPermission) {
     return jsonRpcError(id, -32602, `Unknown resource URI: ${uri}`);
+  }
+  // B-W02 (#6156): domain gate after the (pure) unknown-URI check — so an
+  // unknown URI answers identically for every principal — and before RBAC
+  // and any DB read.
+  const resourceDomain = mcpResourceDomain(uri);
+  if (!isDomainGranted(domainGrant, resourceDomain)) {
+    const denial = buildDomainNotGrantedError(uri, resourceDomain);
+    return jsonRpcError(id, denial.code, denial.message, denial.data);
   }
   try {
     const permError = await checkPermissionRequirement(auth, requiredPermission);

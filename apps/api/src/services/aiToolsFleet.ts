@@ -46,10 +46,6 @@ import {
   notificationChannels,
 } from '../db/schema/alerts';
 import {
-  configurationPolicies,
-  configPolicyFeatureLinks,
-} from '../db/schema/configurationPolicies';
-import {
   listEffectiveServiceMonitors,
   SERVICE_MONITOR_LIST_DEVICE_CAP,
 } from './monitors/listServiceMonitors';
@@ -59,11 +55,6 @@ import {
   EFFECTIVE_PATCH_CATEGORY_SQL,
   EFFECTIVE_PATCH_SEVERITY_SQL,
 } from './patchSeverityOverlay';
-import {
-  addFeatureLink,
-  updateFeatureLink,
-  policyAccessCondition,
-} from './configurationPolicy';
 import {
   reports,
   reportRuns,
@@ -96,6 +87,7 @@ import {
   reportTypeRequiresPermissions,
 } from './reportTypePermissions';
 import { reportTypeDef } from './reportRegistry';
+import { GENERATE_REPORT_TYPES, isBusinessReportType, type GenerateReportType } from './aiReportTypes';
 import { canManagePartnerWidePolicies, PARTNER_WIDE_WRITE_DENIED_MESSAGE } from './partnerWideAccess';
 import { filterWindowsToSiteScope, scopeWindowForRead } from './maintenanceSiteScope';
 import {
@@ -215,6 +207,47 @@ function refuseFleetAgentPrincipal(action: string): string {
 
 function getOrgId(auth: AuthContext): string | null {
   return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
+}
+
+/** #9222: refusal for a business report type run under a site-restricted
+ *  authority. Tickets, time entries, invoices and the AI ledger carry no site
+ *  axis, so the HTTP routes would answer with an unmeasured placeholder; a chat
+ *  tool refuses instead of fabricating a figure. */
+const BUSINESS_REPORT_SITE_RESTRICTED_MESSAGE =
+  'Business report types are not available to site-restricted callers: tickets, time entries, invoices and AI usage have no site dimension.';
+
+/** #9222: the HTTP create/update routes require reports:export plus a fresh-MFA
+ *  session to set `config.emailRecipients` (a business report would mail MSP
+ *  financials off-platform on a timer). The AI tool cannot prove fresh MFA, so
+ *  it refuses recipients on a business type outright; set them in the web UI. */
+const BUSINESS_REPORT_RECIPIENTS_MESSAGE =
+  'Email recipients on a business report must be set in the web UI (requires the export permission and an MFA-verified session).';
+
+function configSetsEmailRecipients(config: unknown): boolean {
+  if (!config || typeof config !== 'object') return false;
+  const r = (config as Record<string, unknown>).emailRecipients;
+  return Array.isArray(r) ? r.length > 0 : Boolean(r);
+}
+
+/**
+ * #9222. The HTTP routes' type gates for the business report types, for the AI
+ * tool: msp_staff audience (ruling F1: an org-scope caller never runs one) and
+ * the per-type read permissions (ruling P8), from the caller's LIVE permission
+ * set. Legacy types pay nothing (no permission lookup). Returns the refusal
+ * body, or null when the caller may proceed to the site-scope check.
+ */
+async function businessReportTypeRefusal(
+  type: unknown,
+  auth: AuthContext,
+): Promise<{ error: string } | null> {
+  if (!isBusinessReportType(type)) return null;
+  if (reportTypeHiddenFromCaller(type, auth)) return { error: 'Insufficient permissions' };
+  if (reportTypeRequiresPermissions(type)) {
+    if (missingReportTypePermission(type, await aiCallerPermissions(auth))) {
+      return { error: 'Insufficient permissions' };
+    }
+  }
+  return null;
 }
 
 /**
@@ -1112,8 +1145,6 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           deferUntil: { type: 'string', description: 'ISO date to defer until (for defer)' },
           notes: { type: 'string', description: 'Approval/decline notes' },
           configPolicyId: { type: 'string', description: 'Configuration policy UUID to attach patch settings to (for setup_auto_approval). If omitted, creates a new policy.' },
-          autoApprove: { type: 'boolean', description: 'Enable auto-approval of patches (for setup_auto_approval)' },
-          autoApproveSeverities: { type: 'array', items: { type: 'string', enum: ['critical', 'important', 'moderate', 'low'] }, description: 'Which severities to auto-approve (for setup_auto_approval)' },
           scheduleFrequency: { type: 'string', enum: ['daily', 'weekly', 'monthly'], description: 'Patch scan frequency (for setup_auto_approval, default: weekly)' },
           scheduleTime: { type: 'string', description: 'Time to run scans in HH:MM format (for setup_auto_approval, default: 02:00)' },
           rebootPolicy: { type: 'string', enum: ['if_required', 'always', 'never'], description: 'Reboot policy after patching (for setup_auto_approval, default: if_required)' },
@@ -1159,7 +1190,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
       if (action === 'setup_auto_approval') {
         return JSON.stringify({
-          error: 'Action "setup_auto_approval" is disabled. Patch policies must be managed through configuration policies. Use manage_policy_feature_link with featureType "patch" to configure auto-approval rules on a policy.',
+          error: 'Action "setup_auto_approval" is disabled. Auto-approval and per-app block/pin rules are configured on an Update Ring with manage_update_rings. Link the ring to a configuration policy with manage_policy_feature_link (featureType "patch", featurePolicyId = the ring id).',
         });
       }
 
@@ -1614,116 +1645,6 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           until: until.toISOString(),
           history,
           showing: history.length,
-        });
-      }
-
-      if (action === 'setup_auto_approval') {
-        // NOTE: this whole action is currently unreachable (see the disabled
-        // early-return above) — defense-in-depth, kept correct so the block is
-        // not a trap if the gate is ever lifted (same convention as the
-        // canManagePartnerWidePolicies check a few lines below). This path
-        // inserts an org configuration_policies row + feature link, which is
-        // exactly the org-wide governance object this contract protects.
-        if (!canMutateOrgWideGovernance(auth)) {
-          return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
-        }
-        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
-
-        const patchSettings = {
-          sources: Array.isArray(input.sources) ? input.sources as string[] : ['os'],
-          autoApprove: typeof input.autoApprove === 'boolean' ? input.autoApprove : true,
-          autoApproveSeverities: Array.isArray(input.autoApproveSeverities) ? input.autoApproveSeverities as string[] : ['critical', 'important'],
-          scheduleFrequency: typeof input.scheduleFrequency === 'string' ? input.scheduleFrequency : 'weekly',
-          scheduleTime: typeof input.scheduleTime === 'string' ? input.scheduleTime : '02:00',
-          rebootPolicy: typeof input.rebootPolicy === 'string' ? input.rebootPolicy : 'if_required',
-        };
-
-        const configPolicyId = input.configPolicyId as string | undefined;
-
-        if (configPolicyId) {
-          // Check if policy exists and user has access.
-          //
-          // NOTE: this whole action is currently unreachable — `setup_auto_approval`
-          // early-returns as disabled above (patch policies are managed through
-          // configuration policies). The two fixes below are defense-in-depth,
-          // kept correct so the block is not a trap if the gate is ever lifted
-          // — configuration policies own these writes.
-          //
-          // `policyAccessCondition`, not a bare org-equality (#3493): a
-          // partner-wide policy stores `org_id NULL`, so the org form would tell
-          // the partner-scoped tech who AUTHORED the policy it "was not found".
-          const policyConditions: SQL[] = [eq(configurationPolicies.id, configPolicyId)];
-          const oc = policyAccessCondition(auth);
-          if (oc) policyConditions.push(oc);
-          const [policy] = await db.select().from(configurationPolicies).where(and(...policyConditions)).limit(1);
-          if (!policy) return JSON.stringify({ error: 'Configuration policy not found or access denied' });
-
-          // Making a partner-wide policy REACHABLE is not the same as making it
-          // writable. Everything below mutates the policy's patch feature link,
-          // which lands on every org the policy covers — so it takes the same
-          // capability the HTTP feature-link route requires
-          // (routes/configurationPolicies/featureLinks.ts).
-          if (policy.orgId === null && !canManagePartnerWidePolicies(auth)) {
-            return JSON.stringify({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE });
-          }
-
-          // Check if patch feature link already exists
-          const existingLinks = await db.select()
-            .from(configPolicyFeatureLinks)
-            .where(and(
-              eq(configPolicyFeatureLinks.configPolicyId, configPolicyId),
-              eq(configPolicyFeatureLinks.featureType, 'patch'),
-            )).limit(1);
-
-          if (existingLinks.length > 0) {
-            // Update existing feature link
-            const updated = await updateFeatureLink(existingLinks[0]!.id, { inlineSettings: patchSettings }, configPolicyId);
-            if (!updated) return JSON.stringify({ error: 'Failed to update patch settings — the feature link may have been deleted. Try again.' });
-            return JSON.stringify({
-              success: true,
-              message: `Patch auto-approval settings updated on policy "${policy.name}"`,
-              configPolicyId,
-              featureLinkId: existingLinks[0]!.id,
-              settings: patchSettings,
-            });
-          }
-
-          // Add new patch feature link. addFeatureLink returns null (instead of
-          // throwing) on a duplicate; existingLinks was just checked above so
-          // this is effectively unreachable outside a race, but guard anyway.
-          const link = await addFeatureLink(configPolicyId, 'patch', null, patchSettings);
-          if (!link) return JSON.stringify({ error: 'Patch feature link already exists on this policy' });
-          return JSON.stringify({
-            success: true,
-            message: `Patch auto-approval configured on policy "${policy.name}"`,
-            configPolicyId,
-            featureLinkId: link.id,
-            settings: patchSettings,
-          });
-        }
-
-        // No configPolicyId — create a new config policy with patch settings
-        const [newPolicy] = await db.insert(configurationPolicies).values({
-          orgId,
-          name: `Patch Auto-Approval Policy`,
-          description: `Auto-approve ${patchSettings.autoApproveSeverities.join(', ')} patches on a ${patchSettings.scheduleFrequency} schedule`,
-          status: 'active',
-          createdBy: auth.user.id,
-        }).returning();
-
-        if (!newPolicy) return JSON.stringify({ error: 'Failed to create configuration policy' });
-
-        // newPolicy.id is freshly generated above, so a duplicate feature-link
-        // conflict is not realistically reachable; guard for type-safety only.
-        const link = await addFeatureLink(newPolicy.id, 'patch', null, patchSettings);
-        if (!link) return JSON.stringify({ error: 'Failed to configure patch auto-approval on the new policy' });
-        return JSON.stringify({
-          success: true,
-          message: `Created new policy "${newPolicy.name}" with patch auto-approval`,
-          configPolicyId: newPolicy.id,
-          featureLinkId: link.id,
-          settings: patchSettings,
-          hint: 'Use apply_configuration_policy to assign this policy to an organization, site, or device group.',
         });
       }
 
@@ -2888,7 +2809,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           action: { type: 'string', enum: ['list', 'generate', 'data', 'create', 'update', 'delete', 'history', 'download'], description: 'The action to perform' },
           reportId: { type: 'string', description: 'Report UUID (for generate/update/delete/history)' },
           reportRunId: { type: 'string', description: 'Report run UUID (required for download)' },
-          reportType: { type: 'string', enum: ['device_inventory', 'software_inventory', 'alert_summary', 'compliance', 'performance', 'executive_summary'], description: 'Report type (for generate/data/create)' },
+          reportType: { type: 'string', enum: [...GENERATE_REPORT_TYPES], description: 'Report type (for generate/data/create). Business types are MSP-staff only and refused for site-restricted callers.' },
           name: { type: 'string', description: 'Report name (for create/update)' },
           config: { type: 'object', description: 'Report configuration (filters, options)' },
           schedule: { type: 'string', enum: ['one_time', 'daily', 'weekly', 'monthly'], description: 'Schedule (for create/update)' },
@@ -3004,6 +2925,11 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         if (auth.allowedDeviceIds) return JSON.stringify({ error: DEVICE_SCOPE_REPORT_DENIED_MESSAGE });
         if (!input.reportId && !input.reportType) return JSON.stringify({ error: 'reportId or reportType is required' });
         if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        // #9222: ad-hoc business type — audience + permission gate before any authority lookup.
+        if (!input.reportId) {
+          const refusal = await businessReportTypeRefusal(input.reportType, auth);
+          if (refusal) return JSON.stringify(refusal);
+        }
 
         let reportDef;
         let executionAuthority: ReportExecutionAuthority | null = null;
@@ -3069,6 +2995,15 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           }
         }
 
+        // #9222: a business type has no site axis — refuse a site-restricted run
+        // (stored definition or ad hoc) rather than mint an unmeasured placeholder.
+        if (
+          isBusinessReportType(reportDef?.type ?? input.reportType)
+          && executionAuthority.scope.kind === 'restricted'
+        ) {
+          return JSON.stringify({ error: BUSINESS_REPORT_SITE_RESTRICTED_MESSAGE });
+        }
+
         const reportConfig = (reportDef?.config ?? input.config ?? {}) as Record<string, unknown>;
         try {
           assertReportExecutionPreflight(orgId, reportConfig, executionAuthority);
@@ -3105,9 +3040,14 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
       if (action === 'data') {
         if (!input.reportType) return JSON.stringify({ error: 'reportType is required' });
         if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        const dataRefusal = await businessReportTypeRefusal(input.reportType, auth);
+        if (dataRefusal) return JSON.stringify(dataRefusal);
         const executionAuthority = await aiLiveReportAuthority(auth, orgId, 'read');
         if (!executionAuthority) {
           return JSON.stringify({ error: 'Access to report scope denied' });
+        }
+        if (isBusinessReportType(input.reportType) && executionAuthority.scope.kind === 'restricted') {
+          return JSON.stringify({ error: BUSINESS_REPORT_SITE_RESTRICTED_MESSAGE });
         }
 
         const limit = Math.min(Math.max(1, Number(input.limit) || 50), 100);
@@ -3222,6 +3162,11 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         const resolvedReportOrg = resolveWritableToolOrgId(auth, typeof input.orgId === 'string' && input.orgId ? input.orgId : undefined);
         if (!resolvedReportOrg.orgId) return JSON.stringify({ error: resolvedReportOrg.error ?? 'Organization context required' });
         const reportOrgId = resolvedReportOrg.orgId;
+        const createRefusal = await businessReportTypeRefusal(input.reportType, auth);
+        if (createRefusal) return JSON.stringify(createRefusal);
+        if (isBusinessReportType(input.reportType) && configSetsEmailRecipients(input.config)) {
+          return JSON.stringify({ error: BUSINESS_REPORT_RECIPIENTS_MESSAGE });
+        }
         const authority = await aiLiveReportAuthority(auth, reportOrgId, 'write');
         if (
           !authority
@@ -3229,10 +3174,13 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         ) {
           return JSON.stringify({ error: 'Access to report scope denied' });
         }
+        if (isBusinessReportType(input.reportType) && authority.scope.kind === 'restricted') {
+          return JSON.stringify({ error: BUSINESS_REPORT_SITE_RESTRICTED_MESSAGE });
+        }
         const [report] = await db.insert(reports).values({
           orgId: reportOrgId,
           name: input.name as string,
-          type: input.reportType as 'device_inventory' | 'software_inventory' | 'alert_summary' | 'compliance' | 'performance' | 'executive_summary',
+          type: input.reportType as GenerateReportType,
           config: (input.config as Record<string, unknown>) ?? {},
           schedule: (input.schedule as 'one_time' | 'daily' | 'weekly' | 'monthly') ?? 'one_time',
           format: (input.format as 'csv' | 'pdf' | 'excel') ?? 'csv',
@@ -3255,6 +3203,9 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         // Multi-org report series W02: a child's shared fields belong to its
         // series (spec §3.3 "Child writers").
         if (existing.seriesId) return JSON.stringify(seriesManagedRefusal(existing.seriesId));
+        if (isBusinessReportType(existing.type) && configSetsEmailRecipients(input.config)) {
+          return JSON.stringify({ error: BUSINESS_REPORT_RECIPIENTS_MESSAGE });
+        }
 
         const updates: Record<string, unknown> = { updatedAt: new Date() };
         if (typeof input.name === 'string') updates.name = input.name;

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mfaVerifySchema, mfaStepUpSchema, unattestedRestoreStepUpResource } from './schemas';
+import { mfaVerifySchema, mfaStepUpSchema, unattestedRestoreStepUpResource, callerVerificationAdministrativeStepUpResource } from './schemas';
 import type { StepUpOperation } from '../../services/mfaStepUpGrant';
 
 // SR2-09: mfaVerifySchema must accept a 6-digit TOTP/SMS code OR the
@@ -203,9 +203,22 @@ describe('mfaStepUpSchema operation field', () => {
     ['autopay_request_recipient', { orgIds: ['00000000-0000-4000-8000-000000000030'], recipientOverride: 'accounts@example.test', mode: 'reauthorize' }],
     ['org_payment_settings_update', { orgId: '00000000-0000-4000-8000-000000000040',
       settings: { autopayCapEnabled: true, autopayCapAmount: '500.00', autopayCapCurrency: 'USD', reminderRepeatDays: null } }],
+    ['device_force_reboot', { deviceId: '00000000-0000-4000-8000-000000000050' }],
   ] as const)('accepts %s with its resource binding, unchanged', (operation, resource) => {
     const parsed = mfaStepUpSchema.parse({ method: 'totp', code: '123456', operation, resource });
     expect(parsed.operation).toBe(operation);
+    expect(parsed.resource).toEqual(resource);
+  });
+
+  // #8729: the force-reboot binding is a bare { deviceId }. It is strict and
+  // last in the union, so a richer device binding never collapses onto it.
+  it('keeps a move-org resource whole now that a { deviceId }-only binding exists', () => {
+    const resource = {
+      deviceId: '00000000-0000-4000-8000-000000000010',
+      targetOrgId: '00000000-0000-4000-8000-000000000020',
+      targetSiteId: '00000000-0000-4000-8000-000000000030',
+    };
+    const parsed = mfaStepUpSchema.parse({ method: 'totp', code: '123456', operation: 'device_move_org', resource });
     expect(parsed.resource).toEqual(resource);
   });
 
@@ -252,5 +265,25 @@ describe('mfaStepUpSchema operation field', () => {
         },
       })
     ).toThrow();
+  });
+});
+
+describe('caller verification administrative step-up', () => {
+  const resource = {
+    orgId: '11111111-1111-4111-8111-111111111111',
+    entraTenantId: 'tenant',
+    entraOid: 'oid',
+    reason: 'Confirmed offboarding request',
+  };
+  it('accepts the operation and rejects a short, long or extra-field resource', () => {
+    const body = { method: 'totp', code: '123456', operation: 'caller_verification_administrative_disable', resource };
+    expect(mfaStepUpSchema.safeParse(body).success).toBe(true);
+    expect(callerVerificationAdministrativeStepUpResource.safeParse(resource).success).toBe(true);
+    expect(callerVerificationAdministrativeStepUpResource.safeParse({ ...resource, reason: 'short' }).success).toBe(false);
+    expect(callerVerificationAdministrativeStepUpResource.safeParse({ ...resource, reason: 'x'.repeat(2001) }).success).toBe(false);
+    expect(callerVerificationAdministrativeStepUpResource.safeParse({ ...resource, extra: 1 }).success).toBe(false);
+  });
+  it('trims the reason before measuring it', () => {
+    expect(callerVerificationAdministrativeStepUpResource.safeParse({ ...resource, reason: `   ${'a'.repeat(10)}   ` }).success).toBe(false);
   });
 });

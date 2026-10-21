@@ -86,7 +86,9 @@
       "failedInstalls_one": "{{count}} failed install",
       "failedInstalls_other": "{{count}} failed installs",
       "critical": "{{count}} critical",
-      "reboot": "{{count}} reboot"
+      "reboot": "{{count}} reboot",
+      "imagesNotChecked_one": "{{count}} container image not checked",
+      "imagesNotChecked_other": "{{count}} container images not checked"
     },
     "filters": {
       "allDevices": "All Devices ({{count}})",
@@ -257,7 +259,9 @@
       "moderate": "Moderate",
       "low": "Low",
       "unrated": "Unrated",
-      "unratedNote": "Will not auto-approve"
+      "unratedNote": "Will not auto-approve",
+      "derivedNote": "Derived rating",
+      "derivedTooltip": "The vendor published no rating for this update. This severity was derived from its classification and title."
     },
     "approval": {
       "pending": "Pending",
@@ -305,6 +309,7 @@
       "os": "OS",
       "release": "Release",
       "approval": "Approval",
+      "devices": "Devices",
       "actions": "Actions"
     },
     "releaseUnknown": "Unknown",
@@ -317,6 +322,18 @@
       "badgeDevices_other": "Install failed on {{count}} devices",
       "noReason": "No reason reported by the agent",
       "failedAt": "Last install attempt failed: {{when}}"
+    },
+    "outstandingDevices": {
+      "badge_one": "{{count}} device",
+      "badge_other": "{{count}} devices",
+      "none": "No device in scope still needs this patch",
+      "open": "Show devices that still need {{title}}",
+      "heading": "Devices that still need {{title}}",
+      "loading": "Loading devices…",
+      "error": "Couldn't load the device list.",
+      "showing": "Showing {{shown}} of {{total}}",
+      "loadMore": "Load more",
+      "lastChecked": "Last checked: {{when}}"
     }
   },
   "patchesPage": {
@@ -357,7 +374,8 @@
       "createRing": "Failed to create update ring",
       "deleteRing": "Failed to delete ring",
       "approveUnknown": "Approval status unknown — the server response could not be read. Refresh to confirm which patches were approved.",
-      "approveAbortedWithFailures": "{{message}} ({{count}} patches were also rejected by the server before this.)"
+      "approveAbortedWithFailures": "{{message}} ({{count}} patches were also rejected by the server before this.)",
+      "checkRingLinks": "Failed to check which policies use this ring — nothing was deleted"
     },
     "toast": {
       "ringSaved": "Update ring saved",
@@ -387,7 +405,13 @@
       "createTitle": "Create update ring"
     },
     "truncatedNotice": "Showing {{shown}} of {{total}} patches. The filters here only narrow what's already loaded, so the rest can't be reached from this view — use the patches API to work through the full catalog.",
-    "shiftedNotice": "Showing {{shown}} of {{total}} patches — the catalog changed while it was loading. Reload to see the rest."
+    "shiftedNotice": "Showing {{shown}} of {{total}} patches — the catalog changed while it was loading. Reload to see the rest.",
+    "ringDelete": {
+      "title": "Delete {{name}}?",
+      "messageOne": "1 policy will stop scheduled patching until you pick another ring.",
+      "messageMany": "{{count}} policies will stop scheduled patching until you pick another ring.",
+      "confirm": "Delete ring"
+    }
   },
   "patchJobsList": {
     "empty": "No patch jobs yet. Jobs created by policies, update rings, or the AI assistant will appear here.",
@@ -568,7 +592,26 @@
     "badges": {
       "manual": "Manual",
       "os": "OS: {{severities}}",
-      "thirdParty": "3rd-party apps"
+      "thirdParty": "3rd-party apps",
+      "appRules_one": "{{count}} app rule",
+      "appRules_other": "{{count}} app rules"
     }
+  },
+  "ringAppRules": {
+    "applicationRules": "Application Rules",
+    "blockSpecificApplicationsFromAutomatedPatchingOr": "Block specific applications from automated patching, or pin them to a maximum version.",
+    "blocked": "Blocked",
+    "pinned": "Pinned",
+    "maxVersion": "Max version",
+    "pinnedApplicationsNeedAVersion": "Pinned applications need a version.",
+    "addApplication": "Add application",
+    "searchCatalogAndDetectedApplications": "Search catalog and detected applications...",
+    "searching": "Searching...",
+    "catalog": "catalog",
+    "couldnTLoadApplicationsYouCanStill": "Couldn't load applications — you can still add by package ID below.",
+    "noMatches": "No matches.",
+    "orEnterAPackageIDManually": "Or enter a package ID manually",
+    "removeRuleFor": "Remove rule for {{application}}",
+    "scopeNote": "These rules apply to every device whose configuration policy links this ring."
   }
 }

@@ -15,6 +15,7 @@ import {
   queueCommandForExecution,
   rearmIdempotentCommandForDelivery,
   resolveCommandCreatedBy,
+  enqueueWatchdogCommand,
 } from './commandQueue';
 import { db } from '../db';
 import { createAuditLogAsync } from './auditService';
@@ -95,6 +96,7 @@ vi.mock('./commandDispatch', () => ({
 
 vi.mock('./sentry', () => ({
   captureException: vi.fn(),
+  captureMessage: vi.fn(),
 }));
 
 vi.mock('./backupMetrics', () => ({
@@ -278,6 +280,9 @@ describe('command queue service', () => {
     await expect(queueCommandForExecution('d1', 'script', {})).resolves.toMatchObject({
       error: 'TRUST_PROBATION',
       trust: { reason: 'probation_default_deny' },
+      // #8022: the refusal class rides beside the message, so a caller can
+      // report WHY without shipping the (scrubbed) error text.
+      refusal: 'trust_denied',
     });
   });
 
@@ -1247,6 +1252,7 @@ describe('command queue service', () => {
       const result = await queueCommandForExecution('dev-online', CommandTypes.FILE_LIST, { path: '/' });
 
       expect(result.error).toBe(cancelledCommandError('requester_inactive'));
+      expect(result.refusal).toBe('cancelled');
       expect(result.command?.status).toBe('cancelled');
       expect(sendCommandToAgent).not.toHaveBeenCalled();
     });
@@ -1989,6 +1995,7 @@ describe('command queue service', () => {
 
       // Matches the adjacent "Device not found" contract — no info leak.
       expect(result.error).toBe('Device not found');
+      expect(result.refusal).toBe('device_not_found');
       // Must not have proceeded to queue the command.
       expect(db.insert).not.toHaveBeenCalled();
     });
@@ -2006,6 +2013,7 @@ describe('command queue service', () => {
       );
 
       expect(result.error).toBe('Device is offline, cannot execute command');
+      expect(result.refusal).toBe('device_offline');
     });
 
     it('is unaffected when expectedOrgId is omitted (existing callers)', async () => {
@@ -2554,5 +2562,141 @@ describe('ai.command.executed — the executeCommand path (#5022 W01)', () => {
 
     const actions = vi.mocked(createAuditLogAsync).mock.calls.map((c) => c[0]!.action);
     expect(actions).not.toContain('ai.command.executed');
+  });
+});
+
+// #9234 step 1 — the device-page "Restart agent" button. Same precheck and the
+// same row as executeCommand(..., { targetRole: 'watchdog' }), but it returns as
+// soon as the row exists: the watchdog polls every ~30s, so a request that
+// waited (and, on timeout, marked the row failed) would cancel restarts the
+// watchdog had not yet had a chance to claim.
+describe('enqueueWatchdogCommand', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    parkedDeviceIds.clear();
+    partnerTrustCommandMocks.assertDeviceExecuteAllowed.mockResolvedValue(undefined);
+  });
+
+  function mockDevice(device: Record<string, unknown>) {
+    const limit = vi.fn().mockResolvedValue([device]);
+    vi.mocked(db.select).mockImplementation(() => ({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({ limit }),
+      }),
+    }) as any);
+    return limit;
+  }
+
+  const silentDevice = {
+    id: 'dev-silent',
+    status: 'offline',
+    agentId: 'agent-silent',
+    orgId: 'org-1',
+    hostname: 'host-silent',
+    watchdogLastSeen: new Date(),
+  };
+
+  it('writes a watchdog-targeted row and returns without waiting for a result', async () => {
+    const deviceLookup = mockDevice(silentDevice);
+    const insertValues = vi.fn().mockReturnValue({
+      returning: vi.fn().mockResolvedValue([{ id: 'cmd-w', type: 'restart_agent', status: 'pending' }]),
+      execute: vi.fn().mockResolvedValue(undefined),
+    });
+    vi.mocked(db.insert).mockReturnValue({ values: insertValues } as any);
+    vi.mocked(isAgentConnected).mockReturnValue(true);
+
+    const result = await enqueueWatchdogCommand('dev-silent', 'restart_agent', {
+      userId: 'user-1',
+      expectedOrgId: 'org-1',
+    });
+
+    expect(result).toEqual({ status: 'queued', commandId: 'cmd-w' });
+    expect(insertValues).toHaveBeenCalledWith(
+      expect.objectContaining({
+        deviceId: 'dev-silent',
+        type: 'restart_agent',
+        payload: {},
+        status: 'pending',
+        targetRole: 'watchdog',
+      }),
+    );
+    // Same delivery clock as executeCommand's reject rows (no deliver_by).
+    expect(insertValues.mock.calls[0]![0]).toMatchObject({ deliverBy: null });
+    // No WS push, and no poll. Had it polled, every read returns the device
+    // row (no terminal status), so the call would spin until its 30s timeout
+    // (past this test's) and then write the timeout marker below.
+    expect(claimPendingCommandForDelivery).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+    expect(deviceLookup).toHaveBeenCalled();
+    // Never marks the row failed on a timeout it did not wait for.
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses before inserting when the watchdog is not reporting', async () => {
+    mockDevice({ ...silentDevice, watchdogLastSeen: new Date(Date.now() - 60 * 60 * 1000) });
+    const insertValues = vi.fn();
+    vi.mocked(db.insert).mockReturnValue({ values: insertValues } as any);
+
+    const result = await enqueueWatchdogCommand('dev-silent', 'start_agent', { userId: 'user-1' });
+
+    expect(result).toMatchObject({ status: 'failed', reason: 'refused' });
+    expect(result.status === 'failed' && result.error).toMatch(/watchdog is not reporting/i);
+    expect(insertValues).not.toHaveBeenCalled();
+  });
+
+  it('refuses a device parked in a holding org', async () => {
+    mockDevice(silentDevice);
+    parkedDeviceIds.add('dev-silent');
+    const insertValues = vi.fn();
+    vi.mocked(db.insert).mockReturnValue({ values: insertValues } as any);
+
+    const result = await enqueueWatchdogCommand('dev-silent', 'restart_agent', { userId: 'user-1' });
+
+    expect(result).toMatchObject({ status: 'failed', reason: 'refused' });
+    expect(insertValues).not.toHaveBeenCalled();
+  });
+
+  it('reports insert_failed when the INSERT returns no row', async () => {
+    mockDevice(silentDevice);
+    vi.mocked(db.insert).mockReturnValue({
+      values: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([]) }),
+    } as any);
+
+    const result = await enqueueWatchdogCommand('dev-silent', 'restart_agent', { userId: 'user-1' });
+
+    expect(result).toEqual({ status: 'failed', reason: 'insert_failed', error: 'Failed to create command' });
+  });
+
+  it('refuses a device that left the deciding organization', async () => {
+    mockDevice({ ...silentDevice, orgId: 'org-other' });
+    const insertValues = vi.fn();
+    vi.mocked(db.insert).mockReturnValue({ values: insertValues } as any);
+
+    const result = await enqueueWatchdogCommand('dev-silent', 'restart_agent', {
+      userId: 'user-1',
+      expectedOrgId: 'org-1',
+    });
+
+    expect(result).toEqual({ status: 'failed', reason: 'not_found', error: 'Device not found' });
+    expect(insertValues).not.toHaveBeenCalled();
+  });
+
+  it('carries a partner-trust denial back to the caller', async () => {
+    mockDevice(silentDevice);
+    partnerTrustCommandMocks.assertDeviceExecuteAllowed.mockRejectedValue(
+      new TrustDeniedError('TRUST_PROBATION', 'probation_default_deny', 'dev-silent', 'start_agent'),
+    );
+    const insertValues = vi.fn();
+    vi.mocked(db.insert).mockReturnValue({ values: insertValues } as any);
+
+    const result = await enqueueWatchdogCommand('dev-silent', 'start_agent', { userId: 'user-1' });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      reason: 'trust_denied',
+      error: 'TRUST_PROBATION',
+      trust: { capability: 'device_execute' },
+    });
+    expect(insertValues).not.toHaveBeenCalled();
   });
 });

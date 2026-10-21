@@ -278,8 +278,9 @@ const EXPECTED_NAMES = [
   'topologyMonitoringWorker',
   'topologyDiagnosticSweeper',
   'topologyTelemetryMaintenance',
+  'topologyPresenceWorker',
   'alertWorkers', 'monitorConversionPreviewWorker', 'alertCorrelationWorker', 'metricRollupsWorker', 'metricRollupMaintenance',
-  'metricAnomaliesWorker', 'aiBudgetAlertDeliveryWorker', 'fleetFindingsWorker', 'fleetRemediationDispatchWorker', 'mlOutputRetention',
+  'metricAnomaliesWorker', 'aiBudgetAlertDeliveryWorker', 'connectionHealthReconcileWorker', 'connectionHealthDigestWorker', 'fleetFindingsWorker', 'fleetRemediationDispatchWorker', 'mlOutputRetention', 'aiToolOutputRetention', 'aiTranscriptSweeper',
   'offlineDetector', 'notificationDispatcher', 'webhookDelivery', 'webhookDeliveryRecovery',
   'policyEvaluationWorker', 'softwareComplianceWorker', 'softwareRemediationWorker', 'aiAgentRunner',
   'agentNotifyRetry', 'fixWatchWorker',
@@ -289,13 +290,15 @@ const EXPECTED_NAMES = [
   'ticketOutboxRetention', 'intentOutboxRetention', 'metricAnomalyIncidentRetention',
   'ipHistoryRetention', 'reliabilityRetention', 'processSampleRetention', 'deviceMetricsRetention',
   'm365SyncRetention', 'filesystemCleanupRunRetention',
-  'serviceProcessCheckRetention', 'changeLogRetention', 'oauthCleanup', 'authBrowserTransitionCleanup', 'stripeAccountCacheRefresh',
+  'serviceProcessCheckRetention', 'changeLogRetention', 'restorePointAttemptRetention', 'webhookDeliveryRetention', 'oauthCleanup', 'authBrowserTransitionCleanup', 'stripeAccountCacheRefresh',
   'exchangeRateSync', 'oauthRevocationRetryWorker', 'mtlsCertificateRevocationWorker', 'authEmailWorker',
-  'quoteSendWorker', 'enrollmentKeyCleanup', 'partnerApiIdempotencyRetention', 'quickSupportReaper', 'softwareUploadSessionCleanup',
-  'softwareRemediationRequestCleanup', 'auditRetention', 'auditChainVerify', 'auditChainAnchor',
+  'quoteSendWorker', 'enrollmentKeyCleanup', 'migrationWindowSweep', 'partnerApiIdempotencyRetention', 'quickSupportReaper', 'softwareUploadSessionCleanup',
+  'softwareRemediationRequestCleanup', 'auditRetention', 'pamEvidenceRetention', 'auditChainVerify', 'auditChainAnchor',
   'tenantErasure', 'orgMerge', 'deviceBulkPurge', 'removedDevicePurge', 'parkedDeviceExpiry', 'parkedDevicePurge', 'desktopSessionFinalization', 'desktopSessionOrphanRecovery', 'playbookRetention',
   // Helper-uploaded screenshot retention (per-device storage quota).
   'helperScreenshotRetentionWorker',
+  // Endpoint messaging (#8742 W02): message/delivery row retention.
+  'endpointMessageRetention',
   'discoveryWorker', 'networkBaselineWorker', 'snmpWorker', 'monitorWorker',
   // #5291 W04 — dispatches `script` monitors' diagnostic probes.
   'monitorScriptWorker',
@@ -306,6 +309,8 @@ const EXPECTED_NAMES = [
   'backupProviderSyncWorker',
   // EDR provider framework W01 (#8164).
   'edrProviderSyncWorker',
+  // Security agent coverage reconciliation (#6960 W03).
+  'securityAgentCoverageWorker',
   'm365SyncWorker', 'pax8SyncWorker',
   'tdSynnexSftpSyncWorker', 'logForwardingWorker', 'patchJobWorker', 'patchSchedulerWorker',
   'maintenanceRebootWorker', 'backupWorker', 'backupSnapshotFileIndexWorker', 'backupSnapshotAttestationWorker', 'backupWriteSessionJanitor', 'sensitiveDataWorker', 'securityScanWorker', 'peripheralJobs',
@@ -318,9 +323,10 @@ const EXPECTED_NAMES = [
   'stripeSessionRevocationSweep',
   'ticketAttachmentReaper', 'aiArtifactSweeper', 'quoteExpiryReaper', 'suppressionExpiryReaper', 'ticketNotifyWorker', 'ticketOutboxPublisher',
   'callerVerificationPublisher',
+  'callerVerificationReconciliation',
   'ticketSlaWorker', 'inboundEmailWorker', 'gmailMarkHandledWorker', 'ticketMailboxPollWorker', 'invoiceWorker', 'autopayWorker',
   'metricAnomalyIncidentPublisher', 'contractWorker', 'deliverableWorker', 'aiUnattendedExposureRetention',
-  'aiInvocationRetention',
+  'aiInvocationRetention', 'llmEgressRetention',
   // AI chargeback W10 (#7608) — daily monthly-close sweep.
   'aiChargebackWorker',
   'alertVerdictScheduler', 'aiAgentSweepScheduler', 'accountingSyncWorker', 'accountingReconcileWorker',
@@ -331,6 +337,8 @@ const EXPECTED_NAMES = [
   'aiBudgetReservationSweep',
   'mfaEnrollmentNoticeWorker',
   'monitorEpisodeRetention',
+  // EDR provider framework W02 (#8164).
+  'edrDetectionRetentionWorker',
   'reportRunDeliveryReconciler',
   // Tool Catalog W1 (#5215 / #5216), Task A6.
   'toolSourceDiscoveryWorker',
@@ -339,6 +347,10 @@ const EXPECTED_NAMES = [
   // AI Suggested Fixes W1.
   'fixOutcomeWorker',
   'aiModelDiscoveryWorker',
+  // Workload image currency W05 (#8194).
+  'imageCurrencyWorker',
+  // Trust Center W1 (#8768).
+  'trustPageSnapshotWorker',
 ];
 
 // ---------------------------------------------------------------------------

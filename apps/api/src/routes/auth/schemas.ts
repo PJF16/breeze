@@ -1,3 +1,4 @@
+import { MIGRATION_WINDOW_MAX_ORGS } from '../../services/migrationWindowLimits';
 import { z } from 'zod';
 import { orgPaymentSettingsPatchSchema, partnerPaymentSettingsPatchSchema } from '@breeze/shared';
 import { envFlag } from '../../utils/envFlag';
@@ -166,6 +167,7 @@ const STEP_UP_OPERATIONS = [
   'agent_rollback',
   'device_maintenance',
   'device_move_org',
+  'device_force_reboot',
   'parked_device_assign',
   'parked_device_assign_bulk',
   'pre_assignment_enable',
@@ -177,6 +179,8 @@ const STEP_UP_OPERATIONS = [
   'partner_payment_settings_update',
   'autopay_request_recipient',
   'org_payment_settings_update',
+  'migration_window_open',
+  'caller_verification_administrative_disable',
 ] as const satisfies readonly Exclude<
   StepUpOperation,
   'enroll_first_factor' | 'sso_reauth_manage_factor' | 'approval_decide'
@@ -212,6 +216,13 @@ export const moveOrgStepUpResource = z.object({
   targetSiteId: z.string().uuid(),
   acceptCurrencyMismatch: z.boolean().optional(),
 });
+// #8729 force reboot: one device. `.strict()` AND last in `stepUpResource`
+// below: the union parses the body before the per-operation schema does, and a
+// loose `{ deviceId }` member placed earlier would match (and strip) the
+// richer device bindings such as move-org's.
+export const forceRebootStepUpResource = z.object({
+  deviceId: z.string().uuid(),
+}).strict();
 // Parked-device assignment bindings. Mirror the pre-assignment route bodies
 // (routes/preAssignment.ts): one device + destination, or a batch of them.
 export const parkedAssignStepUpResource = z.object({
@@ -295,6 +306,15 @@ export const orgPaymentSettingsStepUpResource = z.object({
   orgId: z.string().guid(),
   settings: orgPaymentSettingsPatchSchema,
 });
+// Opening a ticket migration window (#8313): mirrors the POST
+// /migration-windows body the grant is consumed by (routes/migrationWindows.ts).
+export const migrationWindowOpenStepUpResource = z.object({
+  partnerId: z.string().guid(),
+  principalId: z.string().guid(),
+  orgIds: z.array(z.string().guid()).min(1).max(MIGRATION_WINDOW_MAX_ORGS),
+  endsAt: z.string().datetime(),
+  writesPerHour: z.number().int().optional(),
+});
 // Redirected authorization request: mirrors the request body of
 // POST /billing/autopay/requests when recipientOverride is set.
 export const autopayRequestRecipientStepUpResource = z.object({
@@ -302,7 +322,16 @@ export const autopayRequestRecipientStepUpResource = z.object({
   recipientOverride: z.string().email().max(255),
   mode: z.enum(['request', 'reauthorize']).optional(),
 });
-const stepUpResource = z.union([rollbackStepUpResource, maintenanceStepUpResource, moveOrgStepUpResource, parkedAssignStepUpResource, parkedBulkAssignStepUpResource, scriptLaneStepUpResource, partnerScriptCeilingStepUpResource, topologyArmStepUpResource, preAssignmentEnableStepUpResource, unattestedRestoreStepUpResource, autopayChargeNowStepUpResource, partnerPaymentSettingsStepUpResource, autopayRequestRecipientStepUpResource, orgPaymentSettingsStepUpResource]);
+// Caller verification administrative disable (#6354 W05): mirrors
+// administrativeCallerVerificationSchema's reason bounds; the digest binds the
+// exact Entra subject so a grant cannot be spent against another contact.
+export const callerVerificationAdministrativeStepUpResource = z.object({
+  orgId: z.string().uuid(),
+  entraTenantId: z.string().min(1).max(64),
+  entraOid: z.string().min(1).max(64),
+  reason: z.string().trim().min(20).max(2000),
+}).strict();
+const stepUpResource = z.union([callerVerificationAdministrativeStepUpResource, rollbackStepUpResource, maintenanceStepUpResource, moveOrgStepUpResource, parkedAssignStepUpResource, parkedBulkAssignStepUpResource, scriptLaneStepUpResource, partnerScriptCeilingStepUpResource, topologyArmStepUpResource, preAssignmentEnableStepUpResource, unattestedRestoreStepUpResource, autopayChargeNowStepUpResource, partnerPaymentSettingsStepUpResource, autopayRequestRecipientStepUpResource, orgPaymentSettingsStepUpResource, forceRebootStepUpResource]);
 export const mfaStepUpSchema = z.discriminatedUnion('method', [
   z.object({
     method: z.literal('totp'),

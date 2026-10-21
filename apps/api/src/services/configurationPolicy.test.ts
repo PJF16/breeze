@@ -29,6 +29,16 @@ vi.mock('./automationRuntime', () => ({
   ),
 }));
 
+const { resolvePatchPolicyReferenceMock, loadConfigPolicyPartnerIdMock } = vi.hoisted(() => ({
+  resolvePatchPolicyReferenceMock: vi.fn(),
+  loadConfigPolicyPartnerIdMock: vi.fn(),
+}));
+vi.mock('./configPolicyPatching', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./configPolicyPatching')>()),
+  resolvePatchPolicyReference: resolvePatchPolicyReferenceMock,
+  loadConfigPolicyPartnerId: loadConfigPolicyPartnerIdMock,
+}));
+
 vi.mock('../db', () => ({
   db: {
     select: vi.fn(),
@@ -40,6 +50,7 @@ vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  getCurrentDbAccessContext: vi.fn(() => undefined),
 }));
 
 import {
@@ -79,6 +90,18 @@ function selectLimitRows(rows: unknown[]) {
 
 const PATCH_INPUT = {
   sources: ['os', 'third_party'],
+  scheduleFrequency: 'daily',
+  scheduleTime: '03:30',
+  scheduleDayOfWeek: 'tue',
+  scheduleDayOfMonth: 5,
+  rebootPolicy: 'never',
+};
+
+// #8188: policy-level auto-approve and app rules are retired (the Update Ring
+// owns them). A payload from a tab loaded before the cutover still carries them.
+const RETIRED_APPROVAL_KEYS = ['autoApprove', 'autoApproveSeverities', 'autoApproveDeferralDays', 'apps'] as const;
+const STALE_PATCH_INPUT = {
+  ...PATCH_INPUT,
   autoApprove: true,
   autoApproveSeverities: ['critical'],
   autoApproveDeferralDays: 7,
@@ -86,12 +109,8 @@ const PATCH_INPUT = {
     { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' },
     { source: 'third_party', packageId: '7zip.7zip', action: 'pin', pinnedVersion: '23.01' },
   ],
-  scheduleFrequency: 'daily',
-  scheduleTime: '03:30',
-  scheduleDayOfWeek: 'tue',
-  scheduleDayOfMonth: 5,
-  rebootPolicy: 'never',
 };
+
 
 describe('feature link reserved export marker service backstop', () => {
   beforeEach(() => {
@@ -166,133 +185,126 @@ describe('automation feature link reference authorization', () => {
   });
 });
 
-describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () => {
+describe('patch feature link writes strip retired approval keys (#8188)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('persists apps and autoApproveDeferralDays in JSONB on save and returns them from listFeatureLinks', async () => {
-    // --- Save path: addFeatureLink ---
-    let storedJsonb: any;
-    let normalizedRowValues: any;
-    let insertCall = 0;
+  function txWithStoredPatchLink(storedInline: unknown, featurePolicyId: string | null = null) {
+    const set = vi.fn((_values: Record<string, unknown>) => ({
+      where: vi.fn(() => ({ returning: vi.fn(() => Promise.resolve([{ id: 'link-1' }])) })),
+    }));
+    const update = vi.fn(() => ({ set }));
+    const insertValues = vi.fn((_values: Record<string, unknown>) => Promise.resolve([]));
+    const tx: any = {
+      select: vi.fn(() => selectLimitRows([
+        { id: 'link-1', configPolicyId: 'policy-1', featureType: 'patch', featurePolicyId, inlineSettings: storedInline },
+      ])),
+      update,
+      delete: vi.fn(() => ({ where: vi.fn(() => Promise.resolve([])) })),
+      insert: vi.fn(() => ({ values: insertValues })),
+      set,
+      insertValues,
+    };
+    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
+    return tx;
+  }
 
+  /** The link JSONB the update wrote (the first `set` call carrying inlineSettings). */
+  function writtenInline(tx: any): Record<string, unknown> | undefined {
+    const call = tx.set.mock.calls.find((args: any[]) => args[0] && 'inlineSettings' in args[0]);
+    return call?.[0].inlineSettings;
+  }
+
+  it('saves an update that re-sends the retired keys and strips them from the JSONB and the relational insert', async () => {
+    const tx = txWithStoredPatchLink(STALE_PATCH_INPUT);
+    const updated = await updateFeatureLink('link-1', {
+      inlineSettings: { ...STALE_PATCH_INPUT, scheduleTime: '04:00' },
+    }, 'policy-1');
+
+    expect(updated).not.toBeNull();
+    const inline = writtenInline(tx);
+    expect(inline).toMatchObject({ scheduleTime: '04:00', sources: ['os', 'third_party'] });
+    for (const key of RETIRED_APPROVAL_KEYS) expect(inline).not.toHaveProperty(key);
+    const rowValues = tx.insertValues.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(rowValues).toMatchObject({ featureLinkId: 'link-1', scheduleTime: '04:00' });
+    for (const key of RETIRED_APPROVAL_KEYS) expect(rowValues).not.toHaveProperty(key);
+  });
+
+  it('does not write retired keys when an update omits them', async () => {
+    const tx = txWithStoredPatchLink(STALE_PATCH_INPUT);
+    await updateFeatureLink('link-1', { inlineSettings: { ...PATCH_INPUT, scheduleTime: '05:00' } }, 'policy-1');
+    const inline = writtenInline(tx);
+    expect(inline).toMatchObject({ scheduleTime: '05:00' });
+    for (const key of RETIRED_APPROVAL_KEYS) expect(inline).not.toHaveProperty(key);
+  });
+
+  it('a ring change no longer runs any app-rule check, whatever the stored link carries', async () => {
+    const tx = txWithStoredPatchLink(STALE_PATCH_INPUT, 'ring-1');
+    await expect(updateFeatureLink('link-1', { featurePolicyId: 'ring-2', inlineSettings: STALE_PATCH_INPUT }, 'policy-1'))
+      .resolves.not.toBeNull();
+    expect(resolvePatchPolicyReferenceMock).not.toHaveBeenCalled();
+    expect(tx.set.mock.calls[0]?.[0]).toMatchObject({ featurePolicyId: 'ring-2' });
+    const inline = writtenInline(tx);
+    for (const key of RETIRED_APPROVAL_KEYS) expect(inline).not.toHaveProperty(key);
+  });
+
+  it('addFeatureLink saves a payload with the retired keys and strips them', async () => {
+    let storedJsonb: any;
+    let rowValues: any;
+    let insertCall = 0;
     const tx = {
       insert: vi.fn(() => ({
         values: vi.fn((v: any) => {
           insertCall += 1;
           if (insertCall === 1) {
-            // feature link insert — captures what lands in the inline_settings JSONB
             storedJsonb = v.inlineSettings;
             return {
               onConflictDoNothing: vi.fn(() => ({
-                returning: vi.fn(() =>
-                  Promise.resolve([
-                    {
-                      id: 'link-1',
-                      configPolicyId: 'policy-1',
-                      featureType: 'patch',
-                      featurePolicyId: null,
-                      inlineSettings: v.inlineSettings,
-                    },
-                  ])
-                ),
+                returning: vi.fn(() => Promise.resolve([{ id: 'link-1', configPolicyId: 'policy-1', featureType: 'patch', featurePolicyId: null, inlineSettings: v.inlineSettings }])),
               })),
             };
           }
-          // config_policy_patch_settings insert (decomposeInlineSettings)
-          normalizedRowValues = v;
+          rowValues = v;
           return Promise.resolve([]);
         }),
       })),
     };
     vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
 
-    const link = await addFeatureLink('policy-1', 'patch', null, PATCH_INPUT);
+    const link = await addFeatureLink('policy-1', 'patch', null, STALE_PATCH_INPUT);
 
-    // The JSONB mirror must keep the JSON-only fields...
-    expect(storedJsonb.apps).toEqual(PATCH_INPUT.apps);
-    expect(storedJsonb.autoApproveDeferralDays).toBe(7);
-    // ...while the normalized table (which has no columns for them) does not get them
-    expect(normalizedRowValues.featureLinkId).toBe('link-1');
-    expect(normalizedRowValues.apps).toBeUndefined();
-    expect(normalizedRowValues.autoApproveDeferralDays).toBeUndefined();
-
-    // --- Read path: listFeatureLinks, fed exactly what the save wrote ---
-    vi.mocked(db.select)
-      .mockReturnValueOnce(selectWhereRows([link]) as any) // links query
-      .mockReturnValueOnce(
-        selectLimitRows([
-          {
-            id: 'ps-1',
-            featureLinkId: 'link-1',
-            sources: normalizedRowValues.sources,
-            autoApprove: normalizedRowValues.autoApprove,
-            autoApproveSeverities: normalizedRowValues.autoApproveSeverities,
-            scheduleFrequency: normalizedRowValues.scheduleFrequency,
-            scheduleTime: normalizedRowValues.scheduleTime,
-            scheduleDayOfWeek: normalizedRowValues.scheduleDayOfWeek,
-            scheduleDayOfMonth: normalizedRowValues.scheduleDayOfMonth,
-            rebootPolicy: normalizedRowValues.rebootPolicy,
-          },
-        ]) as any
-      ); // assembleInlineSettings patch query
-
-    const result = await listFeatureLinks('policy-1');
-    expect(result).toHaveLength(1);
-    const settings = result[0]!.inlineSettings as any;
-
-    // THE BUG: these two came back as [] / 0 before the merge fix
-    expect(settings.apps).toEqual(PATCH_INPUT.apps);
-    expect(settings.autoApproveDeferralDays).toBe(7);
-
-    // Relational fields still come from the normalized row
-    expect(settings.sources).toEqual(['os', 'third_party']);
-    expect(settings.autoApprove).toBe(true);
-    expect(settings.autoApproveSeverities).toEqual(['critical']);
-    expect(settings.scheduleFrequency).toBe('daily');
-    expect(settings.scheduleTime).toBe('03:30');
-    expect(settings.rebootPolicy).toBe('never');
+    expect(link).not.toBeNull();
+    expect(resolvePatchPolicyReferenceMock).not.toHaveBeenCalled();
+    expect(storedJsonb).toMatchObject({ scheduleTime: '03:30', rebootPolicy: 'never' });
+    expect(rowValues).toMatchObject({ featureLinkId: 'link-1', scheduleTime: '03:30' });
+    for (const key of RETIRED_APPROVAL_KEYS) {
+      expect(storedJsonb).not.toHaveProperty(key);
+      expect(rowValues).not.toHaveProperty(key);
+    }
   });
 
-  it('updateFeatureLink keeps apps and autoApproveDeferralDays in the JSONB write', async () => {
-    let setValues: any;
-    const tx = {
-      select: vi.fn(() =>
-        selectLimitRows([
-          {
-            id: 'link-1',
-            configPolicyId: 'policy-1',
-            featureType: 'patch',
-            featurePolicyId: null,
-            inlineSettings: {},
-          },
-        ])
-      ),
-      update: vi.fn(() => ({
-        set: vi.fn((v: any) => {
-          setValues = v;
-          return {
-            where: vi.fn(() => ({
-              returning: vi.fn(() => Promise.resolve([{ id: 'link-1' }])),
-            })),
-          };
-        }),
-      })),
+  it('does not apply to other feature types', async () => {
+    const tx: any = {
+      select: vi.fn(() => selectLimitRows([
+        { id: 'link-pam', configPolicyId: 'policy-1', featureType: 'pam', featurePolicyId: null, inlineSettings: {} },
+      ])),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn(() => ({ returning: vi.fn(() => Promise.resolve([{ id: 'link-pam' }])) })) })) })),
       delete: vi.fn(() => ({ where: vi.fn(() => Promise.resolve([])) })),
       insert: vi.fn(() => ({ values: vi.fn(() => Promise.resolve([])) })),
     };
     vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
+    await expect(updateFeatureLink('link-pam', { inlineSettings: { uacInterceptionEnabled: false } }, 'policy-1'))
+      .resolves.not.toBeNull();
+  });
+});
 
-    const updated = await updateFeatureLink('link-1', { inlineSettings: PATCH_INPUT }, 'policy-1');
-
-    expect(updated).not.toBeNull();
-    expect(setValues.inlineSettings.apps).toEqual(PATCH_INPUT.apps);
-    expect(setValues.inlineSettings.autoApproveDeferralDays).toBe(7);
+describe('patch feature link read path', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
   });
 
-  it('merges JSON-only fields from stored JSONB even when the normalized row wins', async () => {
-    // Mirrors loadPolicyLocalPatchConfig behavior in configPolicyPatching.ts
+  it('serves relational settings from listFeatureLinks and ignores retired keys in the stored JSONB', async () => {
     vi.mocked(db.select)
       .mockReturnValueOnce(
         selectWhereRows([
@@ -301,13 +313,7 @@ describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () =>
             configPolicyId: 'policy-1',
             featureType: 'patch',
             featurePolicyId: null,
-            inlineSettings: {
-              sources: ['third_party'],
-              autoApprove: true,
-              autoApproveSeverities: ['critical'],
-              autoApproveDeferralDays: 5,
-              apps: [{ source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' }],
-            },
+            inlineSettings: STALE_PATCH_INPUT,
           },
         ]) as any
       )
@@ -317,8 +323,6 @@ describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () =>
             id: 'ps-1',
             featureLinkId: 'link-1',
             sources: ['os'],
-            autoApprove: false,
-            autoApproveSeverities: [],
             scheduleFrequency: 'daily',
             scheduleTime: '03:00',
             scheduleDayOfWeek: 'mon',
@@ -331,18 +335,12 @@ describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () =>
     const result = await listFeatureLinks('policy-1');
     const settings = result[0]!.inlineSettings as any;
 
-    // Normalized row wins for relational fields
     expect(settings.sources).toEqual(['os']);
-    expect(settings.autoApprove).toBe(false);
     expect(settings.scheduleDayOfMonth).toBe(10);
-    // JSON-only fields survive from the stored JSONB
-    expect(settings.autoApproveDeferralDays).toBe(5);
-    expect(settings.apps).toEqual([
-      { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' },
-    ]);
+    for (const key of RETIRED_APPROVAL_KEYS) expect(settings).not.toHaveProperty(key);
   });
 
-  it('falls back to defaults for JSON-only fields when stored JSONB is malformed (no throw)', async () => {
+  it('falls back to the stored JSONB (retired keys stripped) when no normalized row exists', async () => {
     vi.mocked(db.select)
       .mockReturnValueOnce(
         selectWhereRows([
@@ -351,53 +349,7 @@ describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () =>
             configPolicyId: 'policy-1',
             featureType: 'patch',
             featurePolicyId: null,
-            inlineSettings: {
-              sources: [], // violates min(1)
-              scheduleTime: 'not-a-time',
-              apps: 'garbage-not-an-array',
-              autoApproveDeferralDays: 999, // out of range
-            },
-          },
-        ]) as any
-      )
-      .mockReturnValueOnce(
-        selectLimitRows([
-          {
-            id: 'ps-1',
-            featureLinkId: 'link-1',
-            sources: ['os'],
-            autoApprove: false,
-            autoApproveSeverities: [],
-            scheduleFrequency: 'weekly',
-            scheduleTime: '02:00',
-            scheduleDayOfWeek: 'sun',
-            scheduleDayOfMonth: 1,
-            rebootPolicy: 'if_required',
-          },
-        ]) as any
-      );
-
-    const result = await listFeatureLinks('policy-1');
-    const settings = result[0]!.inlineSettings as any;
-
-    // Merged fields fall back to schema defaults without throwing
-    expect(settings.apps).toEqual([]);
-    expect(settings.autoApproveDeferralDays).toBe(0);
-    // Normalized row still supplies the relational fields
-    expect(settings.sources).toEqual(['os']);
-    expect(settings.scheduleTime).toBe('02:00');
-  });
-
-  it('falls back to the stored JSONB (including apps) when no normalized row exists', async () => {
-    vi.mocked(db.select)
-      .mockReturnValueOnce(
-        selectWhereRows([
-          {
-            id: 'link-1',
-            configPolicyId: 'policy-1',
-            featureType: 'patch',
-            featurePolicyId: null,
-            inlineSettings: PATCH_INPUT,
+            inlineSettings: STALE_PATCH_INPUT,
           },
         ]) as any
       )
@@ -406,9 +358,9 @@ describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () =>
     const result = await listFeatureLinks('policy-1');
     const settings = result[0]!.inlineSettings as any;
 
-    expect(settings.apps).toEqual(PATCH_INPUT.apps);
-    expect(settings.autoApproveDeferralDays).toBe(7);
     expect(settings.sources).toEqual(['os', 'third_party']);
+    expect(settings.scheduleTime).toBe('03:30');
+    for (const key of RETIRED_APPROVAL_KEYS) expect(settings).not.toHaveProperty(key);
   });
 
   it('does not throw when no normalized row exists and stored JSONB is malformed', async () => {
@@ -430,8 +382,7 @@ describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () =>
     const settings = result[0]!.inlineSettings as any;
 
     expect(settings.sources).toEqual(['os']); // schema defaults
-    expect(settings.apps).toEqual([]);
-    expect(settings.autoApproveDeferralDays).toBe(0);
+    expect(settings.scheduleTime).toBe('02:00');
   });
 
   it('leaves non-patch feature links untouched (raw JSONB passthrough)', async () => {
@@ -452,6 +403,7 @@ describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () =>
     expect(result[0]!.inlineSettings).toEqual(helperSettings);
   });
 });
+
 
 // ============================================================
 // pamInlineSettingsSchema — unit tests for the exported schema
@@ -842,6 +794,32 @@ describe('updateConfigPolicy / deleteConfigPolicy — partner-wide administratio
 // validateFeaturePolicyExists — software_policy dual-axis (#2126)
 // ============================================================
 
+describe('validateFeaturePolicyExists — patch ring must be enabled (#8678)', () => {
+  beforeEach(() => {
+    vi.mocked(db.select).mockReset();
+  });
+
+  it('rejects linking a deleted (enabled = false) ring', async () => {
+    vi.mocked(db.select).mockReturnValue(selectLimitRows([{ id: 'ring-1', enabled: false }]) as never);
+    const result = await validateFeaturePolicyExists('patch', 'ring-1', { orgId: null, partnerId: 'partner-1' });
+    expect(result.valid).toBe(false);
+    expect(result.error).toMatch(/deleted or disabled/i);
+  });
+
+  it('accepts an enabled ring', async () => {
+    vi.mocked(db.select).mockReturnValue(selectLimitRows([{ id: 'ring-1', enabled: true }]) as never);
+    const result = await validateFeaturePolicyExists('patch', 'ring-1', { orgId: null, partnerId: 'partner-1' });
+    expect(result).toEqual({ valid: true });
+  });
+
+  it('still rejects a ring that does not exist for the partner', async () => {
+    vi.mocked(db.select).mockReturnValue(selectLimitRows([]) as never);
+    const result = await validateFeaturePolicyExists('patch', 'ring-1', { orgId: null, partnerId: 'partner-1' });
+    expect(result.valid).toBe(false);
+    expect(result.error).toMatch(/not found for this partner/i);
+  });
+});
+
 describe('validateFeaturePolicyExists — software_policy dual-axis linking (#2126)', () => {
   beforeEach(() => {
     vi.mocked(db.select).mockReset();
@@ -879,6 +857,24 @@ describe('validateFeaturePolicyExists — software_policy dual-axis linking (#21
     mockLookupReturns([{ id: 'sec-1' }]);
     const result = await validateFeaturePolicyExists('security', 'sec-1', { orgId: null, partnerId: 'partner-1' });
     expect(result.valid).toBe(true);
+  });
+
+  it('never resolves a software policy GENERATED from a security_agents link (#6960 carry-forward)', async () => {
+    const chain = selectLimitRows([{ id: 'sw-1' }]);
+    vi.mocked(db.select).mockReturnValue(chain as never);
+    await validateFeaturePolicyExists('software_policy', 'sw-1', { orgId: 'org-1', partnerId: null });
+    const { PgDialect } = await import('drizzle-orm/pg-core');
+    const rendered = new PgDialect().sqlToQuery(chain.where.mock.calls.at(-1)[0]).sql;
+    expect(rendered).toMatch(/"managed_by_link_id" is null/i);
+  });
+
+  it('does not add the managed predicate to other dual-axis types', async () => {
+    const chain = selectLimitRows([{ id: 'sec-1' }]);
+    vi.mocked(db.select).mockReturnValue(chain as never);
+    await validateFeaturePolicyExists('security', 'sec-1', { orgId: 'org-1', partnerId: null });
+    const { PgDialect } = await import('drizzle-orm/pg-core');
+    const rendered = new PgDialect().sqlToQuery(chain.where.mock.calls.at(-1)[0]).sql;
+    expect(rendered).not.toMatch(/managed_by_link_id/i);
   });
 
   it('rejects a security policy id that resolves to neither axis', async () => {

@@ -616,7 +616,55 @@
           "observability": "Observability",
           "security-abuse": "Security and abuse",
           "integrations": "Integrations"
+        },
+        "probe": {
+          "checkNow": "Check now",
+          "checking": "Checking…",
+          "failed": "Could not run the executor check.",
+          "notConfigured": "Executor URL is not set.",
+          "reachable": "Reachable · {{ms}} ms",
+          "unreachable": "Not reachable",
+          "route": "Route /v1/{{route}}: {{state}}",
+          "version": "Version {{version}} ({{sha}})",
+          "versionMismatch": "Version {{version}} ({{sha}}) differs from this API",
+          "versionUnavailable": "Version not reported (older build)",
+          "state": {
+            "present": "Present",
+            "missing": "Missing",
+            "unknown": "Unknown"
+          }
         }
+      },
+      "connectionHealthJobs": {
+        "title": "Connection health background jobs",
+        "description": "Shows whether the jobs that watch connection health are running. Checked from Redis heartbeats.",
+        "jobs": {
+          "reconcile": {
+            "label": "Incident reconciler",
+            "description": "Opens and resolves connection health incidents every 15 minutes."
+          },
+          "digest": {
+            "label": "Daily digest email",
+            "description": "Sends the connection health digest; runs hourly."
+          }
+        },
+        "state": {
+          "ok": "OK",
+          "stale": "Stale",
+          "missing": "No heartbeat",
+          "failing": "Failing"
+        },
+        "lastRun": "Last run {{relative}}",
+        "neverRun": "No heartbeat recorded",
+        "kindsHeading": "Health sources",
+        "lastOk": "Last OK {{relative}}",
+        "neverOk": "Never succeeded",
+        "failureStreak": "Consecutive failures: {{count}}",
+        "redisUnavailable": "Job status can't be read because Redis is unavailable. This does not mean the jobs have stopped.",
+        "errors": {
+          "load": "Could not load job status."
+        },
+        "retry": "Retry"
       }
     },
     "aiModels": {

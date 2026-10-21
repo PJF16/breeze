@@ -44,6 +44,8 @@ export default defineConfig({
       'src/services/hardwareHealth/**/*.integration.test.ts',
       'src/services/timeSync/**/*.integration.test.ts',
       'src/services/workloads/**/*.integration.test.ts',
+      // Workload image currency (W05 #8194): the pass under real RLS + the system-only cache.
+      'src/services/imageCurrency/**/*.integration.test.ts',
       // Hardware & RAID monitoring (W05 BMC in-band): real-DB migration/enum
       // proof and BMC discovery-worker/topology-publish suites. Import
       // `__tests__/integration/setup` (real postgres pool + autoMigrate).
@@ -324,6 +326,13 @@ export default defineConfig({
       // persistence and the draft-preview-doesn't-persist rule.
       'src/services/invoiceService.issue.integration.test.ts',
       'src/services/invoicePdf.integration.test.ts',
+      // #9402 W1b: the customer-document assembler's row filter is SQL, so a
+      // mocked DB proves nothing about hidden lines — this runs it on Postgres
+      // under portal, staff and system contexts.
+      'src/services/customerDocument.integration.test.ts',
+      // #9418 W2a: the quote half — hidden lines and internal header columns
+      // never leave, on Postgres, under the same three contexts.
+      'src/services/customerDocument.quote.integration.test.ts',
       // Wave 3.5c (#4085): real-Postgres + real-Redis/BullMQ coverage for the
       // durable event-dispatch pipeline (enqueueRouteEvent, eventDispatchProcessor,
       // the event_delivery_receipts state machine) — a real Worker draining a

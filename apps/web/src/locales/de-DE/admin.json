@@ -616,7 +616,55 @@
           "observability": "Beobachtbarkeit",
           "security-abuse": "Sicherheit und Missbrauch",
           "integrations": "Integrationen"
+        },
+        "probe": {
+          "checkNow": "Jetzt prüfen",
+          "checking": "Prüfung läuft…",
+          "failed": "Die Executor-Prüfung konnte nicht ausgeführt werden.",
+          "notConfigured": "Die Executor-URL ist nicht gesetzt.",
+          "reachable": "Erreichbar · {{ms}} ms",
+          "unreachable": "Nicht erreichbar",
+          "route": "Endpunkt /v1/{{route}}: {{state}}",
+          "version": "Version {{version}} (Build {{sha}})",
+          "versionMismatch": "Version {{version}} ({{sha}}) weicht von dieser API ab",
+          "versionUnavailable": "Version nicht gemeldet (älterer Build)",
+          "state": {
+            "present": "Vorhanden",
+            "missing": "Fehlt",
+            "unknown": "Unbekannt"
+          }
         }
+      },
+      "connectionHealthJobs": {
+        "title": "Hintergrundjobs der Verbindungsüberwachung",
+        "description": "Zeigt, ob die Jobs zur Überwachung des Verbindungsstatus laufen. Geprüft anhand von Redis-Heartbeats.",
+        "jobs": {
+          "reconcile": {
+            "label": "Vorfallsabgleich",
+            "description": "Öffnet und schließt Verbindungsvorfälle alle 15 Minuten."
+          },
+          "digest": {
+            "label": "Tägliche Digest-E-Mail",
+            "description": "Versendet die Verbindungsübersicht; läuft stündlich."
+          }
+        },
+        "state": {
+          "ok": "In Ordnung",
+          "stale": "Veraltet",
+          "missing": "Kein Heartbeat",
+          "failing": "Fehlgeschlagen"
+        },
+        "lastRun": "Letzter Lauf {{relative}}",
+        "neverRun": "Kein Heartbeat erfasst",
+        "kindsHeading": "Überwachte Quellen",
+        "lastOk": "Zuletzt OK {{relative}}",
+        "neverOk": "Nie erfolgreich",
+        "failureStreak": "Aufeinanderfolgende Fehler: {{count}}",
+        "redisUnavailable": "Der Jobstatus kann nicht gelesen werden, da Redis nicht verfügbar ist. Das bedeutet nicht, dass die Jobs gestoppt sind.",
+        "errors": {
+          "load": "Jobstatus konnte nicht geladen werden."
+        },
+        "retry": "Erneut versuchen"
       }
     },
     "aiModels": {

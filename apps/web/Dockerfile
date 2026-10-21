@@ -27,6 +27,7 @@ COPY patches ./patches
 COPY apps/web/package.json ./apps/web/
 COPY packages/shared/package.json ./packages/shared/
 COPY packages/extension-web-sdk/package.json ./packages/extension-web-sdk/
+COPY packages/document-ui/package.json ./packages/document-ui/
 
 # Install all dependencies
 RUN pnpm install --frozen-lockfile --prefer-offline
@@ -40,10 +41,12 @@ ARG PUBLIC_API_URL=
 ARG PUBLIC_APP_VERSION=0.1.0
 # Build-time UI feature flags (empty → off; see apps/web/src/lib/featureFlags.ts)
 ARG PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST=
+ARG PUBLIC_ENABLE_ENDPOINT_MESSAGING=
 ENV NODE_ENV=${NODE_ENV}
 ENV PUBLIC_API_URL=${PUBLIC_API_URL}
 ENV PUBLIC_APP_VERSION=${PUBLIC_APP_VERSION}
 ENV PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST=${PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST}
+ENV PUBLIC_ENABLE_ENDPOINT_MESSAGING=${PUBLIC_ENABLE_ENDPOINT_MESSAGING}
 
 # Copy dependencies from deps stage
 COPY --from=deps /app/node_modules ./node_modules

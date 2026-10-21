@@ -22,6 +22,7 @@ import HuntressIntegration from "./HuntressIntegration";
 import MonitoringIntegration from "./MonitoringIntegration";
 import GoogleWorkspaceIntegration from "./GoogleWorkspaceIntegration";
 import M365TenantSection from "./M365TenantSection";
+import M365ActionsStaleManifestTable from "./M365ActionsStaleManifestTable";
 import {
   M365_CUSTOMER_GRAPH_READ_CALLBACK_RESULTS,
   type M365CustomerGraphReadCallbackResult,
@@ -39,7 +40,10 @@ import AccountingProviderCards from "./AccountingProviderCards";
 import StripePaymentsIntegration from "./StripePaymentsIntegration";
 import UnifiIntegration from "./UnifiIntegration";
 import BackupProvidersIntegration from "./BackupProvidersIntegration";
+import EdrProvidersIntegration from "./EdrProvidersIntegration";
 import AccessDenied from "../shared/AccessDenied";
+import ConnectionHealthPanel from "./ConnectionHealthPanel";
+import ConnectionHealthSettingsCard from "./ConnectionHealthSettingsCard";
 import { usePermissions } from "../../lib/permissions";
 import { getJwtClaims } from "../../lib/authScope";
 import { useHelpStore, rebaseDocsUrl } from "../../stores/helpStore";
@@ -65,7 +69,7 @@ type TabId =
   | "accounting"
   | "unifi"
   | "backup";
-type SecuritySubTab = "sentinelone" | "huntress";
+type SecuritySubTab = "sentinelone" | "huntress" | "edr";
 type CloudTenantsSubTab = "google" | "m365";
 type DistributorSubTab = "pax8" | "tdsynnex" | "tdsynnex-ec" | "tdsynnex-sftp";
 type AccountingSubTab = AccountingProviderId | "stripe";
@@ -102,6 +106,7 @@ const tabs: { id: TabId; labelKey: string; icon: typeof Activity }[] = [
 const securitySubTabs: { id: SecuritySubTab; labelKey: string }[] = [
   { id: "sentinelone", labelKey: "integrationsPage.sentinelone" },
   { id: "huntress", labelKey: "integrationsPage.huntress" },
+  { id: "edr", labelKey: "integrationsPage.edrProviders" },
 ];
 
 const cloudTenantsSubTabs: { id: CloudTenantsSubTab; labelKey: string }[] = [
@@ -188,6 +193,10 @@ function parseHash(fallbackTab: TabId): {
       consumeCustomerGraphActionsResult: true,
     };
   }
+  // The partner re-consent table writes `#m365-reconsent-<orgId>` for its
+  // selected row; it lives inside the Microsoft 365 tenant section.
+  if (hash.startsWith("m365-reconsent-"))
+    return { tab: "cloud-tenants", cloudTenantsSub: "m365" };
   if (tabs.some((t) => t.id === hash)) return { tab: hash as TabId };
   // Legacy alias: this tab was "Identity" (#identity) before it was renamed to
   // Cloud tenants. Bookmarks and docs links still carry the old hash.
@@ -230,6 +239,15 @@ export default function IntegrationsPage({
   const claims = getJwtClaims();
   const callbackOrgId = currentOrgId
     || (claims.scope === "organization" ? claims.orgId ?? null : null);
+  // #9318: name the org every card below configures. Same id the cards and the
+  // save calls use (callbackOrgId), so the label cannot disagree with the write
+  // target.
+  const scopeOrgName = useOrgStore((value) => {
+    const organizations = (value as { organizations?: { id: string; name: string }[] }).organizations;
+    return callbackOrgId && Array.isArray(organizations)
+      ? organizations.find((org) => org.id === callbackOrgId)?.name ?? null
+      : null;
+  });
   // Deep-link support: the URL hash selects the initial tab — and sub-tab — on
   // load, e.g. /integrations#psa or /integrations#huntress.
   //
@@ -517,6 +535,34 @@ export default function IntegrationsPage({
         }
       />
 
+      {callbackOrgId && (
+        <div
+          data-testid="integrations-scope-bar"
+          className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border bg-muted/30 px-4 py-2 text-sm"
+        >
+          <span className="text-muted-foreground">{t("integrationsPage.scopeBar.configuringFor")}</span>
+          <strong data-testid="integrations-scope-org" className="font-semibold text-foreground">
+            {scopeOrgName ?? t("integrationsPage.scopeBar.thisOrganization")}
+          </strong>
+          {!isOrgScoped && (
+            <button
+              type="button"
+              data-testid="integrations-scope-change"
+              onClick={() => window.dispatchEvent(new CustomEvent("breeze:open-org-switcher"))}
+              className="text-primary underline-offset-2 hover:underline"
+            >
+              {t("integrationsPage.scopeBar.change")}
+            </button>
+          )}
+        </div>
+      )}
+
+      <ConnectionHealthPanel />
+
+      {/* W5: who besides MSP staff hears about broken connections. Partner and
+          system scope only; the API refuses org scope. */}
+      {!isOrgScoped && <ConnectionHealthSettingsCard orgId={currentOrgId ?? null} />}
+
       {/* Top-level tabs */}
       <div className="flex flex-wrap gap-3">
         {visibleTabs.map((tab) => {
@@ -662,17 +708,25 @@ export default function IntegrationsPage({
       {activeTab === "security" && securitySubTab === "huntress" && (
         <HuntressIntegration />
       )}
+      {activeTab === "security" && securitySubTab === "edr" && (
+        <EdrProvidersIntegration />
+      )}
       {activeTab === "monitoring" && <MonitoringIntegration />}
       {activeTab === "cloud-tenants" && cloudTenantsSubTab === "google" && (
         <GoogleWorkspaceIntegration />
       )}
       {activeTab === "cloud-tenants" && cloudTenantsSubTab === "m365" && (
-        <M365TenantSection
-          readCallbackResult={visibleCustomerGraphReadResult}
-          readCallbackRefreshKey={customerGraphReadCallback.refreshKey}
-          actionsCallbackResult={visibleCustomerGraphActionsResult}
-          actionsCallbackRefreshKey={customerGraphActionsCallback.refreshKey}
-        />
+        <>
+          <M365TenantSection
+            readCallbackResult={visibleCustomerGraphReadResult}
+            readCallbackRefreshKey={customerGraphReadCallback.refreshKey}
+            actionsCallbackResult={visibleCustomerGraphActionsResult}
+            actionsCallbackRefreshKey={customerGraphActionsCallback.refreshKey}
+          />
+          {/* Partner-scoped view of connections still on an older permission
+              manifest. Gated on the JWT scope (never useOrgStore partners). */}
+          {claims.scope === "partner" && <M365ActionsStaleManifestTable />}
+        </>
       )}
       {activeTab === "distributors" && isOrgScoped && (
         <p

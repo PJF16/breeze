@@ -37,6 +37,14 @@ vi.mock('./TicketChecklistCard', () => ({
   default: () => <div data-testid="ticket-checklist-card-stub" />,
 }));
 
+// Same reason as the checklist: the links card self-fetches /tickets/:id/links.
+// Its own behaviour lives in TicketLinksCard.test.tsx; here we only assert it is
+// mounted beside the checklist and handed the ticket.
+const linksCardProps = vi.hoisted(() => ({ last: null as null | { ticketId: string; orgId?: string; ticketType?: string; canWrite?: boolean } }));
+vi.mock('./TicketLinksCard', () => ({
+  default: (p: { ticketId: string; orgId?: string; ticketType?: string; canWrite?: boolean }) => { linksCardProps.last = p; return <div data-testid="ticket-links-card-stub" />; },
+}));
+
 vi.mock('../../lib/ticketConfigApi', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../lib/ticketConfigApi')>();
   return { ...actual, fetchTicketConfig: vi.fn().mockResolvedValue(null) };
@@ -125,6 +133,23 @@ describe('TicketWorkbench — organization record link', () => {
     expect(link.tagName).toBe('A');
     expect(link).toHaveAttribute('href', '/organizations/org-9');
     expect(link).toHaveTextContent('Globex Inc');
+  });
+
+  it('links the header device hostname to /devices/:id (ui-flow W03)', async () => {
+    mockTicketApi({ 'tk-1': makeTicket({ deviceId: 'dev-1', deviceHostname: 'DESKTOP-123' }) });
+    render(<TicketWorkbench ticketId="tk-1" />);
+    await screen.findByTestId('ticket-workbench');
+
+    expect(screen.getByTestId('device-record-link')).toHaveAttribute('href', '/devices/dev-1');
+  });
+
+  it('prints the header hostname as text when the ticket has no deviceId', async () => {
+    mockTicketApi({ 'tk-1': makeTicket({ deviceId: null, deviceHostname: 'DESKTOP-123' }) });
+    render(<TicketWorkbench ticketId="tk-1" />);
+    await screen.findByTestId('ticket-workbench');
+
+    expect(screen.queryByTestId('device-record-link')).toBeNull();
+    expect(screen.getAllByText('DESKTOP-123').length).toBeGreaterThan(0);
   });
 });
 
@@ -2342,6 +2367,78 @@ describe('TicketWorkbench device link/unlink', () => {
   });
 });
 
+describe('TicketWorkbench device link/change (#8962)', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  const DEVICES = [
+    { id: 'dev-7', hostname: 'DESK-7', displayName: null, osType: 'windows', status: 'online' },
+    { id: 'dev-8', hostname: 'DESK-8', displayName: 'Front desk', osType: 'macos', status: 'offline' },
+  ];
+
+  function mockWithDevices(ticket: TicketDetail) {
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.startsWith('/devices/options')) {
+        return makeJsonResponse({ data: DEVICES, page: { hasMore: false, total: 2, nextCursor: null } });
+      }
+      if (!init?.method || init.method === 'GET') {
+        if (url === '/tickets/tk-1') return makeJsonResponse({ data: ticket });
+      }
+      return makeJsonResponse({ success: true });
+    });
+  }
+
+  it('offers Link device on a ticket with no device and PATCHes the chosen deviceId scoped to the ticket org', async () => {
+    mockWithDevices(makeTicket({ orgId: 'org-1', deviceId: null, deviceHostname: null }));
+    render(<TicketWorkbench ticketId="tk-1" assignees={[]} />);
+
+    await screen.findByTestId('ticket-workbench-device');
+    fireEvent.click(screen.getByTestId('ticket-workbench-device-edit'));
+    expect(screen.getByTestId('ticket-workbench-device-edit')).toHaveTextContent('Link device');
+
+    const choice = await screen.findByLabelText(/DESK-7/);
+    fireEvent.click(choice);
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/tickets/tk-1',
+        expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ deviceId: 'dev-7' }) })
+      );
+    });
+    const optionCalls = fetchMock.mock.calls.filter(([u]) => String(u).startsWith('/devices/options'));
+    expect(optionCalls.length).toBeGreaterThan(0);
+    expect(String(optionCalls[0][0])).toContain('orgId=org-1');
+  });
+
+  it('offers Change device on a linked ticket, keeps Unlink, and replaces the device', async () => {
+    mockWithDevices(makeTicket({ orgId: 'org-1', deviceId: 'dev-1', deviceHostname: 'DESKTOP-123' }));
+    render(<TicketWorkbench ticketId="tk-1" assignees={[]} />);
+
+    await screen.findByTestId('ticket-workbench-device');
+    expect(screen.getByTestId('ticket-workbench-device-unlink')).toBeInTheDocument();
+    expect(screen.getByTestId('ticket-workbench-device-edit')).toHaveTextContent('Change device');
+    fireEvent.click(screen.getByTestId('ticket-workbench-device-edit'));
+
+    fireEvent.click(await screen.findByLabelText(/Front desk/));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/tickets/tk-1',
+        expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ deviceId: 'dev-8' }) })
+      );
+    });
+  });
+
+  it('warns that changing the device on an assigned ticket can unassign the technician', async () => {
+    mockWithDevices(makeTicket({ orgId: 'org-1', deviceId: 'dev-1', deviceHostname: 'DESKTOP-123', assignedTo: 'u-1' } as Partial<TicketDetail>));
+    render(<TicketWorkbench ticketId="tk-1" assignees={[]} />);
+
+    await screen.findByTestId('ticket-workbench-device');
+    fireEvent.click(screen.getByTestId('ticket-workbench-device-edit'));
+    expect(await screen.findByTestId('ticket-workbench-device-assignee-warning')).toBeInTheDocument();
+  });
+});
+
 // ─── Requester editing + clickable device link ────────────────────────────────
 
 describe('TicketWorkbench requester editing + device link', () => {
@@ -2576,6 +2673,33 @@ describe('TicketWorkbench move-org action', () => {
     });
   }
 
+  it('on 409 APPROVAL_REQUEST_PENDING toasts localized copy, not the server text (#8196)', async () => {
+    const ticket = makeTicket({ id: 'tk-1', orgId: 'org-1', orgName: 'Acme Corp' });
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.startsWith('/orgs/organizations')) {
+        return makeJsonResponse({ data: [{ id: 'org-1', name: 'Acme Corp' }, { id: 'org-2', name: 'Globex Inc' }] });
+      }
+      if (init?.method === 'POST' && url.includes('/move-org')) {
+        return makeJsonResponse({ error: 'raw server text', code: 'APPROVAL_REQUEST_PENDING' }, false, 409);
+      }
+      if (!init?.method || init.method === 'GET') {
+        if (url === '/tickets/tk-1') return makeJsonResponse({ data: ticket });
+      }
+      return makeJsonResponse({ success: true });
+    });
+    render(<TicketWorkbench ticketId="tk-1" assignees={[]} />);
+    await screen.findByTestId('ticket-workbench');
+    fireEvent.click(screen.getByTestId('ticket-workbench-move-org'));
+    fireEvent.change(await screen.findByTestId('ticket-workbench-move-org-select'), { target: { value: 'org-2' } });
+    fireEvent.click(screen.getByTestId('ticket-workbench-move-org-confirm'));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'error',
+      message: expect.stringMatching(/approval request waiting on the customer/),
+    })));
+    expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ message: 'raw server text' }));
+  });
+
   it('a successful first move closes the form', async () => {
     const ticket = makeTicket({ id: 'tk-1', orgId: 'org-1', orgName: 'Acme Corp' });
     mockTicketApiWithOrgs(ticket);
@@ -2754,6 +2878,25 @@ describe('TicketWorkbench create-invoice blocked by currency (#3776)', () => {
     expect(screen.queryByTestId('ticket-invoice-blocked')).toBeNull();
   });
 
+  it('warns about hours held for the organization block, then opens the draft', async () => {
+    const ticket = makeTicket({ id: 'tk-1' });
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if ((!init?.method || init.method === 'GET') && url === '/tickets/tk-1') return makeJsonResponse({ data: ticket });
+      if (init?.method === 'POST' && url === '/tickets/tk-1/invoice') {
+        return makeJsonResponse({ data: { invoice: { id: 'inv-1' }, lines: [], blockedByCurrency: [], missingRate: [], heldForHourBlock: { count: 1, hours: 0.5 } } });
+      }
+      return makeJsonResponse({ success: true });
+    });
+    render(<TicketWorkbench ticketId="tk-1" />);
+    await screen.findByTestId('ticket-workbench');
+    fireEvent.click(screen.getByTestId('ticket-workbench-create-invoice'));
+    await waitFor(() => expect(navigateTo).toHaveBeenCalledWith('/billing/invoices/inv-1'));
+    expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'warning', message: expect.stringContaining('1 time entry (0.5 hours) is held'),
+    }));
+  });
+
   // Review #1 (#3776): rate-less entries are never billed at zero; the response
   // lists them under missingRate so the tech can set a rate and try again.
   it('lists missingRate entries from a partial success with a link to set a rate', async () => {
@@ -2906,5 +3049,104 @@ describe('TicketWorkbench → TicketPartsCard currency (#3775)', () => {
     await screen.findByTestId('ticket-parts-card-stub');
     await waitFor(() => expect(partsCardProps.last?.currencyCode).toBe('EUR'));
     expect(partsCardProps.last?.ticketId).toBe('tk-1');
+  });
+});
+
+describe('TicketWorkbench — ticket type (#7900)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    linksCardProps.last = null;
+  });
+
+  it('shows an editable type select for users with tickets:write and PATCHes ticketType through the API', async () => {
+    authState.permissions = [{ resource: 'tickets', action: 'write' }];
+    // The reconcile GET is held and would return the OLD type: only the
+    // optimistic patch can make the select read 'problem' in the meantime.
+    const initial = makeTicket({ ticketType: 'incident' });
+    let gets = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (init?.method === 'PATCH' && url === '/tickets/tk-1') return makeJsonResponse({ success: true });
+      if (url === '/tickets/tk-1') {
+        gets += 1;
+        if (gets === 1) return makeJsonResponse({ data: initial });
+        return new Promise<Response>(() => { /* reconcile never lands */ });
+      }
+      return makeJsonResponse({ success: true });
+    });
+    const onTicketPatched = vi.fn();
+    render(<TicketWorkbench ticketId="tk-1" onTicketPatched={onTicketPatched} />);
+    await screen.findByTestId('ticket-workbench');
+
+    const select = screen.getByTestId('ticket-workbench-type') as HTMLSelectElement;
+    expect(select.value).toBe('incident');
+    expect(screen.queryByTestId('ticket-workbench-type-chip')).toBeNull();
+
+    fireEvent.change(select, { target: { value: 'problem' } });
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/tickets/tk-1',
+        expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ ticketType: 'problem' }) })
+      );
+    });
+    // Optimistic: the select reflects the new value without waiting for the reconcile GET,
+    // and the queue row is patched through onTicketPatched.
+    await waitFor(() => expect(screen.getByTestId('ticket-workbench-type')).toHaveValue('problem'));
+    expect(onTicketPatched).toHaveBeenCalledWith('tk-1', { ticketType: 'problem' });
+  });
+
+  it('selecting the current type sends nothing', async () => {
+    authState.permissions = [{ resource: 'tickets', action: 'write' }];
+    mockTicketApi({ 'tk-1': makeTicket({ ticketType: 'change' }) });
+    render(<TicketWorkbench ticketId="tk-1" />);
+    await screen.findByTestId('ticket-workbench');
+    fireEvent.change(screen.getByTestId('ticket-workbench-type'), { target: { value: 'change' } });
+    expect(mutationCalls()).toHaveLength(0);
+  });
+
+  it('read-only users see a chip, not a select', async () => {
+    authState.permissions = [{ resource: 'tickets', action: 'read' }];
+    mockTicketApi({ 'tk-1': makeTicket({ ticketType: 'change' }) });
+    render(<TicketWorkbench ticketId="tk-1" />);
+    await screen.findByTestId('ticket-workbench');
+
+    expect(screen.queryByTestId('ticket-workbench-type')).toBeNull();
+    expect(screen.getByTestId('ticket-workbench-type-chip')).toHaveTextContent('Change');
+  });
+
+  it('toasts a failed type change and keeps the old value', async () => {
+    authState.permissions = [{ resource: 'tickets', action: 'write' }];
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (init?.method === 'PATCH') return makeJsonResponse({ error: 'nope' }, false, 500);
+      if (url === '/tickets/tk-1') return makeJsonResponse({ data: makeTicket({ ticketType: 'incident' }) });
+      return makeJsonResponse({ success: true });
+    });
+    render(<TicketWorkbench ticketId="tk-1" />);
+    await screen.findByTestId('ticket-workbench');
+
+    fireEvent.change(screen.getByTestId('ticket-workbench-type'), { target: { value: 'change' } });
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' })));
+    expect(screen.getByTestId('ticket-workbench-type')).toHaveValue('incident');
+    // A failed save must not report the ticket as changed.
+    expect(fetchMock.mock.calls.filter(([, i]) => i?.method === 'PATCH')).toHaveLength(1);
+  });
+
+  it('mounts the related-tickets card, passing write capability', async () => {
+    authState.permissions = [{ resource: 'tickets', action: 'write' }];
+    mockTicketApi({ 'tk-1': makeTicket({ orgId: 'org-77', ticketType: 'problem' }) });
+    render(<TicketWorkbench ticketId="tk-1" />);
+    await screen.findByTestId('ticket-links-card-stub');
+    // orgId scopes the link search; ticketType drives the linked-incident count.
+    expect(linksCardProps.last).toMatchObject({ ticketId: 'tk-1', orgId: 'org-77', ticketType: 'problem', canWrite: true });
+  });
+
+  it('tells the links card the user is read-only', async () => {
+    authState.permissions = [{ resource: 'tickets', action: 'read' }];
+    mockTicketApi({ 'tk-1': makeTicket() });
+    render(<TicketWorkbench ticketId="tk-1" />);
+    await screen.findByTestId('ticket-links-card-stub');
+    expect(linksCardProps.last).toMatchObject({ canWrite: false });
   });
 });

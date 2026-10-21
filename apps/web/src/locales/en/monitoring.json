@@ -192,7 +192,8 @@
     "script": "Script check",
     "network_check": "Network check",
     "hardware_health": "Hardware health",
-    "time_sync": "Time synchronization"
+    "time_sync": "Time synchronization",
+    "container_image_currency": "Container image currency"
   },
   "fields": {
     "operator": "Comparison",
@@ -538,11 +539,13 @@
       "more": "Load more",
       "empty": "No conversion history.",
       "system": "System",
+      "unknownUser": "Unknown user",
       "reverted": "Reverted",
       "deadline": "Undo is unavailable after the legacy alerting retirement removes the source runtime."
     },
     "errorCodes": {
       "preview_stale": "The policy changed since this preview. Preview again before converting.",
+      "conversion_contended": "Other changes were happening at the same time, so the conversion did not complete. Nothing was changed. Try again.",
       "preview_failed": "The preview could not be produced. Try again later.",
       "equivalence_delta": "The converted monitors would not behave like the legacy rules on every device. Review the preview before converting.",
       "CONVERSION_PREREQUISITE_MISSING": "A required platform update has not been deployed yet, so this cannot be converted.",
@@ -646,6 +649,9 @@
           "policy_not_applied": "Time policy was not applied",
           "policy_conflict_gpo": "Group Policy controls time settings"
         }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "Minimum days behind"
       }
     }
   },

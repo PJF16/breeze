@@ -46,6 +46,18 @@ describe('AI_SYSTEM_PROMPT_TAIL vulnerability tool routing (#2605)', () => {
 // which the model read as "ask in chat". The approval gate already IS the
 // human step; the prompt must send the model to it rather than duplicate it.
 describe('BREEZE_AI_GUARDRAILS_CORE approval-gate wording (#5107)', () => {
+  // #9306 split the approval rules per surface; the in-app chat keeps its
+  // Approve/Deny wording unchanged (MCP gets its own rule 3 in mcpGuidance).
+  it('in-app rule 3 still describes the Approve/Deny prompt verbatim (#9306)', () => {
+    expect(BREEZE_AI_GUARDRAILS_CORE).toContain(
+      '\n3. Destructive operations (service restart, file delete, script/command execution, patch install, registry edits, '
+      + 'elevation changes) are approval-gated by the server, which shows the user an Approve/Deny prompt and rejects '
+      + 'unauthorized calls.',
+    );
+    expect(AI_SYSTEM_PROMPT_BASE).toContain(BREEZE_AI_GUARDRAILS_CORE);
+    expect(BREEZE_AI_GUARDRAILS_CORE).not.toContain('MCP_APPROVAL_REQUIRED');
+  });
+
   it('no longer tells the model to obtain confirmation itself', () => {
     // The exact old instruction, which the model read as "ask in chat".
     expect(BREEZE_AI_GUARDRAILS_CORE).not.toMatch(/require explicit human confirmation/i);
@@ -121,8 +133,11 @@ it('carries no hand-typed tool index any more', () => {
   expect(AI_SYSTEM_PROMPT_BASE).not.toMatch(/\bquery_devices\b/);
   expect(AI_SYSTEM_PROMPT_TAIL).not.toContain('## Available Tools by Domain');
 });
-it('BASE + TAIL stay under 7 KB together', () => {
-  expect(Buffer.byteLength(AI_SYSTEM_PROMPT_BASE + AI_SYSTEM_PROMPT_TAIL, 'utf8')).toBeLessThan(7 * 1024);
+// 7.5 KB since #8852 W04 added guardrail 6a (the untrusted device-text rule,
+// ~400 bytes) — a safety rule, not tool prose; tool detail still belongs in
+// the generated index, not here.
+it('BASE + TAIL stay under 7.5 KB together', () => {
+  expect(Buffer.byteLength(AI_SYSTEM_PROMPT_BASE + AI_SYSTEM_PROMPT_TAIL, 'utf8')).toBeLessThan(7.5 * 1024);
 });
 
 it('tells the model how to continue a paged result and how to read a handle (A-W05)', () => {

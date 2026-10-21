@@ -22,6 +22,10 @@ export const PERMISSION_GRANTS = {
   DEVICES_WRITE: { resource: 'devices', action: 'write' },
   DEVICES_DELETE: { resource: 'devices', action: 'delete' },
   DEVICES_EXECUTE: { resource: 'devices', action: 'execute' },
+  // Ask the watchdog to restart or start a wedged/stopped agent (#9234). Its own
+  // grant so an MSP can hand out agent recovery without arbitrary device
+  // commands, or withhold it from a role that otherwise holds devices:execute.
+  DEVICES_RECOVER_AGENT: { resource: 'devices', action: 'recover_agent' },
 
   // Signed, resource-bound rollback of customer-machine agent components.
   AGENT_ROLLBACK_CREATE: { resource: 'agent_rollback', action: 'create' },
@@ -155,6 +159,12 @@ export const PERMISSION_GRANTS = {
   SITES_WRITE: { resource: 'sites', action: 'write' },
   SITES_DELETE: { resource: 'sites', action: 'delete' },
   SITES_SET_LOCATION: { resource: 'sites', action: 'set_location' },
+
+  // Endpoint messaging (#8293): push a message to the person at a device.
+  // Deliberately separate from devices:execute ("may talk to a user" is not
+  // "may run code").
+  ENDPOINT_MESSAGES_SEND: { resource: 'endpoint_messages', action: 'send' },
+  ENDPOINT_MESSAGES_READ: { resource: 'endpoint_messages', action: 'read' },
 
   // Automations
   AUTOMATIONS_READ: { resource: 'automations', action: 'read' },

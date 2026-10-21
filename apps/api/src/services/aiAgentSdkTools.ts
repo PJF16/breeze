@@ -7,6 +7,7 @@ import { AI_AGENT_RUN_STATUSES, TOPOLOGY_INTERFACE_METRIC_SERIES } from '@breeze
  * via Zod schemas and calls the existing handler with org-scoped auth context.
  */
 
+import { GENERATE_REPORT_TYPES } from './aiReportTypes';
 import { z } from 'zod';
 import { fixProblemSchema } from './fixMemory/problemSignature';
 import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
@@ -22,7 +23,9 @@ import type { CaptureScope } from './artifacts/toolResultCapture';
 import type { ToolExecutionContext } from './toolExecutionContext';
 import type { AiToolTier, ActionPlanStep } from '@breeze/shared/types/ai';
 import { compactToolResultForChat } from './aiToolOutput';
+import { sanitizeUntrustedToolValue } from './aiInputSanitizer';
 import { sanitizeThrownToolError } from './aiToolErrors';
+import { callerRefusal, type CallerRefusalPayload } from './callerVerification/refusal';
 import { buildToolHandoffResult, handoffIsError, type ToolHandoffStatus } from './aiToolHandoff';
 import type { ActiveSession } from './streamingSessionManager';
 import type { SdkTool } from './aiAgents/outcomeTools';
@@ -39,13 +42,17 @@ import { JOURNAL_VACUUM_MAX_BYTES, JOURNAL_VACUUM_MIN_BYTES, SYSTEM_CLEANUP_ACTI
 import { getToolTimeout, withToolTimeout } from './toolTimeouts';
 import { aiRunContextInputShape } from './scriptRunRequest';
 import { deliveryToolShape, diagnosticAccessShapes, executeCommandShape, setDeviceContextShape, toolInputSchemas } from './aiToolSchemas';
-import { aiScriptAuthoringEnabled } from '../config/env';
+import { sendEndpointMessageShape } from './aiToolSchemasMessaging';
+import { aiScriptAuthoringEnabled, flowsEnabled } from '../config/env';
 import { keysetZodShape, pageZodShape } from './aiToolPagination';
 import { captureMessage } from './sentry';
 import { postToolUseForCall, sdkToolUseIdFromExtra } from './aiToolUseCorrelation';
 import {
   m365LookupUserHandler, m365RecentSigninsHandler, m365ListGroupMembershipsHandler,
   m365DisableUserHandler, m365ResetPasswordHandler,
+  m365RevokeSessionsHandler, m365RemoveLicenseHandler, m365AssignLicenseHandler,
+  m365RemoveFromGroupHandler, m365AddToGroupHandler, m365RetireIntuneDeviceHandler,
+  m365CreateUserHandler, m365SetAutoReplyHandler,
 } from './aiToolsM365';
 import {
   googleLookupUserHandler, googleResetPasswordHandler, googleSuspendUserHandler,
@@ -143,7 +150,7 @@ export type PreToolUseCallback = (
    * it is a status message, not a failure, and it never reaches an `error`
    * field on the wire. See services/aiToolHandoff.ts (#5107).
    */
-  | { allowed: false; error: string; handoff?: ToolHandoffStatus }
+  | { allowed: false; error: string; handoff?: ToolHandoffStatus; requiresCallerVerification?: CallerRefusalPayload }
 >;
 
 /**
@@ -182,9 +189,12 @@ export type PostToolUseCallback = (
 // ============================================
 
 export const TOOL_TIERS = {
+  // #8742. Base tier 3: `send` is always human-approved; list/get downgrade to 1 in aiGuardrails.
+  send_endpoint_message: 3,
   list_time_entries: 1,
   get_running_timer: 1,
   get_timesheet: 1,
+  get_ticket_approval_status: 1,
   // #6930. Base tier; the mutating actions are Tier 2 in aiGuardrails.
   manage_ticket_checklist: 1,
 
@@ -193,6 +203,8 @@ export const TOOL_TIERS = {
   get_device_details: 1,
   get_device_hardware_health: 1,
   get_device_time_status: 1,
+  list_device_restore_point_attempts: 1,
+  query_device_workloads: 1,
   list_time_sync_issues: 1,
   analyze_metrics: 1,
   get_active_users: 1,
@@ -205,7 +217,11 @@ export const TOOL_TIERS = {
   manage_dns_policy: 2,
   get_s1_status: 1,
   get_s1_threats: 1,
+  get_edr_status: 1,
+  list_edr_detections: 1,
   s1_isolate_device: 3,
+  edr_endpoint_action: 3,
+  sync_edr_data: 2,
   s1_threat_action: 3,
   sync_huntress_data: 2,
   execute_command: 3,
@@ -237,6 +253,7 @@ export const TOOL_TIERS = {
   get_cis_device_report: 1,
   apply_cis_remediation: 3,
   get_fleet_health: 1,
+  get_fleet_device_stats: 1,
   // Fleet hygiene (Task 8) — read-only fleet-wide aggregation.
   get_fleet_findings: 1,
   analyze_fleet_metrics: 1,
@@ -292,6 +309,15 @@ export const TOOL_TIERS = {
   export_dataset: 1,
   // A-W05 (D13a): reads only the caller's own already-captured artifacts.
   read_artifact: 1,
+  // Trust Center W2 (Ruling 15): read-only page status; publish/edit stay human-attested.
+  get_trust_page_status: 1,
+  // Tool Catalog W03 (#5218, Decision 6): draft_flow writes a row, so Tier 2
+  // (ai:write over MCP, Tier-2 audit row); the reads are Tier 1. Declared to
+  // chat only when FLOWS_ENABLED (flowToolDefinitions).
+  draft_flow: 2,
+  validate_flow: 1,
+  get_flow: 1,
+  list_flows: 1,
   // Execution plane W04 — sandbox workspace tools. Tier 1: they execute
   // nothing on the fleet. NOT read-only (see TIER1_NON_READONLY_TOOLS in
   // aiGuardrails.ts) — the allowlist is what gates them. A tool absent from
@@ -455,6 +481,15 @@ export const TOOL_TIERS = {
   m365_list_group_memberships: 1,
   m365_disable_user: 3,
   m365_reset_password: 3,
+  // M365 control-plane identity writes (Operator Recipe Library M1) — session-only
+  m365_revoke_sessions: 3,
+  m365_remove_license: 3,
+  m365_assign_license: 3,
+  m365_remove_from_group: 3,
+  m365_add_to_group: 3,
+  m365_retire_intune_device: 3,
+  m365_create_user: 3,
+  m365_set_auto_reply: 3,
   // M365 typed Graph read-query tools (Task 9) — registered in the shared
   // `aiTools` map (see aiToolsM365.ts's registerM365Tools) and executed via
   // makeHandler/executeTool like list_organizations, not session-aware.
@@ -556,11 +591,16 @@ export const POST_TOOL_USE_TIMEOUT_MS = 10_000; // 10s for postToolUse DB writes
  */
 function preToolUseDenialResult(
   toolName: string,
-  check: { error: string; handoff?: ToolHandoffStatus },
+  check: { error: string; handoff?: ToolHandoffStatus; requiresCallerVerification?: CallerRefusalPayload },
 ): { text: string; isError: boolean } {
   const payload = check.handoff
     ? buildToolHandoffResult(check.handoff, check.error)
-    : { error: check.error };
+    : {
+        error: check.error,
+        ...(check.requiresCallerVerification
+          ? { requiresCallerVerification: check.requiresCallerVerification }
+          : {}),
+      };
   return {
     text: compactToolResultForChat(toolName, JSON.stringify(payload)),
     isError: check.handoff ? handoffIsError(check.handoff) : true,
@@ -604,6 +644,14 @@ export const SESSION_TOOL_DESCRIPTIONS = {
   m365_list_group_memberships: 'List the groups in the customer tenant selected for this session.',
   m365_disable_user: 'Disable (block sign-in for) a Microsoft 365 user on the customer tenant selected for this session. Requires approval.',
   m365_reset_password: 'Reset the password for a Microsoft 365 user on the customer tenant selected for this session. Returns a temporary password the user must change at next sign-in. Requires approval.',
+  m365_revoke_sessions: 'Revoke all sign-in sessions and refresh tokens for a Microsoft 365 user. Requires approval.',
+  m365_remove_license: 'Remove one or more Microsoft 365 licenses (SKU ids) from a user. Requires approval.',
+  m365_assign_license: 'Assign one or more Microsoft 365 licenses (SKU ids) to a user. Refuses when no seat is available. Requires approval.',
+  m365_remove_from_group: 'Remove a Microsoft 365 user from a group. Does not work on dynamic-membership or role-assignable groups, which Microsoft manages. Requires approval.',
+  m365_add_to_group: 'Add a Microsoft 365 user to a group. Does not work on dynamic-membership or role-assignable groups, which Microsoft manages. Requires approval.',
+  m365_retire_intune_device: 'Retires the device (removes company data and unenrols it). This is not a full wipe and Breeze cannot perform one. Requires approval.',
+  m365_create_user: 'Create a Microsoft 365 user. Returns a temporary password the user must change at first sign-in. Requires approval.',
+  m365_set_auto_reply: 'Set, schedule or disable the automatic reply (out of office) on a Microsoft 365 mailbox. Requires approval.',
   google_lookup_user: "Look up a Google Workspace user (profile, suspended/admin status, 2-step enrollment, last login, OU, aliases) for this organization's connected Workspace domain.",
   google_reset_password: 'Reset a Google Workspace user\'s password (forces change at next sign-in). Returns a temporary password. Requires approval.',
   google_suspend_user: 'Suspend (block sign-in for) a Google Workspace user. Requires approval.',
@@ -660,6 +708,43 @@ function inputShape(toolName: string): z.ZodRawShape {
   return shape;
 }
 
+
+/**
+ * Text blocks that ride alongside a vision tool's image. Built from the RAW
+ * handler result (the image branch skips compactToolResultForChat), so the
+ * device-reported strings in them — the agent's screenshot error, device
+ * fields, the action echo — are fenced here (#8852 W04).
+ */
+export function visionMetadataTextBlocks(
+  toolName: string,
+  parsed: Record<string, unknown>,
+): Array<{ type: 'text'; text: string }> {
+  const blocks: Array<{ type: 'text'; text: string }> = [];
+  // For analyze_screen, include device context as text
+  if (toolName === 'analyze_screen' && parsed.device) {
+    blocks.push({
+      type: 'text',
+      text: JSON.stringify(sanitizeUntrustedToolValue({
+        analysisContext: parsed.analysisContext,
+        device: parsed.device,
+        capturedAt: parsed.capturedAt,
+        resolution: `${parsed.width}x${parsed.height}`,
+      })),
+    });
+  }
+  // For computer_control, include action metadata as text
+  if (toolName === 'computer_control') {
+    const meta: Record<string, unknown> = {
+      actionExecuted: parsed.actionExecuted,
+      capturedAt: parsed.capturedAt,
+      resolution: `${parsed.width}x${parsed.height}`,
+    };
+    if (parsed.screenshotError) meta.screenshotError = parsed.screenshotError;
+    blocks.push({ type: 'text', text: JSON.stringify(sanitizeUntrustedToolValue(meta)) });
+  }
+  return blocks;
+}
+
 function makeToolHandler(
   toolName: string,
   getAuth: () => AuthContext,
@@ -695,7 +780,7 @@ function makeToolHandler(
     if (onPreToolUse) {
       let check:
         | { allowed: true; intentId?: string; context?: ToolExecutionContext }
-        | { allowed: false; error: string; handoff?: ToolHandoffStatus };
+        | { allowed: false; error: string; handoff?: ToolHandoffStatus; requiresCallerVerification?: CallerRefusalPayload };
       try {
         check = await onPreToolUse(toolName, args, undefined, sdkToolUseIdFromExtra(extra));
       } catch (err) {
@@ -823,28 +908,7 @@ function makeToolHandler(
                 mimeType: `image/${parsed.format || 'jpeg'}`,
               },
             ];
-            // For analyze_screen, include device context as text
-            if (toolName === 'analyze_screen' && parsed.device) {
-              contentBlocks.push({
-                type: 'text',
-                text: JSON.stringify({
-                  analysisContext: parsed.analysisContext,
-                  device: parsed.device,
-                  capturedAt: parsed.capturedAt,
-                  resolution: `${parsed.width}x${parsed.height}`,
-                }),
-              });
-            }
-            // For computer_control, include action metadata as text
-            if (toolName === 'computer_control') {
-              const meta: Record<string, unknown> = {
-                actionExecuted: parsed.actionExecuted,
-                capturedAt: parsed.capturedAt,
-                resolution: `${parsed.width}x${parsed.height}`,
-              };
-              if (parsed.screenshotError) meta.screenshotError = parsed.screenshotError;
-              contentBlocks.push({ type: 'text', text: JSON.stringify(meta) });
-            }
+            contentBlocks.push(...visionMetadataTextBlocks(toolName, parsed));
             return { content: contentBlocks };
           }
         } catch (err) {
@@ -874,8 +938,15 @@ function makeToolHandler(
       // raw Drizzle/postgres.js string carrying the full query and column list.
       // sanitizeThrownToolError logs it server-side and returns a safe generic
       // string for the stream (#2603).
-      const message = sanitizeThrownToolError(toolName, err, { durationMs });
-      const safeError = compactToolResultForChat(toolName, JSON.stringify({ error: message }));
+      // A typed caller-verification refusal is a gate outcome, not a fault: it
+      // carries only the gate's typed payload (never a message/stack), so it is
+      // emitted intact — and bypasses compaction, which would otherwise be free
+      // to truncate the payload the UI renders "verify the caller" from.
+      const refusal = callerRefusal(err);
+      const message = refusal ? refusal.error : sanitizeThrownToolError(toolName, err, { durationMs });
+      const safeError = refusal
+        ? JSON.stringify(refusal)
+        : compactToolResultForChat(toolName, JSON.stringify({ error: message }));
       await safePostToolUse(postToolUse, toolName, args, safeError, true, durationMs);
       return {
         content: [{ type: 'text' as const, text: safeError }],
@@ -910,6 +981,7 @@ function makeSessionAwareHandler(
     args: Record<string, unknown>,
     auth: AuthContext,
     sessionId: string,
+    context?: ToolExecutionContext,
   ) => Promise<string | SecretToolResult>,
   onPreToolUse?: PreToolUseCallback,
   onPostToolUse?: PostToolUseCallback,
@@ -939,7 +1011,7 @@ function makeSessionAwareHandler(
     if (onPreToolUse) {
       let check:
         | { allowed: true; intentId?: string }
-        | { allowed: false; error: string; handoff?: ToolHandoffStatus };
+        | { allowed: false; error: string; handoff?: ToolHandoffStatus; requiresCallerVerification?: CallerRefusalPayload };
       try {
         check = await onPreToolUse(toolName, args, undefined, sdkToolUseIdFromExtra(extra));
       } catch (err) {
@@ -994,7 +1066,13 @@ function makeSessionAwareHandler(
       // declares its own `result: string` from `llmText`, so the raw handler
       // return must never share that name.
       const handlerResult = await withToolTimeout(
-        withDbAccessContext(dbContext, () => sessionHandler(args, auth, session.breezeSessionId)),
+        withDbAccessContext(dbContext, () =>
+          sessionHandler(
+            args,
+            auth,
+            session.breezeSessionId,
+            intentId ? { actionIntentId: intentId } : undefined,
+          )),
         toolTimeout,
         toolName,
       );
@@ -1050,8 +1128,15 @@ function makeSessionAwareHandler(
       // raw Drizzle/postgres.js string carrying the full query and column list.
       // sanitizeThrownToolError logs it server-side and returns a safe generic
       // string for the stream (#2603).
-      const message = sanitizeThrownToolError(toolName, err, { durationMs });
-      const safeError = compactToolResultForChat(toolName, JSON.stringify({ error: message }));
+      // A typed caller-verification refusal is a gate outcome, not a fault: it
+      // carries only the gate's typed payload (never a message/stack), so it is
+      // emitted intact — and bypasses compaction, which would otherwise be free
+      // to truncate the payload the UI renders "verify the caller" from.
+      const refusal = callerRefusal(err);
+      const message = refusal ? refusal.error : sanitizeThrownToolError(toolName, err, { durationMs });
+      const safeError = refusal
+        ? JSON.stringify(refusal)
+        : compactToolResultForChat(toolName, JSON.stringify({ error: message }));
       await safePostToolUse(postToolUse, toolName, args, safeError, true, durationMs);
       return {
         content: [{ type: 'text' as const, text: safeError }],
@@ -1148,6 +1233,35 @@ export function scriptProposalToolDefinitions(
   ];
 }
 
+/**
+ * Tool Catalog W03 (#5218) flow tools — EXPOSURE gate for FLOWS_ENABLED.
+ * Registration in aiTools and TOOL_TIERS stays unconditional (registry
+ * parity); with the flag off the model is never told these exist. Breeze's
+ * MCP server enumerates the registry directly, so it applies the same gate via
+ * `isToolEnvGatedOff` (aiToolEnvGates.ts), and every handler refuses with
+ * `flows_disabled` as the last line of defence.
+ */
+export function flowToolDefinitions(
+  getAuth: () => AuthContext,
+  getActiveSession: (() => ActiveSession | undefined) | undefined,
+  onPreToolUse?: PreToolUseCallback,
+  onPostToolUse?: PostToolUseCallback,
+) {
+  if (!flowsEnabled()) return [];
+  const makeHandler = (
+    toolName: string,
+    auth: () => AuthContext,
+    pre?: PreToolUseCallback,
+    post?: PostToolUseCallback,
+  ) => makeToolHandler(toolName, auth, getActiveSession, pre, post);
+  return [
+    tool('draft_flow', registryDescription('draft_flow'), inputShape('draft_flow'), makeHandler('draft_flow', getAuth, onPreToolUse, onPostToolUse)),
+    tool('validate_flow', registryDescription('validate_flow'), inputShape('validate_flow'), makeHandler('validate_flow', getAuth, onPreToolUse, onPostToolUse)),
+    tool('get_flow', registryDescription('get_flow'), inputShape('get_flow'), makeHandler('get_flow', getAuth, onPreToolUse, onPostToolUse)),
+    tool('list_flows', registryDescription('list_flows'), inputShape('list_flows'), makeHandler('list_flows', getAuth, onPreToolUse, onPostToolUse)),
+  ];
+}
+
 export function m365ToolDefinitions(
   getAuth: () => AuthContext,
   getActiveSession: (() => ActiveSession | undefined) | undefined,
@@ -1158,6 +1272,12 @@ export function m365ToolDefinitions(
   const m365Enabled = ['1', 'true', 'yes', 'on'].includes(m365Flag);
   const delegantConfigured = !!(process.env.DELEGANT_BASE_URL ?? '').trim();
   if (!m365Enabled && !delegantConfigured) return [];
+  // Bounds mirror packages/shared/src/m365/writeActions.ts (the handler's
+  // strict schema is the authority; these keep the advertised shape honest).
+  const guidShape = z.string().guid();
+  const userIdentifierShape = z.string().min(3).max(320);
+  const reasonShape = z.string().min(1).max(500);
+  const orgIdShape = z.string().guid().optional();
   return [
     tool(
       'm365_lookup_user',
@@ -1188,6 +1308,80 @@ export function m365ToolDefinitions(
       SESSION_TOOL_DESCRIPTIONS.m365_reset_password,
       { userIdentifier: z.string(), reason: z.string() },
       makeSessionAwareHandler('m365_reset_password', getAuth, getActiveSession, m365ResetPasswordHandler, onPreToolUse, onPostToolUse)
+    ),
+    // Control-plane identity writes (Operator Recipe Library M1). Declared
+    // shapes mirror the strict shared write-action schema bounds; the handler
+    // re-validates against m365WriteActionSchema, so these are advisory.
+    tool(
+      'm365_revoke_sessions',
+      SESSION_TOOL_DESCRIPTIONS.m365_revoke_sessions,
+      { userIdentifier: userIdentifierShape, reason: reasonShape, orgId: orgIdShape },
+      makeSessionAwareHandler('m365_revoke_sessions', getAuth, getActiveSession, m365RevokeSessionsHandler, onPreToolUse, onPostToolUse)
+    ),
+    tool(
+      'm365_remove_license',
+      SESSION_TOOL_DESCRIPTIONS.m365_remove_license,
+      { userIdentifier: userIdentifierShape, skuIds: z.array(guidShape).min(1).max(20), reason: reasonShape, orgId: orgIdShape },
+      makeSessionAwareHandler('m365_remove_license', getAuth, getActiveSession, m365RemoveLicenseHandler, onPreToolUse, onPostToolUse)
+    ),
+    tool(
+      'm365_assign_license',
+      SESSION_TOOL_DESCRIPTIONS.m365_assign_license,
+      {
+        userIdentifier: userIdentifierShape,
+        skuIds: z.array(guidShape).min(1).max(20),
+        disabledPlanIds: z.array(guidShape).max(50).optional(),
+        reason: reasonShape,
+        orgId: orgIdShape,
+      },
+      makeSessionAwareHandler('m365_assign_license', getAuth, getActiveSession, m365AssignLicenseHandler, onPreToolUse, onPostToolUse)
+    ),
+    tool(
+      'm365_remove_from_group',
+      SESSION_TOOL_DESCRIPTIONS.m365_remove_from_group,
+      { groupId: guidShape, userIdentifier: userIdentifierShape, reason: reasonShape, orgId: orgIdShape },
+      makeSessionAwareHandler('m365_remove_from_group', getAuth, getActiveSession, m365RemoveFromGroupHandler, onPreToolUse, onPostToolUse)
+    ),
+    tool(
+      'm365_add_to_group',
+      SESSION_TOOL_DESCRIPTIONS.m365_add_to_group,
+      { groupId: guidShape, userIdentifier: userIdentifierShape, reason: reasonShape, orgId: orgIdShape },
+      makeSessionAwareHandler('m365_add_to_group', getAuth, getActiveSession, m365AddToGroupHandler, onPreToolUse, onPostToolUse)
+    ),
+    tool(
+      'm365_retire_intune_device',
+      SESSION_TOOL_DESCRIPTIONS.m365_retire_intune_device,
+      { managedDeviceId: guidShape, reason: reasonShape, orgId: orgIdShape },
+      makeSessionAwareHandler('m365_retire_intune_device', getAuth, getActiveSession, m365RetireIntuneDeviceHandler, onPreToolUse, onPostToolUse)
+    ),
+    tool(
+      'm365_create_user',
+      SESSION_TOOL_DESCRIPTIONS.m365_create_user,
+      {
+        userPrincipalName: userIdentifierShape,
+        displayName: z.string().min(1).max(256),
+        mailNickname: z.string().min(1).max(64).regex(/^[A-Za-z0-9._-]+$/),
+        usageLocation: z.string().regex(/^[A-Z]{2}$/),
+        reason: reasonShape,
+        orgId: orgIdShape,
+      },
+      makeSessionAwareHandler('m365_create_user', getAuth, getActiveSession, m365CreateUserHandler, onPreToolUse, onPostToolUse)
+    ),
+    tool(
+      'm365_set_auto_reply',
+      SESSION_TOOL_DESCRIPTIONS.m365_set_auto_reply,
+      {
+        userIdentifier: userIdentifierShape,
+        status: z.enum(['disabled', 'alwaysEnabled', 'scheduled']),
+        internalReplyMessage: z.string().min(1).max(4000).optional(),
+        externalReplyMessage: z.string().min(1).max(4000).optional(),
+        externalAudience: z.enum(['none', 'contactsOnly', 'all']).optional(),
+        scheduledStartDateTime: z.string().datetime().optional(),
+        scheduledEndDateTime: z.string().datetime().optional(),
+        reason: reasonShape,
+        orgId: orgIdShape,
+      },
+      makeSessionAwareHandler('m365_set_auto_reply', getAuth, getActiveSession, m365SetAutoReplyHandler, onPreToolUse, onPostToolUse)
     ),
   ];
 }
@@ -1437,7 +1631,7 @@ export function wrapExtraToolWithHooks(
       if (onPreToolUse) {
         let check:
           | { allowed: true; context?: ToolExecutionContext }
-          | { allowed: false; error: string; handoff?: ToolHandoffStatus };
+          | { allowed: false; error: string; handoff?: ToolHandoffStatus; requiresCallerVerification?: CallerRefusalPayload };
         try {
           check = await onPreToolUse(name, args, undefined, sdkToolUseIdFromExtra(extra));
         } catch (err) {
@@ -1544,7 +1738,7 @@ export function buildBreezeSdkTools(
         from: z.string().optional(),
         to: z.string().optional(),
         running: z.boolean().optional(),
-        billingStatus: z.enum(['not_billed', 'billed', 'no_charge', 'contract']).optional(),
+        billingStatus: z.enum(['not_billed', 'billed', 'no_charge', 'contract', 'awaiting_approval']).optional(),
         approved: z.boolean().optional(),
         limit: z.number().int().min(1).max(200).optional(),
         offset: z.number().int().min(0).optional(),
@@ -1562,6 +1756,12 @@ export function buildBreezeSdkTools(
       registryDescription('get_timesheet'),
       { weekStart: z.string(), userId: uuid.optional() },
       makeHandler('get_timesheet', getAuth, onPreToolUse, onPostToolUse)
+    ),
+    tool(
+      'get_ticket_approval_status',
+      registryDescription('get_ticket_approval_status'),
+      { ticketId: uuid },
+      makeHandler('get_ticket_approval_status', getAuth, onPreToolUse, onPostToolUse)
     ),
 
     tool(
@@ -1600,6 +1800,20 @@ export function buildBreezeSdkTools(
       registryDescription('get_device_time_status'),
       { deviceId: uuid },
       makeHandler('get_device_time_status', getAuth, onPreToolUse, onPostToolUse),
+    ),
+
+    tool(
+      'list_device_restore_point_attempts',
+      registryDescription('list_device_restore_point_attempts'),
+      inputShape('list_device_restore_point_attempts'),
+      makeHandler('list_device_restore_point_attempts', getAuth, onPreToolUse, onPostToolUse),
+    ),
+
+    tool(
+      'query_device_workloads',
+      registryDescription('query_device_workloads'),
+      inputShape('query_device_workloads'),
+      makeHandler('query_device_workloads', getAuth, onPreToolUse, onPostToolUse),
     ),
 
     tool(
@@ -1668,6 +1882,7 @@ export function buildBreezeSdkTools(
         action: z.enum([
           'list', 'add_item', 'update_item', 'delete_item', 'reorder',
           'apply_template', 'list_templates', 'get_template',
+          'save_as_template', 'duplicate_template',
         ]),
         ticketId: uuid.optional(),
         itemId: uuid.optional(),
@@ -1678,6 +1893,9 @@ export function buildBreezeSdkTools(
         mode: z.enum(['append', 'replace_unticked']).optional(),
         orgId: uuid.optional(),
         includeInactive: z.boolean().optional(),
+        name: z.string().min(1).max(200).optional(),
+        description: z.string().max(2000).nullable().optional(),
+        ownerScope: z.enum(['organization', 'partner']).optional(),
       },
       makeHandler('manage_ticket_checklist', getAuth, onPreToolUse, onPostToolUse)
     ),
@@ -1777,6 +1995,51 @@ export function buildBreezeSdkTools(
     ),
 
     tool(
+      'get_edr_status',
+      registryDescription('get_edr_status'),
+      {
+        orgId: uuid.optional(),
+      },
+      makeHandler('get_edr_status', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'list_edr_detections',
+      registryDescription('list_edr_detections'),
+      {
+        orgId: uuid.optional(),
+        deviceId: uuid.optional(),
+        severity: z.enum(['critical', 'high', 'medium', 'low', 'info']).optional(),
+        status: z.enum(['open', 'all']).optional(),
+        provider: z.string().max(30).optional(),
+        limit: z.number().int().min(1).max(100).optional(),
+      },
+      makeHandler('list_edr_detections', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'edr_endpoint_action',
+      registryDescription('edr_endpoint_action'),
+      {
+        deviceId: uuid,
+        action: z.enum(['isolate', 'unisolate', 'scan']),
+        connectionId: uuid.optional(),
+        reason: z.string().max(500).optional(),
+      },
+      makeHandler('edr_endpoint_action', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'sync_edr_data',
+      registryDescription('sync_edr_data'),
+      {
+        connectionId: uuid.optional(),
+        orgId: uuid.optional(),
+      },
+      makeHandler('sync_edr_data', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
       's1_isolate_device',
       registryDescription('s1_isolate_device'),
       {
@@ -1825,7 +2088,10 @@ export function buildBreezeSdkTools(
         // validateToolInput enforces at dispatch. Deliberate asymmetry.
         scriptId: uuid.optional(),
         proposalId: uuid.optional(),
-        deviceIds: z.array(uuid).min(1).max(10),
+        // Exactly one of deviceIds / groupId (#8600) — enforced by the same
+        // toolInputSchemas.run_script refinement, for the same reason.
+        deviceIds: z.array(uuid).min(1).max(10).optional().describe('Device UUIDs to run on (max 10). Omit when groupId is given.'),
+        groupId: uuid.optional().describe('Saved device group UUID to run on instead of deviceIds. Its members are frozen when approval is requested and that list runs; refused above 10 devices.'),
         parameters: z.record(z.string(), z.unknown()).optional(),
         // #4888 — mirrors toolInputSchemas.run_script; see scriptRunRequest.ts
         // for why the shape is shared rather than repeated.
@@ -2004,6 +2270,13 @@ export function buildBreezeSdkTools(
     ),
 
     tool(
+      'get_fleet_device_stats',
+      registryDescription('get_fleet_device_stats'),
+      { orgId: uuid.optional() },
+      makeHandler('get_fleet_device_stats', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
       'get_fleet_health',
       registryDescription('get_fleet_health'),
       {
@@ -2166,7 +2439,7 @@ export function buildBreezeSdkTools(
       registryDescription('network_discovery'),
       {
         deviceId: uuid,
-        subnet: z.string().max(50).optional(),
+        subnet: z.string().max(50).regex(/^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/, 'Invalid CIDR notation'),
         scanType: z.enum(['ping', 'arp', 'full']).optional(),
       },
       makeHandler('network_discovery', getAuth, onPreToolUse, onPostToolUse)
@@ -2210,6 +2483,13 @@ export function buildBreezeSdkTools(
         captureDelayMs: z.number().int().min(0).max(3000).optional(),
       },
       makeHandler('computer_control', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'send_endpoint_message',
+      registryDescription('send_endpoint_message'),
+      sendEndpointMessageShape,
+      makeHandler('send_endpoint_message', getAuth, onPreToolUse, onPostToolUse)
     ),
 
     // Fleet orchestration tools
@@ -2258,8 +2538,6 @@ export function buildBreezeSdkTools(
         deferUntil: z.string().optional(),
         notes: z.string().max(1000).optional(),
         configPolicyId: uuid.optional(),
-        autoApprove: z.boolean().optional(),
-        autoApproveSeverities: z.array(z.enum(['critical', 'important', 'moderate', 'low'])).optional(),
         scheduleFrequency: z.enum(['daily', 'weekly', 'monthly']).optional(),
         scheduleTime: z.string().optional(),
         rebootPolicy: z.enum(['if_required', 'always', 'never']).optional(),
@@ -2394,7 +2672,7 @@ export function buildBreezeSdkTools(
       {
         action: z.enum(['list', 'generate', 'data', 'create', 'update', 'delete', 'history']),
         reportId: uuid.optional(),
-        reportType: z.enum(['device_inventory', 'software_inventory', 'alert_summary', 'compliance', 'performance', 'executive_summary']).optional(),
+        reportType: z.enum(GENERATE_REPORT_TYPES).optional(),
         name: z.string().max(255).optional(),
         config: z.record(z.string(), z.unknown()).optional(),
         schedule: z.enum(['one_time', 'daily', 'weekly', 'monthly']).optional(),
@@ -2779,6 +3057,15 @@ export function buildBreezeSdkTools(
         // `patch_policies.sources` is deprecated (#3150) — never advertised to
         // the model; the handler ignores it and `get` strips it from responses.
         autoApprove: z.record(z.string(), z.unknown()).optional(),
+        appRules: z.array(z.object({
+          source: z.enum(['third_party', 'custom']),
+          packageId: z.string().min(1).max(256),
+          action: z.enum(['block', 'pin']),
+          pinnedVersion: z.string().min(1).max(64).optional(),
+          displayName: z.string().max(255).optional(),
+        })).max(200).optional().describe(
+          'Per-app block/pin rules on the ring; pin requires pinnedVersion. Overrides manual approvals in patch jobs. Update replaces the list.'
+        ),
         enabled: z.boolean().optional(),
         limit: z.number().int().min(1).max(100).optional(),
       },
@@ -3577,7 +3864,7 @@ export function buildBreezeSdkTools(
         action: z.enum([
           'create_draft', 'add_manual_line', 'add_catalog_line', 'add_bundle_line', 'add_contract_line',
           'update_line', 'remove_line', 'update_header', 'delete_draft',
-          'assemble_from_org', 'assemble_from_ticket',
+          'assemble_from_org', 'assemble_from_ticket', 'refresh_time_lines',
           'issue', 'void', 'record_payment', 'void_payment', 'create_pay_link',
         ]),
         orgId: uuid.optional(),
@@ -3710,6 +3997,8 @@ export function buildBreezeSdkTools(
         contractId: uuid.optional(),
         includeInactive: z.boolean().optional(),
         occurrencesFor: uuid.optional(),
+        includeDetails: z.boolean().optional(),
+        ...pageZodShape(15, 100),
       },
       makeHandler('list_deliverables', getAuth, onPreToolUse, onPostToolUse)
     ),
@@ -3739,6 +4028,7 @@ export function buildBreezeSdkTools(
         reason: z.string().max(2000).optional(),
         dueAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
         reportRunId: uuid.optional(),
+        documentId: uuid.optional(),
       },
       makeHandler('manage_deliverables', getAuth, onPreToolUse, onPostToolUse)
     ),
@@ -3994,6 +4284,16 @@ export function buildBreezeSdkTools(
       }
     ),
 
+    // Trust Center W2 (Ruling 15): read-only; never creates the draft page.
+    tool(
+      'get_trust_page_status',
+      registryDescription('get_trust_page_status'),
+      {
+        orgId: uuid.describe('Organization UUID'),
+      },
+      makeHandler('get_trust_page_status', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
     // Microsoft 365 helpdesk tools (session-aware; the customer tenant is bound
     // to the active AI session). Only advertised when the Delegant integration
     // is configured — see m365ToolDefinitions. Routed through
@@ -4005,6 +4305,8 @@ export function buildBreezeSdkTools(
     // AI script authoring — behind BREEZE_AI_SCRIPT_AUTHORING_ENABLED (see the
     // factory for why registration stays unconditional but exposure does not).
     ...scriptProposalToolDefinitions(getAuth, getActiveSession, onPreToolUse, onPostToolUse),
+    // Tool Catalog W03 (#5218) — behind FLOWS_ENABLED (see the factory).
+    ...flowToolDefinitions(getAuth, getActiveSession, onPreToolUse, onPostToolUse),
     // Google Workspace helpdesk tools (gated on GOOGLE_WORKSPACE_ENABLED + a
     // per-org connection). Same enforcement path as every other tool.
     ...googleToolDefinitions(getAuth, getActiveSession, onPreToolUse, onPostToolUse),

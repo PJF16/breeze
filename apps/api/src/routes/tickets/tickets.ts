@@ -1,13 +1,14 @@
 import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { z } from 'zod';
-import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, or, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, isNull, sql, type SQL } from 'drizzle-orm';
 import { db } from '../../db';
 import { tickets, ticketComments, ticketAlertLinks, devices, organizations, users, alerts, ticketStatuses } from '../../db/schema';
 import { requireScope, requirePermission } from '../../middleware/auth';
 import { alertInSiteScope, deviceInSiteScope, ticketSiteScopeCondition } from './siteScope';
 import { PERMISSIONS, hasPermission, type UserPermissions } from '../../services/permissions';
-import { escapeLike } from '../../utils/sql';
+import { ticketSearchCondition } from '../../services/ticketSearch';
+import { checklistCountsForTickets } from '../../services/ticketChecklistService';
 import {
   createTicketSchema, updateTicketSchema, changeTicketStatusSchema,
   assignTicketSchema, addTicketCommentSchema, listTicketsQuerySchema,
@@ -349,18 +350,19 @@ ticketsRoutes.get(
     else if (q.assignee === 'unassigned') conditions.push(isNull(tickets.assignedTo));
     else if (q.assignee) conditions.push(eq(tickets.assignedTo, q.assignee));
     if (q.categoryId) conditions.push(eq(tickets.categoryId, q.categoryId));
+    if (q.ticketType) conditions.push(inArray(tickets.ticketType, q.ticketType));
     if (q.priority) conditions.push(eq(tickets.priority, q.priority));
     if (q.slaState === 'breached') conditions.push(SLA_BREACHED);
     else if (q.slaState === 'at_risk') conditions.push(SLA_AT_RISK);
     else if (q.slaState === 'breaching') conditions.push(sql`(${SLA_BREACHED} OR ${SLA_AT_RISK})`);
     else if (q.slaState === 'ok') conditions.push(sql`(NOT ${SLA_BREACHED} AND NOT ${SLA_AT_RISK})`);
     if (q.search) {
-      // Escape ILIKE special chars (\, %, _) so they match literally, not as
-      // wildcards/escapes. Use the shared helper — the prior inline regex
-      // dropped backslash, so a trailing '\' could escape the closing '%'.
-      const term = `%${escapeLike(q.search)}%`;
-      const searchCond = or(ilike(tickets.subject, term), ilike(tickets.internalNumber, term));
-      if (searchCond) conditions.push(searchCond);
+      // Subject / Breeze number substrings (ILIKE-escaped by the helper), or
+      // the whole source number of an imported ticket (#8313).
+      const visibleOrgIds = auth.scope === 'organization'
+        ? [auth.orgId as string]
+        : auth.scope === 'partner' ? (auth.accessibleOrgIds ?? []) : null;
+      conditions.push(ticketSearchCondition(q.search, visibleOrgIds));
     }
     const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
 
@@ -378,6 +380,7 @@ ticketsRoutes.get(
         status: tickets.status,
         priority: tickets.priority,
         source: tickets.source,
+        ticketType: tickets.ticketType,
         orgId: tickets.orgId,
         orgName: organizations.name,
         deviceId: tickets.deviceId,
@@ -396,6 +399,8 @@ ticketsRoutes.get(
         createdAt: tickets.createdAt,
         updatedAt: tickets.updatedAt,
         deletedAt: tickets.deletedAt,
+        // #8313: the window that imported the ticket; null when live.
+        migrationWindowId: tickets.migrationWindowId,
         statusName: ticketStatuses.name,
         statusColor: ticketStatuses.color
       })
@@ -415,7 +420,15 @@ ticketsRoutes.get(
       .where(whereCondition);
     const total = Number(countRows[0]?.count ?? 0);
 
-    return c.json({ data, pagination: { page: q.page, limit: q.limit, total } });
+    // #9180 — checklist progress for the queue: one grouped count for the page,
+    // never a per-row fetch. Checklists are internal MSP procedure (spec #5783
+    // §2): an organization-scoped caller gets no `checklist` key at all.
+    if (auth.scope === 'organization' || data.length === 0) {
+      return c.json({ data, pagination: { page: q.page, limit: q.limit, total } });
+    }
+    const counts = await checklistCountsForTickets(data.map((t) => t.id));
+    const withChecklist = data.map((t) => ({ ...t, checklist: counts.get(t.id) ?? null }));
+    return c.json({ data: withChecklist, pagination: { page: q.page, limit: q.limit, total } });
   }
 );
 
@@ -530,6 +543,10 @@ ticketsRoutes.get(
 
     const comments = commentRows.map((row) => ({
       ...row,
+      // #8313: who wrote an imported comment in its source (display only).
+      originalAuthor: row.originalAuthorKind
+        ? { name: row.authorName ?? null, email: row.originalAuthorEmail ?? null, kind: row.originalAuthorKind }
+        : null,
       deleted: row.deletedAt != null,
       // Never ship the prior text of a deleted comment to the client.
       content: row.deletedAt != null ? '' : row.content,
@@ -702,6 +719,13 @@ ticketsRoutes.patch(
       return c.json({ error: 'Assignee is not updatable via PATCH — use POST /tickets/:id/assign' }, 400);
     }
     if (Object.keys(body).length === 0) return c.json({ error: 'No fields to update' }, 400);
+
+    // #4617: the budget is the customer's spend ceiling under the approval
+    // gate — a partner-staff decision. Organization scope cannot read the
+    // time entries it is measured against (time_entries has no org-axis RLS).
+    if (auth.scope === 'organization' && (body.budgetMinutes !== undefined || body.budgetAmount !== undefined)) {
+      return c.json({ error: 'The ticket budget can only be set by partner staff', code: ERROR_CODES.ACCESS_DENIED }, 403);
+    }
 
     if (auth.scope === 'organization' && !auth.orgId) {
       return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);

@@ -1,4 +1,5 @@
 import { pgTable, uuid, varchar, text, timestamp, boolean, jsonb, pgEnum, integer, real, bigint, date, primaryKey, index, unique, uniqueIndex, foreignKey } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 import { ipClassEnum, organizations, sites } from './orgs';
 import { users } from './users';
 import { aiInitiatorKindEnum } from './aiInitiator';
@@ -122,10 +123,9 @@ export const devices = pgTable('devices', {
   // logs ingest route (agents/logs.ts), throttled to a conditional UPDATE so
   // a batch that moved the value < 5 min doesn't cost a write on the hot
   // ingest path. NULL = never shipped a log (or predates this column).
-  // Combined with `status`, this is what lets the server tell "a heartbeating
-  // device that is quiet by design" from "a heartbeating device whose log
-  // shipping is mute" without depending on the (possibly broken) log channel
-  // itself — see isDeviceLogSilent in @breeze/shared.
+  // Not a health signal on its own: agents ship warn+ by default, so a
+  // healthy agent can be log-quiet for hours. Shipping health comes from the
+  // agent's heartbeat instead (#7067).
   lastLogAt: timestamp('last_log_at', { withTimezone: true }),
   enrolledAt: timestamp('enrolled_at').defaultNow().notNull(),
   // Bare-metal recovery W04a: stamped by the heartbeat check-in that completes
@@ -247,10 +247,30 @@ export const devices = pgTable('devices', {
   peripheralPolicyProtocolVersion: integer('peripheral_policy_protocol_version').notNull().default(0),
   rollbackProtocolVersion: integer('rollback_protocol_version').notNull().default(0),
   pamLifetimeProtocolVersion: integer('pam_lifetime_protocol_version').notNull().default(0),
+  // Independent of PAM availability: unavailable agents can still retry verification.
+  pamReconciliationResetProtocolVersion: integer('pam_reconciliation_reset_protocol_version').notNull().default(0),
   // PAM ownership epochs (#8203): current ownership epoch. Trigger-managed —
   // advanced by exactly +1 on every org_id change; a caller-written change is
   // refused with 42501. Never set it from app code.
   ownershipEpoch: integer('ownership_epoch').notNull().default(1),
+  // PAM ownership epochs W4 (#8206): the ownership epoch whose identity the
+  // agent has loaded, as last reported on a heartbeat (signed identity
+  // assertion v2). Written only by the heartbeat route, monotonically and never
+  // above ownershipEpoch. PAM dispatch requires it to equal ownershipEpoch;
+  // NULL counts as acknowledged only at ownershipEpoch = 1.
+  agentIdentityEpochAck: integer('agent_identity_epoch_ack'),
+  // Reinstall reattach W1a (#8318, spec 2026-10-12-reinstall-reattach-design
+  // §4.1): which agent install owns this row. 1 = the original install (every
+  // device that was never reattached); advanced by exactly one when a reattach
+  // confirm hands the row to a new install, never otherwise
+  // (devices_install_incarnation_guard). device_commands rows are stamped with
+  // it at insert, and claim/result acceptance refuse an earlier incarnation's
+  // rows. incarnation_started_at is NULL exactly while the incarnation is 1
+  // (devices_install_incarnation_chk); last_reattached_at backs the
+  // "Reinstalled on" badge. Written only by services/deviceInstallBoundary.
+  installIncarnation: integer('install_incarnation').notNull().default(1),
+  incarnationStartedAt: timestamp('incarnation_started_at', { withTimezone: true }),
+  lastReattachedAt: timestamp('last_reattached_at', { withTimezone: true }),
   // Revocation-lease capability. 1 = this agent build renews a per-session
   // revocation lease over the command WebSocket and stops the desktop stream
   // when the lease is revoked or expires past its grace window. 0 (default,
@@ -339,6 +359,22 @@ export const devices = pgTable('devices', {
   // the current episode began.
   helperInstallIssue: varchar('helper_install_issue', { length: 50 }),
   helperInstallIssueSince: timestamp('helper_install_issue_since', { withTimezone: true }),
+  // #8620 — agent-reported watchdog install health (#8618 / #7583). NULL =
+  // not reported. State and error class are closed vocabularies (see
+  // services/watchdogInstallHealth); written by the heartbeat ONLY on a
+  // transition. `since` is the server-clock time of the last state change.
+  watchdogInstallState: varchar('watchdog_install_state', { length: 20 }),
+  watchdogInstallErrorClass: varchar('watchdog_install_error_class', { length: 20 }),
+  watchdogInstallSince: timestamp('watchdog_install_since', { withTimezone: true }),
+  // #8608 — agent-reported log-shipping health (#8406). Classified per beat by
+  // services/logShippingHealth and written ONLY on a state change. NULL state =
+  // unknown (old agent / field absent), never healthy and never failing.
+  // 'failing' episodes are timed on the server receive clock via
+  // logShippingFailureStartedAt; the "sustained" verdict is derived at read time.
+  // lastError is a closed vocabulary (never raw error text), shown only while failing.
+  logShippingState: varchar('log_shipping_state', { length: 16 }),
+  logShippingFailureStartedAt: timestamp('log_shipping_failure_started_at', { withTimezone: true }),
+  logShippingLastError: varchar('log_shipping_last_error', { length: 200 }),
   // Enrollment idempotency (#2764): uninstall intent stamped by the agent's
   // graceful-uninstall notify path (Task 5/6); reaper decommissions once past
   // grace with no re-enrollment heartbeat. possibleReplacementOfDeviceId links
@@ -353,12 +389,19 @@ export const devices = pgTable('devices', {
   // silently extend itself. NULL on a decommissioned row means "removal time
   // unknown" and the purge job treats that as NEVER PURGE (fail closed).
   decommissionedAt: timestamp('decommissioned_at', { withTimezone: true }),
+  // Topology site location W3 (#7887, spec S§11): "Keep at <site>" — a technician confirmed this
+  // assignment, so no wrong-site suggestion is computed. Cleared by the
+  // breeze_devices_site_assignment_confirmation_reset trigger on any site/org change; no expiry.
+  siteAssignmentConfirmedAt: timestamp('site_assignment_confirmed_at', { withTimezone: true }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
   partnerExportUpdatedAt: timestamp('partner_export_updated_at', { precision: 3 }).defaultNow().notNull()
 }, (table) => ({
   idOrgSiteUnique: uniqueIndex('devices_id_org_id_site_id_uniq').on(table.id, table.orgId, table.siteId),
   idOrgUnique: uniqueIndex('devices_id_org_id_uniq').on(table.id, table.orgId),
+  logShippingFailingIdx: index('devices_log_shipping_failing_idx')
+    .on(table.logShippingFailureStartedAt)
+    .where(sql`log_shipping_failure_started_at IS NOT NULL`),
 }));
 
 // Linked device profiles for multi-boot systems (#2138). One row per physical
@@ -740,7 +783,13 @@ export const deviceCommands = pgTable('device_commands', {
   // table as system-scoped (both key on the literal column name).
   aiInitiatorKind: aiInitiatorKindEnum('ai_initiator_kind'),
   aiSessionId: uuid('ai_session_id'),
-  aiAgentRunId: uuid('ai_agent_run_id')
+  aiAgentRunId: uuid('ai_agent_run_id'),
+  // Reinstall reattach W1a (#8318 §4.2): the devices.install_incarnation this
+  // row was enqueued for. Stamped by the device_commands_stamp_incarnation
+  // trigger on EVERY insert (a value written here is overwritten) and
+  // immutable after. NULL only on rows from before the trigger, and a NULL
+  // counts as incarnation 1. See services/commandIncarnation.ts.
+  deviceIncarnation: integer('device_incarnation')
 });
 
 export const connectionProtocolEnum = pgEnum('connection_protocol', ['tcp', 'tcp6', 'udp', 'udp6']);

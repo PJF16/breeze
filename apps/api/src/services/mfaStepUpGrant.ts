@@ -60,6 +60,10 @@ export type StepUpOperation =
   // operator was shown, so a grant can never be replayed against a different
   // device, destination, or billing acknowledgement.
   | 'device_move_org'
+  // #8729 "Force reboot now": an immediate reboot that force-closes running
+  // apps and discards unsaved work. Bound by resourceDigest to { deviceId }, so
+  // a grant minted for one device can never force-reboot another. Single-use.
+  | 'device_force_reboot'
   // Parked-device assignment: moving a device out of the partner's holding
   // area into a customer org. Single: bound to { deviceId, targetOrgId,
   // targetSiteId }. Bulk: ONE grant bound to the whole sorted batch — a
@@ -132,7 +136,17 @@ export type StepUpOperation =
   // partner's (cap, schedule, fees, payment methods, reminders). Asked for only
   // when a saved value differs from the stored one; bound to the organization
   // AND to the exact values saved, like partner_payment_settings_update.
-  | 'org_payment_settings_update';
+  | 'org_payment_settings_update'
+  // Ticket migration windows (#8313): opening a window widens a keyless
+  // partner service principal into import mode across the chosen orgs. Bound
+  // to the exact { partnerId, principalId, sorted orgIds, endsAt,
+  // writesPerHour } the admin confirmed, so a grant can never open a wider,
+  // longer or faster window than the one shown.
+  | 'migration_window_open'
+  // Caller verification (#6354 W05): an administrative disable authorised by
+  // an interactive step-up instead of a caller challenge. Bound to the exact
+  // { orgId, Entra tenant, Entra OID, reason } the technician confirmed.
+  | 'caller_verification_administrative_disable';
 
 export interface StepUpGrant {
   id: string;
@@ -235,6 +249,15 @@ export function maintenanceResourceDigest(input: {
     durationHours: input.durationHours,
     reason: input.reason.trim(),
   });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Canonical digest for a `device_force_reboot` grant (#8729): the device id
+ * alone, so a grant minted for one device can never force-reboot another.
+ */
+export function forceRebootResourceDigest(input: { deviceId: string }): `sha256:${string}` {
+  const canonical = JSON.stringify({ deviceId: input.deviceId });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
 
@@ -465,6 +488,29 @@ export function orgPaymentSettingsResourceDigest(input: {
 }
 
 /**
+ * Migration window open binding (#8313): the partner, the principal, the
+ * deduplicated sorted org set, the end (normalised to ISO) and the throughput
+ * as requested (null when the admin left the default), independent of order.
+ */
+export function migrationWindowOpenResourceDigest(input: {
+  partnerId: string;
+  principalId: string;
+  orgIds: readonly string[];
+  endsAt: string;
+  writesPerHour?: number | null;
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    kind: 'migration_window_open',
+    partnerId: input.partnerId.toLowerCase(),
+    principalId: input.principalId.toLowerCase(),
+    orgIds: [...new Set(input.orgIds.map((id) => id.toLowerCase()))].sort(),
+    endsAt: new Date(input.endsAt).toISOString(),
+    writesPerHour: input.writesPerHour ?? null,
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
  * Redirected authorization-request binding: the deduplicated, sorted org set,
  * the exact recipient, and the mode (absent means 'request', as on the route).
  */
@@ -479,6 +525,14 @@ export function autopayRequestRecipientResourceDigest(input: {
     orgIds: [...new Set(input.orgIds.map(id => id.toLowerCase()))].sort(),
     recipientOverride: input.recipientOverride,
   });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+export function callerVerificationAdministrativeDigest(input: {
+  orgId: string; entraTenantId: string; entraOid: string; reason: string;
+}): `sha256:${string}` {
+  const reasonHash = createHash('sha256').update(input.reason.trim()).digest('hex');
+  const canonical = [input.orgId, input.entraTenantId, input.entraOid, reasonHash].join('|');
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
 

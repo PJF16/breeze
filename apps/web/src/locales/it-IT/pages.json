@@ -23,6 +23,8 @@
     "adminUsersDetailDevices": "Dispositivi dell'utente",
     "aiAgentsImpact": "Impatto IA",
     "aiAgentsFixMemory": "Memoria delle correzioni",
+    "flows": "Flussi",
+    "flowDetail": "Flusso",
     "aiAgentsRunsDetail": "Dettaglio esecuzione",
     "aiAgentsRuns": "Esecuzioni degli agenti",
     "aiForOffice": "AI per Office",
@@ -94,6 +96,7 @@
     "policies": "Criteri",
     "policiesNew": "Nuovo criterio",
     "quick": "Supporto rapido",
+    "verify": "Controlla una richiesta di assistenza",
     "registerPartner": "Registra la tua azienda",
     "remoteFilesDevice": "Gestione file remota",
     "remoteFiles": "Avvia trasferimento file",
@@ -174,7 +177,8 @@
     "securityScans": "Scansioni IOC",
     "devicesTime": "Sincronizzazione dell’ora",
     "adminAiModels": "Modelli di IA",
-    "billingAutopay": "Automatic payments"
+    "billingAutopay": "Automatic payments",
+    "endpointMessages": "Messaggi agli endpoint"
   },
   "layout": {
     "metaDescription": "Breeze RMM - Monitoraggio e gestione remota",
@@ -182,6 +186,10 @@
   },
   "authShell": {
     "tagline": "La piattaforma RMM moderna pensata per velocità, chiarezza e scalabilità."
+  },
+  "authFooter": {
+    "reportAbuse": "Segnala un abuso",
+    "security": "Sicurezza"
   },
   "errorPage": {
     "notFoundBody": "La pagina che stai cercando non esiste o potrebbe essere stata spostata.",

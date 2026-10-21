@@ -86,7 +86,9 @@
       "failedInstalls_one": "{{count}} başarısız kurulum",
       "failedInstalls_other": "{{count}} başarısız kurulum",
       "critical": "{{count}} kritik",
-      "reboot": "{{count}} yeniden başlat"
+      "reboot": "{{count}} yeniden başlat",
+      "imagesNotChecked_one": "{{count}} kapsayıcı imajı denetlenmedi",
+      "imagesNotChecked_other": "{{count}} kapsayıcı imajı denetlenmedi"
     },
     "filters": {
       "allDevices": "Tüm Cihazlar ({{count}})",
@@ -257,7 +259,9 @@
       "moderate": "Orta",
       "low": "Düşük",
       "unrated": "Derecelendirilmemiş",
-      "unratedNote": "Otomatik onaylanmayacak"
+      "unratedNote": "Otomatik onaylanmayacak",
+      "derivedNote": "Türetilmiş derecelendirme",
+      "derivedTooltip": "Satıcı bu güncelleme için bir derecelendirme yayımlamadı. Bu önem derecesi, sınıflandırmasından ve başlığından türetildi."
     },
     "approval": {
       "pending": "Beklemede",
@@ -305,6 +309,7 @@
       "os": "İşletim Sistemi",
       "release": "Yayınla",
       "approval": "Onay",
+      "devices": "Cihazlar",
       "actions": "Eylemler"
     },
     "releaseUnknown": "Bilinmiyor",
@@ -317,6 +322,18 @@
       "badgeDevices_other": "Kurulum {{count}} cihazda başarısız oldu",
       "noReason": "Ajan bir neden bildirmedi",
       "failedAt": "Son kurulum denemesi başarısız oldu: {{when}}"
+    },
+    "outstandingDevices": {
+      "badge_one": "{{count}} cihaz",
+      "badge_other": "{{count}} cihaz",
+      "none": "Kapsamdaki hiçbir cihazın artık bu yamaya ihtiyacı yok",
+      "open": "{{title}} güncellemesine hâlâ ihtiyaç duyan cihazları göster",
+      "heading": "{{title}} güncellemesine hâlâ ihtiyaç duyan cihazlar",
+      "loading": "Cihazlar yükleniyor…",
+      "error": "Cihaz listesi yüklenemedi.",
+      "showing": "{{total}} cihazdan {{shown}} tanesi gösteriliyor",
+      "loadMore": "Daha fazla yükle",
+      "lastChecked": "Son denetim: {{when}}"
     }
   },
   "patchesPage": {
@@ -357,7 +374,8 @@
       "createRing": "Güncelleme halkası oluşturulamadı",
       "deleteRing": "Zil silinemedi",
       "approveUnknown": "Onay durumu bilinmiyor — sunucu yanıtı okunamadı. Hangi yamaların onaylandığını onaylamak için yenileyin.",
-      "approveAbortedWithFailures": "{{message}} ({{count}} yamaları da bundan önce sunucu tarafından reddedilmişti.)"
+      "approveAbortedWithFailures": "{{message}} ({{count}} yamaları da bundan önce sunucu tarafından reddedilmişti.)",
+      "checkRingLinks": "Bu halkayı hangi ilkelerin kullandığı denetlenemedi; hiçbir şey silinmedi"
     },
     "toast": {
       "ringSaved": "Güncelleme halkası kaydedildi",
@@ -387,7 +405,13 @@
       "createTitle": "Güncelleme halkası oluştur"
     },
     "truncatedNotice": "{{total}} yamalardan {{shown}} gösteriliyor. Buradaki filtreler yalnızca önceden yüklenmiş olanları daraltır, dolayısıyla geri kalanlara bu görünümden erişilemez; kataloğun tamamı üzerinde çalışmak için API yamalarını kullanın.",
-    "shiftedNotice": "{{total}} yamasından {{shown}} gösteriliyor — katalog yüklenirken değişti. Gerisini görmek için yeniden yükleyin."
+    "shiftedNotice": "{{total}} yamasından {{shown}} gösteriliyor — katalog yüklenirken değişti. Gerisini görmek için yeniden yükleyin.",
+    "ringDelete": {
+      "title": "{{name}} silinsin mi?",
+      "messageOne": "1 ilke, siz başka bir halka seçene kadar zamanlanmış yama uygulamayı durduracak.",
+      "messageMany": "{{count}} ilke, siz başka bir halka seçene kadar zamanlanmış yama uygulamayı durduracak.",
+      "confirm": "Halkayı sil"
+    }
   },
   "patchJobsList": {
     "empty": "Henüz yama işi yok. Politikalar, güncelleme halkaları veya yapay zeka asistanı tarafından oluşturulan işler burada görünecek.",
@@ -568,7 +592,26 @@
     "badges": {
       "manual": "Manuel",
       "os": "İşletim Sistemi: {{severities}}",
-      "thirdParty": "3. taraf uygulamalar"
+      "thirdParty": "3. taraf uygulamalar",
+      "appRules_one": "{{count}} uygulama kuralı",
+      "appRules_other": "{{count}} uygulama kuralı"
     }
+  },
+  "ringAppRules": {
+    "applicationRules": "Başvuru Kuralları",
+    "blockSpecificApplicationsFromAutomatedPatchingOr": "Belirli uygulamaların otomatik yama uygulanmasını engelleyin veya bunları maksimum sürüme sabitleyin.",
+    "blocked": "Engellendi",
+    "pinned": "Sabitlendi",
+    "maxVersion": "Maksimum sürüm",
+    "pinnedApplicationsNeedAVersion": "Sabitlenen uygulamaların bir sürümü olması gerekir.",
+    "addApplication": "Uygulama ekle",
+    "searchCatalogAndDetectedApplications": "Katalogda ve algılanan uygulamalarda arama yapın...",
+    "searching": "Aranıyor...",
+    "catalog": "katalog",
+    "couldnTLoadApplicationsYouCanStill": "Uygulamalar yüklenemedi — hâlâ aşağıdaki paket kimliğine göre ekleyebilirsiniz.",
+    "noMatches": "Eşleşme yok.",
+    "orEnterAPackageIDManually": "Veya manuel olarak bir paket kimliği girin",
+    "removeRuleFor": "{{application}} kuralını kaldır",
+    "scopeNote": "Bu kurallar, yapılandırma ilkesi bu halkaya bağlı olan her cihaz için geçerlidir."
   }
 }

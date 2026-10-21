@@ -111,6 +111,10 @@ const TOOL_CAPABILITY_NOT_YET_IN_TIER_CONFIG: readonly string[] = [
   'get_cis_device_report',
   'get_contract',
   'get_device_vulnerabilities',
+  // EDR provider framework (#8164/#8166): same gap as get_huntress_incidents.
+  // (edr_endpoint_action / sync_edr_data have tierConfig rows since #8167 W03 PR-B.)
+  'get_edr_status',
+  'list_edr_detections',
   'get_huntress_incidents',
   'get_huntress_status',
   'get_invite_funnel',
@@ -222,7 +226,9 @@ const CATEGORY_CAPABILITY_PAIRS: Record<ToolCategory, AgentCapabilityId[]> = {
   'Files, Disk & Registry': ['files_disk', 'scripts_commands'],
   'Logs & Audit': ['alerts_monitoring', 'automations_reports', 'endpoint_agent'],
   'Services & Processes': ['services_startup', 'scripts_commands'],
-  'Scripts & Automation': ['scripts_commands', 'author_scripts'],
+  // automations_reports: Tool Catalog W03 flow tools (#5218) — flows are automations, read and
+  // drafted with automations.read/write, shown with the other scripting tools.
+  'Scripts & Automation': ['scripts_commands', 'author_scripts', 'automations_reports'],
   'Configuration Policies': ['config_policies'],
   'Fleet Operations': [
     'automations_reports',

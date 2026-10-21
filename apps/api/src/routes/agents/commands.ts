@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { z } from 'zod';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, getTableColumns } from 'drizzle-orm';
 import { db, runOutsideDbContext, withDbTransaction, withSystemDbAccessContext } from '../../db';
 import { dbWriteExpectingRows } from '../../db/dbWriteExpectingRows';
 import { commandCasPriorStatusTags } from '../../services/commandCasDiagnostics';
@@ -23,6 +23,7 @@ import {
   handleCisCommandResult,
 } from './helpers';
 import { captureException } from '../../services/sentry';
+import { ingestRestorePointOutcome } from '../../services/restorePointIngest';
 import { markCommandResultProcessingFailed } from '../../services/commandResultProcessingFailure';
 import { processCollectedAuditPolicyCommandResult } from '../../services/auditBaselineService';
 import { CommandTypes, queueCommandForExecution } from '../../services/commandQueue';
@@ -47,17 +48,19 @@ import {
   commandAcceptsAgentResult,
   commandAcceptsAgentResultCondition,
 } from '../../services/commandResultAcceptance';
+import { commandIncarnationIsCurrentCondition } from '../../services/commandIncarnation';
 import { QUEUED_BACKUP_WORKLOAD_COMMAND_TYPES } from '../../services/commandTypes';
 import { tryParseBackupResultPayload, isBackupQueuedAck, isBackupStartedAck } from '../../services/backupProgress';
 import {
   pamAgentResultV2Schema,
-  type PamActuationResultClassification,
+  toV1PamResultClassification,
+  type PamActuationResultClassificationV1,
 } from '../../services/pamActuationResult';
 import { consumePamReconciliationRateLimit } from '../../services/pamReconciliationRateLimit';
 
 export type PamResultAcknowledgement = {
   protocolVersion: 1;
-  classification: PamActuationResultClassification;
+  classification: PamActuationResultClassificationV1;
 };
 
 export const commandsRoutes = new Hono();
@@ -114,6 +117,15 @@ const REGISTRY_DISPATCHED_COMMAND_TYPES = new Set([
   // #8385: a vault configuration the helper could not apply is recorded on
   // the vault. Registry-only, like system_cleanup_run.
   'vault_configure',
+  // #6354 W02: caller verification. Registry-only so both transports apply
+  // the human's answer through the same leaf handler.
+  'caller_verify',
+  // #8742 W02: endpoint-message delivery state follows the notify_user result.
+  'notify_user',
+  'retract_message',
+  // #8743 W03: conversation / message state follows the chat command results.
+  'chat_open',
+  'chat_message',
 ]);
 
 const PAM_COMMAND_TYPES = new Set(['pam_apply_v2', 'pam_cleanup_v2']);
@@ -278,9 +290,16 @@ commandsRoutes.post(
     // device_commands ever gains an RLS policy, this read becomes a silent
     // 0-row no-op and MUST move into withSystemDbAccessContext — same caveat as
     // services/commandDispatch.ts.
+    //
+    // #8318: `incarnationCurrent` is read in the same statement — is the row
+    // stamped for the device's CURRENT install incarnation? (A SECURITY
+    // DEFINER resolver, so it answers on this contextless read.)
     const [command] = await runOutsideDbContext(() =>
       db
-        .select()
+        .select({
+          ...getTableColumns(deviceCommands),
+          incarnationCurrent: commandIncarnationIsCurrentCondition(),
+        })
         .from(deviceCommands)
         .where(
           and(
@@ -309,6 +328,21 @@ commandsRoutes.post(
     const commandTargetRole = command.targetRole === 'watchdog' ? 'watchdog' : 'agent';
     if (commandTargetRole !== agent.role) {
       return c.json({ error: 'Command role mismatch' }, 403);
+    }
+
+    // #8318 §5.2: work queued for an EARLIER install incarnation of this
+    // device. Nothing about it is recorded — not the result, not a late
+    // caller-verification receipt, not cleanup evidence, not PAM evidence —
+    // and it is acknowledged like any other result the server no longer
+    // wants, so a replaying outbox stops. The terminal CAS below carries the
+    // same check in SQL (commandAcceptsAgentResultCondition); this answers
+    // before any of the branches that bypass it. Compared with `=== false`
+    // because the column is always a boolean from the database.
+    if (command.incarnationCurrent === false) {
+      if (PAM_COMMAND_TYPES.has(command.type)) {
+        return c.json<PamResultAcknowledgement>({ protocolVersion: 1, classification: 'stale' });
+      }
+      return c.json({ success: true });
     }
 
     // Supplemental PAM evidence for every terminal command state, including a
@@ -346,7 +380,7 @@ commandsRoutes.post(
       }
       return c.json<PamResultAcknowledgement>({
         protocolVersion: 1,
-        classification: outcome.classification,
+        classification: toV1PamResultClassification(outcome.classification),
       });
     }
     if (isTerminalPamCommand) {
@@ -358,6 +392,33 @@ commandsRoutes.post(
     // reaper) remains acceptable for non-PAM commands. Every other terminal
     // result preserves the historical short circuit.
     const acceptsResult = commandAcceptsAgentResult(command.status, command.result, command.type);
+
+    // Caller verification (#6354 W02): "This is not me" must survive a
+    // command that is already terminal. The row was authorized above (this
+    // device, agent role); the receipt is merged into it without reopening
+    // it, and the decision runs in the same savepoint — a failure rolls both
+    // back and the agent's retry re-applies it.
+    if (!acceptsResult && command.type === 'caller_verify') {
+      const late = await import('../../services/callerVerification/workstationResult');
+      const lateStdout = commandResultToStdout(data);
+      if (late.isCallerNotMe(lateStdout, data.result)) {
+        await withDbTransaction(async () => {
+          const recorded = await late.persistCallerNotMeReceipt({
+            commandId, deviceId: command.deviceId, stdout: lateStdout, result: data.result,
+          });
+          if (!recorded) {
+            console.warn(`[agents] late caller rejection for command ${commandId} could not be recorded; ignored`);
+          } else {
+            await late.handleCallerVerifyResult({
+              agentId: agent.agentId ?? agentId, command, commandId, result: data,
+              resolvedDeviceId: command.deviceId, stdout: lateStdout,
+            });
+          }
+        });
+      }
+      return c.json({ success: true });
+    }
+
     if (!acceptsResult && command.type !== 'file_delete' && command.type !== 'system_cleanup_run') {
       return c.json({ success: true });
     }
@@ -649,7 +710,7 @@ commandsRoutes.post(
               }
               pamAcknowledgement = {
                 protocolVersion: 1,
-                classification: outcome.classification,
+                classification: toV1PamResultClassification(outcome.classification),
               };
             }
           }
@@ -695,6 +756,25 @@ commandsRoutes.post(
       return c.json({ success: true });
     }
     if (finalized === 'queue_ack') return c.json({ success: true });
+
+    // #4757 W06: terminalise the restore-point ledger only after the CAS won
+    // (a losing duplicate returned 'stale' above), outside the savepoint so a
+    // ledger failure can never roll the result back, and before the
+    // 'rejected' return (the command still went terminal). The ingest escapes
+    // this request's org-scoped transaction into its own system context, so
+    // the ledger write commits independently of the request's final commit.
+    // Skipped entirely when the agent sent no restorePoint. Never fails the
+    // result.
+    if (data.restorePoint !== undefined) {
+      try {
+        await ingestRestorePointOutcome(data.restorePoint, {
+          orgId: agent.orgId, deviceId, deviceCommandId: commandId,
+        });
+      } catch (err) {
+        console.error(`[agents] restore-point ledger ingest failed for ${commandId}; result unaffected:`, err);
+        captureException(err, undefined, { restore_point_ingest: 'call_site' });
+      }
+    }
 
     // The guarded command transition is the authority, so the automation
     // ledger follows it only once it (and its persistence) succeeded. Before

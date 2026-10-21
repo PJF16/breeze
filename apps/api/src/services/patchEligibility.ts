@@ -37,12 +37,13 @@ import { z } from 'zod';
 import type { PatchIneligibleReason } from '@breeze/shared';
 import { db } from '../db';
 import {
-  devicePatches, devices, organizations, patchApprovals, patches, patchPolicies,
+  devicePatches, devices, organizations, patches, patchPolicies,
   OUTSTANDING_DEVICE_PATCH_STATUSES,
 } from '../db/schema';
 import { loadPolicyLocalPatchConfig } from './configPolicyPatching';
 import { resolvePatchConfigPolicyForDevice } from './featureConfigResolver';
 import { captureException } from './sentry';
+import { resolveLatestManualDecisions, selectManualDecisionRows } from './patchManualDecisions';
 import { EFFECTIVE_PATCH_CATEGORY_SQL, EFFECTIVE_PATCH_SEVERITY_SQL } from './patchSeverityOverlay';
 import {
   buildAllowedPatchSources,
@@ -57,7 +58,6 @@ import {
   type ApprovalReason,
   type ApprovedPatch,
   type CategoryRule,
-  type PolicyAppRule,
 } from './patchApprovalEvaluator';
 
 export type { PatchIneligibleReason };
@@ -129,10 +129,12 @@ export async function evaluatePatchInstallEligibility(args: {
 
   // Cross-partner ring guard: a config policy could reference a ring owned by
   // a different partner (featurePolicyId is an unconstrained uuid). If the
-  // ring's partner != this device-org's partner, treat it as no ring.
+  // ring's partner != this device-org's partner, it is an invalid reference
+  // and fails closed like any other (#8186): the ring owns the app rules, so
+  // treating it as "no ring" could let a manual approval install a blocked app.
   let ringConfig = args.config;
   if (ringConfig.ringId && ringConfig.ringPartnerId && ringConfig.ringPartnerId !== partnerId) {
-    ringConfig = { ...ringConfig, ringId: null };
+    ringConfig = { ...ringConfig, ringId: null, ringAppRules: [], ringReferenceInvalid: true };
   }
 
   // 1. The device's device_patches rows joined with patch details, pinned to
@@ -195,6 +197,14 @@ export async function evaluatePatchInstallEligibility(args: {
 
   if (pendingPatches.length === 0) return { eligible, ineligible, ringId: ringConfig.ringId, resolvedAt };
 
+  // An unresolvable ring reference fails closed (#8186): the ring owns the
+  // app rules, so evaluating as "no ring" could install an app the ring
+  // blocks. The scheduler already refuses these policies.
+  if (ringConfig.ringReferenceInvalid) {
+    for (const p of pendingPatches) deny(p.patchId, 'ring_reference_invalid');
+    return { eligible, ineligible, ringId: null, resolvedAt };
+  }
+
   // Apply policy-level source filtering ('os' vs 'third_party' etc.).
   const allowedSources = buildAllowedPatchSources(ringConfig.sources);
   const candidatePatches = allowedSources
@@ -236,9 +246,9 @@ export async function evaluatePatchInstallEligibility(args: {
 
   // App rules filter before manual approvals are loaded — a block/pin
   // overrides even an explicit manual approval in the job flow; manual
-  // per-device installs bypass this evaluator entirely. Ring rules and
-  // policy rules are both enforced (#8184 dual read); the stricter verdict
-  // wins.
+  // per-device installs bypass this evaluator entirely. The live path fills
+  // only `ringAppRules` (#8186); `apps` arrives only from job snapshots and
+  // is still enforced, with the stricter verdict winning.
   const appRuleMaps = [buildAppRuleMap(ringConfig.ringAppRules), buildAppRuleMap(ringConfig.apps)]
     .filter((m) => m.size > 0);
   const finalCandidates = appRuleMaps.length > 0
@@ -269,29 +279,14 @@ export async function evaluatePatchInstallEligibility(args: {
   // 2. Load manual approvals for this partner (optionally scoped to ring).
   //    partner-wide (ring_id NULL) AND ring-specific rows are both returned.
   const patchIds = finalCandidates.map((p) => p.patchId);
-  const manualApprovals = await db
-    .select({
-      patchId: patchApprovals.patchId,
-      status: patchApprovals.status,
-      ringId: patchApprovals.ringId,
-    })
-    .from(patchApprovals)
-    .where(
-      and(
-        eq(patchApprovals.partnerId, partnerId),
-        inArray(patchApprovals.patchId, patchIds),
-        eq(patchApprovals.status, 'approved')
-      )
-    );
+  const manualApprovals = await selectManualDecisionRows(partnerId, patchIds);
 
-  // Index manual approvals by patchId for fast lookup
-  const manualApprovalSet = new Set<string>();
-  for (const approval of manualApprovals) {
-    // Ring-scoped approval: match if ringId matches, or approval is partner-wide (null ringId)
-    if (approval.ringId === ringConfig.ringId || approval.ringId === null) {
-      manualApprovalSet.add(approval.patchId);
-    }
-  }
+  // A decline ('rejected') is a TERMINAL deny (#9369) — it must beat ring
+  // auto-approve, which never sees it otherwise. Latest decision wins among
+  // this ring's rows and partner-wide (null ringId) rows; see
+  // patchManualDecisions.ts.
+  const { approved: manualApprovalSet, declined: declinedSet } =
+    resolveLatestManualDecisions(manualApprovals, { ringId: ringConfig.ringId });
 
   // 3. Build category rules index
   const categoryRules = Array.isArray(ringConfig.categoryRules) ? ringConfig.categoryRules : [];
@@ -311,7 +306,7 @@ export async function evaluatePatchInstallEligibility(args: {
 
   const now = new Date();
   for (const patch of finalCandidates) {
-    const decision = decidePatchApproval(patch, ringConfig, manualApprovalSet, categoryRuleMap, ringAutoApprove, now);
+    const decision = decidePatchApproval(patch, ringConfig, manualApprovalSet, categoryRuleMap, ringAutoApprove, now, declinedSet);
     if ('approved' in decision) {
       eligible.push({
         patchId: patch.patchId,
@@ -400,9 +395,10 @@ const NO_POLICY_CONFIG: ApprovalEvaluationConfig = { ringId: null, categoryRules
 /**
  * The device's CURRENT effective patch config, resolved through the same
  * hierarchy the scheduler uses (`resolvePatchConfigPolicyForDevice` →
- * `loadPolicyLocalPatchConfig`), in the shape the evaluator takes. No policy
- * → manual approvals only. An invalid ring reference → no ring, but the
- * policy's own sources / app rules still apply.
+ * `loadPolicyLocalPatchConfig`), in the shape the evaluator takes. No policy,
+ * or a policy with no ring → manual approvals only. App rules come from the
+ * ring alone (#8186); a policy's own inline `apps` list is no longer read.
+ * An invalid ring reference → `ringReferenceInvalid`, which denies everything.
  */
 export async function resolveDevicePatchEvaluationConfig(deviceId: string): Promise<ApprovalEvaluationConfig> {
   return (await resolveDevicePatchEvaluation(deviceId)).config;
@@ -425,6 +421,13 @@ export async function resolveDevicePatchEvaluation(
 
   const { settings, ring } = policyLocal;
   const ringId = ring.valid ? ring.ringId : null;
+  if (!ring.valid) {
+    // missing / legacy / config-policy uuid: not the `null` no-ring case.
+    return {
+      config: { ...NO_POLICY_CONFIG, sources: settings.sources, ringAppRules: [], ringReferenceInvalid: true },
+      ringName: null,
+    };
+  }
   const config: ApprovalEvaluationConfig = {
     ringId,
     ringPartnerId: null,
@@ -434,18 +437,8 @@ export async function resolveDevicePatchEvaluation(
     categories: ringId ? ring.categories : undefined,
     excludeCategories: ringId ? ring.excludeCategories : undefined,
     sources: settings.sources,
-    policyAutoApprove: {
-      enabled: settings.autoApprove ?? false,
-      severities: settings.autoApproveSeverities ?? [],
-      deferralDays: settings.autoApproveDeferralDays ?? 0,
-    },
-    // Same normalisation the executor applies to its snapshot: strip the
-    // display-only fields, and a pin without a version is a block.
-    apps: (settings.apps ?? []).map((rule): PolicyAppRule =>
-      rule.action === 'pin' && rule.pinnedVersion
-        ? { source: rule.source, packageId: rule.packageId, action: 'pin', pinnedVersion: rule.pinnedVersion }
-        : { source: rule.source, packageId: rule.packageId, action: 'block' }),
-    // The resolver already normalised these (coerceRingAppRules) — #8184.
+    // The ring owns the app rules (#8186); the resolver already normalised
+    // them (coerceRingAppRules). The policy's inline `apps` is not read.
     ringAppRules: ringId ? ring.appRules : [],
   };
 
@@ -465,13 +458,14 @@ export async function resolveDevicePatchEvaluation(
       // The ring resolved as valid a moment ago and is gone now (deleted
       // between the two reads). Keeping its category/auto-approve rules with
       // a zeroed deferral window would fail OPEN — the direction
-      // `disabledForMalformedField` refuses. Fail closed: no ring, manual
-      // approvals only, and say so.
-      const message = `[patchEligibility] device ${deviceId}: ring ${ringId} vanished between resolution and read — treating as no ring (manual approvals only)`;
+      // `disabledForMalformedField` refuses — and treating it as "no ring"
+      // would drop its app rules, the only ones there are (#8186). Fail
+      // closed: deny everything, as for any unresolvable ring, and say so.
+      const message = `[patchEligibility] device ${deviceId}: ring ${ringId} vanished between resolution and read — denying every candidate (ring_reference_invalid)`;
       console.warn(message);
       captureException(new Error(message));
       return {
-        config: { ...NO_POLICY_CONFIG, sources: config.sources, policyAutoApprove: config.policyAutoApprove, apps: config.apps, ringAppRules: [] },
+        config: { ...NO_POLICY_CONFIG, sources: config.sources, ringAppRules: [], ringReferenceInvalid: true },
         ringName: null,
       };
     }

@@ -17,7 +17,8 @@ import { showToast } from "../shared/Toast";
 import type { ScriptAdmissionResult } from "@breeze/shared";
 import type { FilterConditionGroup } from "@breeze/shared";
 import { encodeFilterToHash } from "./filterUrl";
-import { FilterBuilder, DEFAULT_FILTER_FIELDS } from "../filters/FilterBuilder";
+import { FilterBuilder } from "../filters/FilterBuilder";
+import { useDeviceFilterFields } from "../filters/useDeviceFilterFields";
 import { FilterPreview } from "../filters/FilterPreview";
 import { useFilterPreview } from "../../hooks/useFilterPreview";
 import {
@@ -54,6 +55,7 @@ type GroupType = "static" | "dynamic";
 
 type DeviceGroup = {
   id: string;
+  orgId?: string;
   name: string;
   type: GroupType;
   deviceCount?: number;
@@ -188,6 +190,9 @@ const parseDragPayload = (event: DragEvent): DragPayload | null => {
 
 export default function DeviceGroupsPage() {
   const { t } = useTranslation("devices");
+  // Static catalog + org/partner custom fields (#8843): the rule builder's
+  // field picker and the card's condition chips both draw from it.
+  const filterFields = useDeviceFilterFields();
   const [groups, setGroups] = useState<DeviceGroup[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
   const [sites, setSites] = useState<Site[]>([]);
@@ -245,7 +250,15 @@ export default function DeviceGroupsPage() {
       (modalMode === "create" || modalMode === "edit")
       ? groupForm.filterConditions
       : null,
-    { enabled: true },
+    // Pin to the group's own org when editing (All-orgs view has no injected
+    // org, so a negated group filter would match every org's devices — #9262),
+    // or to the chosen owner org when creating.
+    {
+      enabled: true,
+      orgId:
+        (modalMode === "edit" ? selectedGroup?.orgId : undefined) ??
+        (modalMode === "create" ? fleet.bodyOrgId : undefined),
+    },
   );
 
   // The chooser is inert until the server's membership answer is in hand: an
@@ -1162,7 +1175,7 @@ export default function DeviceGroupsPage() {
               // are only shown for rows that have no filter — otherwise a
               // stale stub would misreport the group's membership.
               const membershipChips = group.filterConditions
-                ? describeFilterConditions(group.filterConditions)
+                ? describeFilterConditions(group.filterConditions, filterFields)
                 : (group.rules ?? []).map((rule) =>
                     buildRuleLabel(rule, siteNameById),
                   );
@@ -1473,7 +1486,7 @@ export default function DeviceGroupsPage() {
                         filterConditions: conditions,
                       }))
                     }
-                    filterFields={DEFAULT_FILTER_FIELDS}
+                    filterFields={filterFields}
                     showPreview={false}
                   />
                   <FilterPreview

@@ -192,7 +192,8 @@
     "script": "Verifica script",
     "network_check": "Verifica di rete",
     "hardware_health": "Stato hardware",
-    "time_sync": "Sincronizzazione dell’ora"
+    "time_sync": "Sincronizzazione dell’ora",
+    "container_image_currency": "Aggiornamento delle immagini container"
   },
   "fields": {
     "operator": "Confronto",
@@ -538,11 +539,13 @@
       "more": "Carica altro",
       "empty": "Nessuna conversione precedente.",
       "system": "Sistema",
+      "unknownUser": "Utente sconosciuto",
       "reverted": "Annullato",
       "deadline": "Annullamento non disponibile dopo la rimozione del motore di origine da parte del ritiro degli avvisi legacy."
     },
     "errorCodes": {
       "preview_stale": "Il criterio è cambiato dopo questa anteprima. Genera una nuova anteprima prima di convertire.",
+      "conversion_contended": "Modifiche simultanee hanno interrotto la conversione. Non è stato modificato nulla. Riprova.",
       "preview_failed": "Impossibile generare l'anteprima. Riprova più tardi.",
       "equivalence_delta": "I monitor convertiti non si comporterebbero come le regole legacy su tutti i dispositivi. Controlla l'anteprima prima di convertire.",
       "CONVERSION_PREREQUISITE_MISSING": "Un aggiornamento necessario della piattaforma non è ancora stato distribuito, quindi la conversione non è possibile.",
@@ -646,6 +649,9 @@
           "policy_not_applied": "Il criterio relativo all’ora non è stato applicato",
           "policy_conflict_gpo": "Criteri di gruppo controlla le impostazioni dell’ora"
         }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "Giorni minimi di ritardo"
       }
     }
   },

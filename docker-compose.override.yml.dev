@@ -120,16 +120,20 @@ services:
       # predev/prebuild run scripts/*.ts inside the container (copy-monaco-assets); read-only — never written at runtime
       - ./apps/web/scripts:/app/apps/web/scripts:ro
       - ./packages/shared/src:/app/packages/shared/src:cached
+      - ./packages/document-ui/src:/app/packages/document-ui/src:cached
       # Mount config files
       - ./apps/web/package.json:/app/apps/web/package.json:ro
       - ./apps/web/tsconfig.json:/app/apps/web/tsconfig.json:ro
       - ./apps/web/astro.config.mjs:/app/apps/web/astro.config.mjs:ro
       - ./packages/shared/package.json:/app/packages/shared/package.json:ro
       - ./packages/shared/tsconfig.json:/app/packages/shared/tsconfig.json:ro
+      - ./packages/document-ui/package.json:/app/packages/document-ui/package.json:ro
+      - ./packages/document-ui/tsconfig.json:/app/packages/document-ui/tsconfig.json:ro
       # Exclude node_modules (use container's)
       - /app/node_modules
       - /app/apps/web/node_modules
       - /app/packages/shared/node_modules
+      - /app/packages/document-ui/node_modules
     environment:
       NODE_ENV: development
       HOST: 0.0.0.0
@@ -137,6 +141,8 @@ services:
       PUBLIC_APP_VERSION: dev
       # Empty → the web default (on); set false in .env to test the agent-only list.
       PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST: ${PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST:-}
+      # Empty → off; set true in .env to show the Send message entry points (#8968).
+      PUBLIC_ENABLE_ENDPOINT_MESSAGING: ${PUBLIC_ENABLE_ENDPOINT_MESSAGING:-}
     healthcheck:
       test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://127.0.0.1:4321/']
       start_period: 60s

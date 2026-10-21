@@ -192,7 +192,8 @@
     "script": "Skriptprüfung",
     "network_check": "Netzwerkprüfung",
     "hardware_health": "Hardwarezustand",
-    "time_sync": "Zeitsynchronisierung"
+    "time_sync": "Zeitsynchronisierung",
+    "container_image_currency": "Aktualität von Container-Images"
   },
   "fields": {
     "operator": "Vergleich",
@@ -538,11 +539,13 @@
       "more": "Mehr laden",
       "empty": "Kein Konvertierungsverlauf.",
       "system": "Automatisches System",
+      "unknownUser": "Unbekannter Benutzer",
       "reverted": "Rückgängig gemacht",
       "deadline": "Rückgängig ist nach Entfernung der Quelllaufzeit durch die Stilllegung der Legacy-Benachrichtigungen nicht verfügbar."
     },
     "errorCodes": {
       "preview_stale": "Die Richtlinie wurde seit dieser Vorschau geändert. Erstellen Sie vor der Konvertierung erneut eine Vorschau.",
+      "conversion_contended": "Gleichzeitige Änderungen haben die Konvertierung unterbrochen. Es wurde nichts geändert. Versuchen Sie es erneut.",
       "preview_failed": "Die Vorschau konnte nicht erstellt werden. Versuchen Sie es später erneut.",
       "equivalence_delta": "Die konvertierten Monitore würden sich nicht auf jedem Gerät wie die Legacy-Regeln verhalten. Prüfen Sie die Vorschau vor der Konvertierung.",
       "CONVERSION_PREREQUISITE_MISSING": "Ein erforderliches Plattform-Update wurde noch nicht bereitgestellt, daher ist keine Konvertierung möglich.",
@@ -646,6 +649,9 @@
           "policy_not_applied": "Zeitrichtlinie wurde nicht angewendet",
           "policy_conflict_gpo": "Gruppenrichtlinie steuert die Zeiteinstellungen"
         }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "Mindestanzahl Tage veraltet"
       }
     }
   },

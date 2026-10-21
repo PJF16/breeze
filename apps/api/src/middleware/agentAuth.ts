@@ -22,6 +22,7 @@ import { isUnassignedPoolOrgType } from '../services/unassignedPool/orgType';
 import { CORE_AGENT_ACTION_INDEX, isCoreAgentPath } from './agentCorePath';
 import { isParkedAllowedAgentPath, PARKED_DEVICE_REFUSAL } from './agentAuthParked';
 import { agentAuthNegativeCache, type AgentAuthTerminalRejection } from './agentAuthNegativeCache';
+import { bufferAgentRequestBody } from './agentRequestBody';
 import {
   AGENT_ORG_RATE_WINDOW_SECONDS,
   computeReservedIngestLimit,
@@ -126,12 +127,12 @@ declare module 'hono' {
 
 // 120 requests per 60-second window per agent
 const AGENT_RATE_LIMIT = 120;
-const AGENT_RATE_WINDOW_SECONDS = 60;
+export const AGENT_RATE_WINDOW_SECONDS = 60;
 // Task 19: per-(agent, source-IP) bucket. A stolen token used from a second
 // IP can no longer eat the legit agent's 120/min budget — it has its own
 // smaller 30/min ceiling, and the legit agent keeps its own.
 const AGENT_PER_IP_RATE_LIMIT = 30;
-const AGENT_PER_IP_RATE_WINDOW_SECONDS = 60;
+export const AGENT_PER_IP_RATE_WINDOW_SECONDS = 60;
 // Dedup TTL for `agent.source.ip.changed` audits: log a given (device, IP)
 // pair at most once per day so noisy mobile/roaming agents don't drown ops
 // in events.
@@ -1131,6 +1132,17 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
     await next();
     return;
   }
+
+  // #8839 — receive the WHOLE request body before the request-long org
+  // transaction opens. Routes inside the wrap parse their body (`bodyLimit` →
+  // `zValidator` → handler) after `next()`, so reading it inside the wrap held
+  // a pooled connection idle-in-transaction for as long as a stalled upload
+  // took to arrive — one tenant's misbehaving proxy drained the whole pool for
+  // everyone (2026-10-15). The auth SELECT above stays first: it is short and
+  // rejects unauthenticated uploads before any body is read. Self-managed and
+  // storage-session routes (returned above) read their own bodies, unbuffered.
+  const bodyRefusal = await bufferAgentRequestBody(c, { agentId: device.agentId, orgId: device.orgId });
+  if (bodyRefusal) return bodyRefusal;
 
   await withDbAccessContext(
     {

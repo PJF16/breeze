@@ -51,6 +51,15 @@ function normalizeSeverity(value?: string): PatchSeverity {
   return severityMap[normalized] ?? 'unrated';
 }
 
+/**
+ * #9387: provenance of a device-reported severity. Only a real rating has
+ * one — an unrated patch is never shown as "derived".
+ */
+function normalizeSeveritySource(value: unknown, severity: PatchSeverity): Patch['severitySource'] {
+  if (severity === 'unrated') return undefined;
+  return value === 'derived' || value === 'vendor' ? value : undefined;
+}
+
 function normalizeApprovalStatus(value?: string): PatchApprovalStatus {
   if (!value) return 'pending';
   return approvalMap[value.toLowerCase()] ?? 'pending';
@@ -84,10 +93,13 @@ export function normalizePatch(raw: Record<string, unknown>, index: number): Pat
     ? cveIdsRaw.filter((v): v is string => typeof v === 'string' && v.length > 0)
     : undefined;
 
+  const severity = normalizeSeverity(raw.severity ? String(raw.severity) : undefined);
+
   return {
     id: String(id),
     title: String(title),
-    severity: normalizeSeverity(raw.severity ? String(raw.severity) : undefined),
+    severity,
+    severitySource: normalizeSeveritySource(raw.severitySource ?? raw.severity_source, severity),
     source: typeof source === 'string' && source.trim() ? source : 'unknown',
     os: normalizeOs(os ? String(os) : undefined),
     releaseDate: String(releaseDate),
@@ -96,6 +108,8 @@ export function normalizePatch(raw: Record<string, unknown>, index: number): Pat
     vendor: typeof vendor === 'string' && vendor.trim() ? vendor : null,
     cveIds,
     installFailure: readInstallFailure(raw.installFailure),
+    // #8728: only GET /patches supplies it; the ring list leaves it undefined.
+    outstandingDeviceCount: typeof raw.outstandingDeviceCount === 'number' ? raw.outstandingDeviceCount : undefined,
   };
 }
 
@@ -200,6 +214,10 @@ export function normalizeRing(raw: Record<string, unknown>): UpdateRingItem {
     gracePeriodHours: Number(raw.gracePeriodHours ?? 4),
     autoApprove: normalizeRingAutoApprove(raw.autoApprove),
     categoryRules: Array.isArray(raw.categoryRules) ? raw.categoryRules as UpdateRingItem['categoryRules'] : [],
+    // #8187: the ring's per-app block / pin rules. The editor round-trips this
+    // value, so anything that is not a list (missing on an older API, or a
+    // malformed row) loads as no rules rather than reaching the form.
+    appRules: Array.isArray(raw.appRules) ? raw.appRules as UpdateRingItem['appRules'] : [],
     deviceCount: raw.deviceCount != null ? Number(raw.deviceCount) : undefined,
     updatedAt: raw.updatedAt ? String(raw.updatedAt) : undefined,
   };
@@ -222,6 +240,8 @@ export type DevicePatchRow = {
   lastInstalledAt?: string;
   lastScannedAt?: string;
   pendingReboot: boolean;
+  /** W06: distinct container images behind their registry tag; a stale image is an outstanding update. */
+  staleImages?: number;
   /** Device status from the /devices API ('online' | 'offline' | ...). Used to
    *  mute the pending-reboot badge for offline devices, whose reboot flag is
    *  frozen at the last heartbeat and may be stale (#2219). */
@@ -362,4 +382,13 @@ export function normalizeCompliance(raw: Record<string, unknown>): PatchComplian
     importantSummary,
     devicesNeedingPatches
   };
+}
+
+/**
+ * A device needs updates when it has an outstanding OS/software patch or a
+ * container image behind its registry tag (W06, spec §10.1 — the API's
+ * compliant-device count uses the same rule).
+ */
+export function deviceNeedsUpdates(device: Pick<DevicePatchRow, 'pendingPatches' | 'staleImages'>): boolean {
+  return device.pendingPatches > 0 || (device.staleImages ?? 0) > 0;
 }

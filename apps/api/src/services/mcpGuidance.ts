@@ -1,11 +1,11 @@
-import { BREEZE_AI_GUARDRAILS_CORE } from './aiAgentSystemPrompt';
+import { BREEZE_MCP_GUARDRAILS_CORE } from './aiAgentSystemPrompt';
 
 // Approximate tool count stated in the instructions below. Kept as a rounded
 // literal (not derived from the aiTools registry at runtime) so this string
 // module stays decoupled from the heavy tool registry — mcpGuidancePromptTools
 // .test.ts asserts it stays within tolerance of the live count and fails loudly
 // if the two drift apart.
-export const MCP_TOOL_COUNT_APPROX = 240;
+export const MCP_TOOL_COUNT_APPROX = 250;
 
 export const MCP_SERVER_INSTRUCTIONS = `You are connected to Breeze RMM — a multi-tenant Remote Monitoring and Management platform for MSPs. This server exposes ~${MCP_TOOL_COUNT_APPROX} tools for managing devices, alerts, patches, backups, security, tickets, and configuration policies.
 
@@ -17,7 +17,7 @@ Partner (MSP) → Organization (customer) → Site (location) → Device Group �
 2. Read before write: prefer query_* and get_* tools to understand state before any manage_* or execute_* call.
 3. One target at a time unless the user explicitly asks for a fleet-wide operation.
 
-${BREEZE_AI_GUARDRAILS_CORE}
+${BREEZE_MCP_GUARDRAILS_CORE}
 
 ## Paged and large results
 List results carry hasMore and nextCursor. When hasMore is true and you need more, call the same tool again with cursor set to nextCursor and the same filters. A result with artifact.handle means the full output is stored: use read_artifact to page through it instead of re-running the query.

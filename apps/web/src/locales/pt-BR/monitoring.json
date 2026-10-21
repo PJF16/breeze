@@ -192,7 +192,8 @@
     "script": "Verificação de script",
     "network_check": "Verificação de rede",
     "hardware_health": "Integridade do hardware",
-    "time_sync": "Sincronização de horário"
+    "time_sync": "Sincronização de horário",
+    "container_image_currency": "Atualização de imagens de contêiner"
   },
   "fields": {
     "operator": "Comparação",
@@ -538,11 +539,13 @@
       "more": "Carregar mais",
       "empty": "Nenhum histórico de conversão.",
       "system": "Sistema",
+      "unknownUser": "Usuário desconhecido",
       "reverted": "Revertido",
       "deadline": "Desfazer fica indisponível após a aposentadoria de alertas legados remover o avaliador de origem."
     },
     "errorCodes": {
       "preview_stale": "A política mudou desde esta pré-visualização. Gere uma nova pré-visualização antes de converter.",
+      "conversion_contended": "Alterações simultâneas interromperam a conversão. Nada foi modificado. Tente novamente.",
       "preview_failed": "Não foi possível gerar a pré-visualização. Tente novamente mais tarde.",
       "equivalence_delta": "Os monitores convertidos não se comportariam como as regras legadas em todos os dispositivos. Revise a pré-visualização antes de converter.",
       "CONVERSION_PREREQUISITE_MISSING": "Uma atualização necessária da plataforma ainda não foi implantada, então a conversão não é possível.",
@@ -646,6 +649,9 @@
           "policy_not_applied": "A política de hora não foi aplicada",
           "policy_conflict_gpo": "A Política de Grupo controla as configurações de hora"
         }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "Mínimo de dias desatualizada"
       }
     }
   },

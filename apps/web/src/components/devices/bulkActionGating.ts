@@ -73,6 +73,11 @@ export function isCommandQueueable(status: string): boolean {
  * runBulkAction's switch already routes them through sendBulkCommand, so they are
  * classified up front: wiring a button later must not silently skip the gate.
  *
+ * `force_reboot` (#8729) is deliberately NOT a bulk action and must not become
+ * one: it force-closes apps on the device, so it is one device at a time, behind
+ * a typed-hostname confirmation and a step-up bound to that device. The API
+ * refuses it on POST /devices/bulk/commands as well.
+ *
  * `decommission` (i.e. bulk Remove) is gated here too, but for a DIFFERENT
  * reason than the agent-command actions above — read this before moving it back
  * to INTENTIONALLY_UNGATED_BULK_ACTIONS. `bulkDecommissionDevices` fires one
@@ -93,6 +98,7 @@ export const DECOMMISSION_BLOCKED_BULK_ACTIONS: ReadonlySet<string> = new Set([
   'shutdown',
   'lock',
   'run-script',
+  'send-message',
   'decommission',
 ]);
 
@@ -279,3 +285,33 @@ export function actionGateHint(
     ? t('devices:deviceActions.gateHint.liveSessionOnly', { reason })
     : t('devices:deviceActions.gateHint.allCommands', { reason });
 }
+
+/**
+ * Bulk actions that fire immediately against the selected agents and therefore
+ * need an explicit confirm (#9032): one misclick on select-all would otherwise
+ * reboot, lock or wake a customer's whole fleet with only a post-hoc toast.
+ *
+ * Not listed, because they already have their own step before anything is sent:
+ * run-script (picker, then scope-naming confirm), maintenance-on (reason
+ * dialog), deploy-software (wizard), decommission / delete-manual /
+ * permanent-delete (their own dialogs).
+ *
+ * The first four queue for offline devices, so their confirm splits the count
+ * into "online now" and "queued for next check-in". wake and maintenance-off
+ * have no queue semantics, so they get the count + scope only.
+ */
+export const CONFIRM_REQUIRED_BULK_COMMANDS: ReadonlySet<string> = new Set([
+  'reboot',
+  'reboot_safe_mode',
+  'shutdown',
+  'lock',
+  'wake',
+  'maintenance-off',
+]);
+
+export const QUEUEING_BULK_COMMANDS: ReadonlySet<string> = new Set([
+  'reboot',
+  'reboot_safe_mode',
+  'shutdown',
+  'lock',
+]);

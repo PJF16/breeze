@@ -57,6 +57,8 @@ export const CONNECTION_REGISTRY: readonly ConnectionEntry[] = [
     vars: [
       { name: 'PUBLIC_APP_URL', secret: false, required: true },
       { name: 'PUBLIC_API_URL', secret: false, required: true },
+      { name: 'TUNNEL_ORIGIN_TEMPLATE', secret: false },
+      { name: 'TUNNEL_FRAME_ANCESTOR', secret: false },
       { name: 'DASHBOARD_URL', secret: false },
       { name: 'PUBLIC_URL', secret: false },
       { name: 'PUBLIC_PORTAL_URL', secret: false },
@@ -284,6 +286,17 @@ export const CONNECTION_REGISTRY: readonly ConnectionEntry[] = [
     status: {
       kind: 'flags',
       flags: ['TOOL_SOURCES_ENABLED'],
+      requiredWhenOn: [],
+    },
+  }),
+  defineEntry({
+    id: 'flows',
+    group: 'ai',
+    label: 'Flows (AI-drafted automation flows)',
+    vars: [{ name: 'FLOWS_ENABLED', secret: false }],
+    status: {
+      kind: 'flags',
+      flags: ['FLOWS_ENABLED'],
       requiredWhenOn: [],
     },
   }),
@@ -772,6 +785,8 @@ export const CONNECTION_REGISTRY: readonly ConnectionEntry[] = [
       { name: 'OAUTH_DCR_ENABLED', secret: false },
       { name: 'OAUTH_DCR_ALLOW_ANONYMOUS', secret: false },
       { name: 'OAUTH_DCR_REQUIRE_IAT', secret: false },
+      { name: 'OAUTH_CIMD_ENABLED', secret: false },
+      { name: 'OAUTH_CIMD_ALLOWED_HOSTS', secret: false },
     ],
     status: {
       kind: 'flags',

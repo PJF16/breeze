@@ -99,6 +99,22 @@ const DIRECT_READ_ALLOWLIST = new Set([
   // pick an arbitrary row. Which rules apply to a device is decided upstream by
   // resolveComplianceRulesForDevice; this never decides what a device gets.
   'services/configComplianceAlertBridge.ts',
+  // Ownership lookup only: resolves the ONE authored link a generated software
+  // policy hangs on (managed_by_link_id) to name the owning config policy in the
+  // 409 refusal. Through the view one link id maps to the parent AND every
+  // inheriting child, so the owner would be ambiguous. Never decides what a
+  // device gets.
+  'services/securityAgents/managedSoftwarePolicyGuard.ts',
+  // #6960 W02 — the generator's repair sweep re-derives each security_agents
+  // link's OWN generated policy: it enumerates and locks the AUTHORED link rows
+  // (one generated policy per authored link id). Through the view a parent's
+  // link would appear once per inheriting child. Never decides what a device
+  // gets — that is resolveSecurityAgentsLinkForDevice (the view).
+  'services/securityAgents/managedPolicyGenerator.ts',
+  // #6960 W02 — reads the ONE authored link a generated policy hangs on
+  // (managed_by_link_id), by primary key, for its per-vendor platform list.
+  // Which devices the policy reaches was already decided through the view.
+  'services/securityAgents/managedRuleApplicability.ts',
   // Reason text only: once resolveComplianceAssignmentForDevice (the view) has
   // decided a compliance rule no longer applies to a device, this looks up the
   // ONE authored link the alert was raised under to say why (rule set renamed,
@@ -109,7 +125,6 @@ const DIRECT_READ_ALLOWLIST = new Set([
   'services/alertCorrelationRca.ts',
   // AI tools operate on a policy's own links (create/update/remove/list).
   'services/aiToolsConfigPolicy.ts',
-  'services/aiToolsFleet.ts',
   'services/aiToolsBackup.ts',
   // Approval-digest content pin for the AI tool `manage_policy_feature_link:update`.
   // It pins the CURRENT content of the one authored row the approver evaluated,
@@ -136,6 +151,11 @@ const DIRECT_READ_ALLOWLIST = new Set([
 
   // Standalone-entity delete guards and authored-link editors.
   'routes/updateRingsHelpers.ts',
+  // #8909 — ring delete/disable preflight lists the policies whose AUTHORED
+  // link names this ring, the same authored-row set updateRingsHelpers.ts's
+  // delete guard reads; an inherited projection would list child policies the
+  // tech never attached and could not detach.
+  'routes/updateRingLinkedPolicies.ts',
   'routes/policyManagement/helpers.ts',
   'routes/scripts.ts',
   'routes/backup/profiles.ts',

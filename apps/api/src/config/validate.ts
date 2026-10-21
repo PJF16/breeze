@@ -1,4 +1,5 @@
 import { isIP } from 'net';
+import { parseCimdAllowedHosts } from '../oauth/cimdHosts';
 import { MAX_BOOTSTRAP_TOKEN_TTL_MINUTES } from '@breeze/shared';
 import { parseUnattendedPrincipals } from '../services/mcpUnattendedPrincipals';
 import { z } from 'zod';
@@ -12,6 +13,7 @@ import {
 } from '../services/releaseSource';
 import { EVENT_SUBSCRIBER_IDS, isSubscriberId } from '../services/eventSubscriberIds';
 import { parsePlayIntegrityServiceAccount } from '../services/attestation/playIntegrity';
+import { parseTunnelOriginConfig } from './tunnelOrigin';
 import {
   canonicalCfAccessTeamDomain,
   decodePartnerApiCursorSigningKey,
@@ -565,6 +567,19 @@ const envObjectSchema = z
     // FORCE_HTTPS is off, so this must not retroactively boot-refuse existing
     // deployments that don't force HTTPS.
     PUBLIC_API_URL: z.string().optional(),
+    // Network Proxy host mode (spec 2026-10-06 §2). Unset = path mode only.
+    // Validated in the superRefine below (shape + registrable-domain separation).
+    TUNNEL_ORIGIN_TEMPLATE: z.string().optional(),
+    TUNNEL_FRAME_ANCESTOR: z.string().optional(),
+    // Read by the tunnel-origin validator to derive the frame ancestor and to
+    // compare registrable domains; used unvalidated elsewhere.
+    PUBLIC_APP_URL: z.string().optional(),
+    DASHBOARD_URL: z.string().optional(),
+    PUBLIC_PORTAL_URL: z.string().optional(),
+    PUBLIC_WEB_URL: z.string().optional(),
+    PUBLIC_URL: z.string().optional(),
+    API_URL: z.string().optional(),
+    WEBAUTHN_ORIGIN: z.string().optional(),
     TRUST_PROXY_HEADERS: z.string().optional(),
     // Whether CF-Connecting-IP is trusted for client-IP resolution
     // (services/clientIp.ts). Boolean-ish; unset/empty means off. Format is
@@ -655,8 +670,10 @@ const envObjectSchema = z
       .string()
       .optional()
       .refine(
-        (v) => !v?.trim() || /^[1-9]\d{0,8}$/.test(v.trim()),
-        'AGENT_ENROLL_RATE_WINDOW_SECONDS must be a positive integer below 1,000,000,000',
+        (v) => !v?.trim() || (/^[1-9]\d{0,8}$/.test(v.trim()) && Number(v.trim()) <= 230),
+        // The window is the /enroll 429 Retry-After; W09 agents cap Retry-After
+        // at 300 s after x1.3 jitter (230 = AGENT_RETRY_AFTER_MAX_SECONDS, #9457).
+        'AGENT_ENROLL_RATE_WINDOW_SECONDS must be a positive integer of at most 230',
       ),
 
     // Controlled agent-fleet rollout (decouple registration from promotion).
@@ -674,6 +691,12 @@ const envObjectSchema = z
     // AGENT_AUTO_PROMOTE above — a typo must fail boot, not silently read as
     // "off" for an operator who believed they enabled auto-remediation.
     AGENT_EDITION_AUTO_MIGRATE_ENABLED: z.string().optional(),
+
+    // Stateless MCP 2026-07-28 era kill switch (B-W03 #6157). Default false;
+    // read per request by mcpStatelessEnabled() (services/mcpProtocol.ts).
+    // Validated here for boolean format only, same class as
+    // AGENT_AUTO_PROMOTE above.
+    MCP_STATELESS_ENABLED: z.string().optional(),
 
     // Signup-abuse detection kill switch / opt-in (services/abuseSignals).
     // Defaults to IS_HOSTED; read at runtime by abuseSignalsEnabled() in
@@ -701,6 +724,10 @@ const envObjectSchema = z
     // at runtime by toolSourcesEnabled() in env.ts. Validated here for
     // boolean format only, same class as AGENT_AUTO_PROMOTE above.
     TOOL_SOURCES_ENABLED: z.string().optional(),
+
+    // Tool Catalog W3 (#5218). Platform kill switch for Flows, read at runtime
+    // by flowsEnabled() in env.ts. Boolean-format validation only.
+    FLOWS_ENABLED: z.string().optional(),
 
     // Task A7. Sub-flag allowing a tool source to target private/loopback
     // egress — an SSRF vector on the hosted platform, so it's refused there
@@ -789,7 +816,7 @@ const envObjectSchema = z
     // with 3.5d once the split is actually exercised in prod topology).
     BREEZE_ROLE: z.string().optional(),
 
-    // M365 Tier-3 write-action AI tools (m365_disable_user, m365_reset_password)
+    // M365 Tier-3 write-action AI tools (the ten M365_HEADLESS_ACTIONS tools, e.g. m365_disable_user)
     // and the action-intents release worker's headless dispatch. Dark by
     // default. Read at runtime by writeActionRuntimeConfig.ts; declared here so
     // the format is guarded (a typo reads as OFF at the runtime flag parser,
@@ -827,6 +854,10 @@ const envObjectSchema = z
     OAUTH_DCR_ENABLED: z.string().optional(),
     OAUTH_DCR_REQUIRE_IAT: z.string().optional(),
     OAUTH_DCR_ALLOW_ANONYMOUS: z.string().optional(),
+    // CIMD (B-W03 #6157): boolean flag + optional host allowlist, both checked
+    // in the superRefine below.
+    OAUTH_CIMD_ENABLED: z.string().optional(),
+    OAUTH_CIMD_ALLOWED_HOSTS: z.string().optional(),
 
     // Wave 3 live-authorization rollout controls. Shape is validated in EVERY
     // environment (a garbage value is a bug anywhere); presence is required in
@@ -1014,6 +1045,15 @@ const envObjectSchema = z
     // staying on the safe default — see docs/operations/agent-network-and-manifest-rollout.md.
     AGENT_REQUIRE_MANIFEST_SIGNING_KEY_ID: z.enum(['true', 'false']).default('false'),
 
+    // #8616 heartbeat retain-state kill switch (routes/agents/
+    // heartbeatSettingsDecision.ts). Default on: a beat that advertises
+    // securityCapabilities.retainStateProtocolVersion 1 gets `retainState`
+    // for features with no decision this beat. 'false' answers every agent
+    // with the legacy payload, as an older API would. Strict enum so a typo
+    // boot-refuses instead of silently staying on.
+    HEARTBEAT_RETAIN_STATE_ENABLED: z.enum(['true', 'false']).default('true'),
+    AGENT_ECH_ENABLED: z.enum(['true', 'false']).default('true'),
+
     // Phase 2 of per-partner LLM BYOK (#3922), Task 3.1 — gates catalog-mode
     // routing (partner_ai_connections.catalog_entry_id). Off by default so a
     // rolling deploy or rollback never exposes catalog selection ahead of
@@ -1025,9 +1065,11 @@ const envObjectSchema = z
     LLM_PROVIDER_CATALOG_ENABLED: z.enum(['true', 'false']).default('false'),
 
     // Caller verification (anti-vishing, #6354 W01). Exact-string contract:
-    // only 'true' enables; '' === unset. No generic boolean superRefine —
+    // unset or 'true' enables (W05 default); '' and 'false' disable. No generic boolean superRefine —
     // '1'/'yes'/'on' are refused at boot rather than silently accepted.
     CALLER_VERIFICATION_ENABLED: z.enum(['true', 'false', '']).optional(),
+    // Workstation tier (#6354 W05): dark by default; same exact-string contract.
+    CALLER_VERIFICATION_WORKSTATION_ENABLED: z.enum(['true', 'false', '']).optional(),
 
     // Security remediation Wave 6, Task 9 (approved plan deviation D1) — the
     // managed-software destination gate (services/managedSoftwareDispatchPolicy.ts).
@@ -1304,6 +1346,16 @@ const envSchema = envObjectSchema
             }
           }
         }
+      }
+    }
+
+    // Network Proxy tunnel origin (spec 2026-10-06 §2): refuse boot on a
+    // malformed template or one sharing a registrable domain with any app origin,
+    // in every NODE_ENV — a same-site tunnel origin is a tenant-isolation bug.
+    const tunnelOrigin = parseTunnelOriginConfig(data);
+    if (!tunnelOrigin.ok) {
+      for (const issue of tunnelOrigin.issues) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: [issue.path], message: `${issue.path} ${issue.message}` });
       }
     }
 
@@ -2019,6 +2071,37 @@ const envSchema = envObjectSchema
       });
     }
 
+    // OAUTH_CIMD_ENABLED / OAUTH_CIMD_ALLOWED_HOSTS (B-W03 #6157). A typo in
+    // the allowlist would otherwise fail closed at runtime with no boot error.
+    const cimdEnabledRaw = (data.OAUTH_CIMD_ENABLED ?? '').trim().toLowerCase();
+    if (cimdEnabledRaw && !boolValues.has(cimdEnabledRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['OAUTH_CIMD_ENABLED'],
+        message: 'OAUTH_CIMD_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to false.',
+      });
+    }
+    const cimdHosts = parseCimdAllowedHosts(data.OAUTH_CIMD_ALLOWED_HOSTS);
+    if (!cimdHosts.ok) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['OAUTH_CIMD_ALLOWED_HOSTS'],
+        message: `OAUTH_CIMD_ALLOWED_HOSTS must be a comma-separated list of hostnames or .suffix entries (no scheme, path, port or wildcard): ${cimdHosts.reason}.`,
+      });
+    }
+
+    // MCP_STATELESS_ENABLED (B-W03 #6157). Same treatment as AGENT_AUTO_PROMOTE.
+    const mcpStatelessRaw = (data.MCP_STATELESS_ENABLED ?? '').trim().toLowerCase();
+    if (mcpStatelessRaw && !boolValues.has(mcpStatelessRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['MCP_STATELESS_ENABLED'],
+        message:
+          'MCP_STATELESS_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. ' +
+          'Defaults to false (the MCP server answers only the initialize-based protocol versions).',
+      });
+    }
+
     // ABUSE_SIGNALS_ENABLED (signup-abuse detection). Same treatment and same
     // reasoning as AGENT_AUTO_PROMOTE above: independent of NODE_ENV, because
     // the value silently governs whether the subsystem runs at all. A typo
@@ -2142,6 +2225,18 @@ const envSchema = envObjectSchema
         path: ['TOOL_SOURCES_ENABLED'],
         message:
           'TOOL_SOURCES_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to false (the tool-catalog / tool-sources feature is dark).',
+      });
+    }
+
+    // FLOWS_ENABLED (Tool Catalog W3, #5218). Same treatment as
+    // TOOL_SOURCES_ENABLED: a typo must fail boot rather than read as off.
+    const flowsRaw = (data.FLOWS_ENABLED ?? '').trim().toLowerCase();
+    if (flowsRaw && !boolValues.has(flowsRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['FLOWS_ENABLED'],
+        message:
+          'FLOWS_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to false (the Flows feature is dark).',
       });
     }
 
