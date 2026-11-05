@@ -18,6 +18,7 @@ import StorageKeyRevocationCard from "./StorageKeyRevocationCard";
 import BackupDestinationSection, {
   emptyConfigForm,
   capabilitySummary,
+  destinationPrefixError,
   supportsProviderImmutability,
 } from "./BackupDestinationSection";
 import type {
@@ -46,6 +47,9 @@ type BackupScheduleSettings = {
   scheduleTime: string;
   scheduleDayOfWeek: number;
   scheduleDayOfMonth: number;
+  // #11013: API-only for now. Not editable here, but it has to survive a save:
+  // the schedule is rebuilt from these fields, which would turn it back on.
+  runMissedBackupsOnConnect?: boolean;
   retentionPreset: RetentionPreset;
   retentionDays: number;
   retentionVersions: number;
@@ -321,7 +325,7 @@ function scheduleDescription(s: BackupScheduleSettings): string {
   }
 }
 
-function inflateSettings(
+export function inflateSettings(
   stored?: Record<string, unknown> | null,
 ): BackupScheduleSettings {
   const schedule = (stored?.schedule ?? {}) as Record<string, unknown>;
@@ -346,6 +350,9 @@ function inflateSettings(
       (schedule.dayOfWeek as number) ?? scheduleDefaults.scheduleDayOfWeek,
     scheduleDayOfMonth:
       (schedule.dayOfMonth as number) ?? scheduleDefaults.scheduleDayOfMonth,
+    ...(typeof schedule.runMissedBackupsOnConnect === "boolean"
+      ? { runMissedBackupsOnConnect: schedule.runMissedBackupsOnConnect }
+      : {}),
     retentionPreset:
       (retention.preset as RetentionPreset) ?? scheduleDefaults.retentionPreset,
     retentionDays:
@@ -393,7 +400,7 @@ function hasAdvancedValues(s: BackupScheduleSettings): boolean {
   );
 }
 
-function buildInlineSettings(
+export function buildInlineSettings(
   settings: BackupScheduleSettings,
   backupMode: string,
   targets: Record<string, unknown>,
@@ -420,6 +427,9 @@ function buildInlineSettings(
         : {}),
       ...(settings.backupWindowEnd
         ? { windowEnd: settings.backupWindowEnd }
+        : {}),
+      ...(settings.runMissedBackupsOnConnect !== undefined
+        ? { runMissedBackupsOnConnect: settings.runMissedBackupsOnConnect }
         : {}),
     },
     retention: {
@@ -995,6 +1005,10 @@ export default function BackupTab({
           "policies:configurationPolicies.featureTabs.backupTab.s3BucketNameIsRequired",
         );
       }
+      // Rendered inline by BackupDestinationSection; recorded here so a save
+      // that slips past the disabled button still stops.
+      const prefixError = destinationPrefixError(configForm);
+      if (prefixError) errors.prefix = prefixError;
       if (
         !configForm.region.trim() &&
         !deriveS3RegionFromEndpoint(configForm.endpoint)
@@ -1235,6 +1249,12 @@ export default function BackupTab({
       ? defaultConfig
       : configs.find((c) => c.id === selectedConfigId);
   const isSaving = saving || configSaving;
+  // #7081: the destination form shows the key-prefix error inline; Save waits
+  // until it is fixed (the API would refuse the destination anyway).
+  const destinationPrefixInvalid =
+    !isPartnerWide &&
+    (mode === "create" || mode === "edit") &&
+    destinationPrefixError(configForm) !== null;
   const combinedError = configError || error;
   const retentionInfo = retentionPresets.find(
     (p) => p.value === settings.retentionPreset,
@@ -1300,6 +1320,7 @@ export default function BackupTab({
       icon={<HardDrive className="h-5 w-5" />}
       isConfigured={!!existingLink || isInherited}
       saving={isSaving}
+      saveDisabled={destinationPrefixInvalid}
       error={combinedError}
       onSave={handleSave}
       onRemove={existingLink && !linkedPolicyId ? handleRemove : undefined}

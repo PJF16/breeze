@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/breeze-rmm/agent/internal/ipc"
+	"github.com/breeze-rmm/agent/internal/remote/desktop"
+	"github.com/breeze-rmm/agent/internal/tccdiag"
 )
 
 // maybeRequestScreenRecording must never raise the macOS consent dialog when we
@@ -16,14 +18,17 @@ import (
 // per screenRecordingRequestInterval when we don't. Calling the prompting API
 // (CGRequestScreenCaptureAccess) unconditionally at the top of the check loop is
 // what produced one system dialog per helper start in #4327, multiplied by the
-// launchd respawn loop in #4194.
+// launchd respawn loop in #4194. An unverified state (#8390, macOS 26+) must
+// not ask either: the host may already be granted.
 func TestMaybeRequestScreenRecording(t *testing.T) {
 	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
 
 	tests := []struct {
 		name string
-		// granted is what the non-prompting probe reports.
+		// granted is what the non-capturing check reports.
 		granted bool
+		// unknown makes the check report an unverified state instead.
+		unknown bool
 		// marker is the timestamp already recorded, or nil for no marker file.
 		marker *time.Time
 		// markerBody overrides marker with raw file content.
@@ -71,6 +76,19 @@ func TestMaybeRequestScreenRecording(t *testing.T) {
 			wantRequest:     true,
 			wantMarkerStamp: now.Format(time.RFC3339),
 		},
+		{
+			name:            "unverified, no marker — never prompts",
+			unknown:         true,
+			wantRequest:     false,
+			wantMarkerStamp: "",
+		},
+		{
+			name:            "unverified, stale marker — still never prompts",
+			unknown:         true,
+			marker:          timePtr(now.Add(-72 * time.Hour)),
+			wantRequest:     false,
+			wantMarkerStamp: now.Add(-72 * time.Hour).Format(time.RFC3339),
+		},
 	}
 
 	for _, tt := range tests {
@@ -84,13 +102,13 @@ func TestMaybeRequestScreenRecording(t *testing.T) {
 			}
 
 			requested := false
-			restore := stubScreenRecordingFns(t, tt.granted, func() bool {
+			restore := stubScreenRecordingFns(t, accessReport(tt.granted, tt.unknown), func() bool {
 				requested = true
 				return tt.granted
 			})
 			defer restore()
 
-			maybeRequestScreenRecording(markerPath, now)
+			maybeRequestScreenRecording(ipc.DesktopContextUserSession, markerPath, now)
 
 			if requested != tt.wantRequest {
 				t.Errorf("prompting API called = %v, want %v", requested, tt.wantRequest)
@@ -113,13 +131,24 @@ func TestMaybeRequestScreenRecording(t *testing.T) {
 	}
 }
 
-func stubScreenRecordingFns(t *testing.T, granted bool, request func() bool) func() {
+// accessReport builds the non-capturing check's answer for a test.
+func accessReport(granted, unknown bool) desktop.CaptureAccessReport {
+	switch {
+	case unknown:
+		return desktop.CaptureAccessReport{State: desktop.CaptureAccessUnknown, Reason: "unverified"}
+	case granted:
+		return desktop.CaptureAccessReport{State: desktop.CaptureAccessGranted, Reason: "preflight"}
+	}
+	return desktop.CaptureAccessReport{State: desktop.CaptureAccessDenied, Reason: "preflight"}
+}
+
+func stubScreenRecordingFns(t *testing.T, report desktop.CaptureAccessReport, request func() bool) func() {
 	t.Helper()
-	origGranted, origRequest := screenRecordingGrantedFn, requestScreenRecordingFn
-	screenRecordingGrantedFn = func() bool { return granted }
+	origAccess, origRequest := captureAccessFn, requestScreenRecordingFn
+	captureAccessFn = func(string) desktop.CaptureAccessReport { return report }
 	requestScreenRecordingFn = request
 	return func() {
-		screenRecordingGrantedFn = origGranted
+		captureAccessFn = origAccess
 		requestScreenRecordingFn = origRequest
 	}
 }
@@ -146,15 +175,43 @@ func TestRequestScreenRecordingAtLoopStart_OnlyDesktopHelper(t *testing.T) {
 	} {
 		t.Run(tc.kind, func(t *testing.T) {
 			requested := false
-			restore := stubScreenRecordingFns(t, false, func() bool { requested = true; return false })
+			restore := stubScreenRecordingFns(t, accessReport(false, false), func() bool { requested = true; return false })
 			defer restore()
 			markerPath := filepath.Join(t.TempDir(), "screen-recording-requested")
 
-			requestScreenRecordingAtLoopStart(tccLoopPolicyFor(tc.kind), markerPath, time.Now())
+			requestScreenRecordingAtLoopStart(tccLoopPolicyFor(tc.kind, false), ipc.DesktopContextUserSession, markerPath, time.Now())
 
 			if requested != tc.want {
 				t.Fatalf("consent dialog requested = %v, want %v", requested, tc.want)
 			}
 		})
+	}
+}
+
+// #10300: the loop step attaches the verdict only for the desktop helper's
+// policy; any other helper's status is dropped by the broker, so it must not
+// pay for a diagnosis.
+func TestCollectTCCStatusDiagnosesOnlyUnderPolicy(t *testing.T) {
+	saveAccess, saveDiag := captureAccessFn, tccDiagnoseFn
+	t.Cleanup(func() { captureAccessFn, tccDiagnoseFn = saveAccess, saveDiag })
+	captureAccessFn = func(string) desktop.CaptureAccessReport {
+		return desktop.CaptureAccessReport{State: desktop.CaptureAccessDenied, Reason: "preflight"}
+	}
+	calls := 0
+	tccDiagnoseFn = func([]tccdiag.Service) tccdiag.Diagnosis {
+		calls++
+		return tccdiag.Diagnosis{Verdict: tccdiag.VerdictRequirementMismatch}
+	}
+
+	// promptAccessibility stays false: no consent prompt from a test.
+	var dl denialLog
+	if st := collectTCCStatus(tccLoopPolicy{diagnoseDenial: true}, "", &dl); st.DenialVerdict != "requirement_mismatch" || calls != 1 {
+		t.Fatalf("desktop policy: verdict %q after %d diagnoses, want requirement_mismatch once", st.DenialVerdict, calls)
+	}
+	if dl.last != tccdiag.VerdictRequirementMismatch {
+		t.Fatalf("denial log saw %q, want the diagnosis logged", dl.last)
+	}
+	if st := collectTCCStatus(tccLoopPolicy{}, "", &dl); st.DenialVerdict != "" || calls != 1 {
+		t.Fatalf("other helper: verdict %q after %d diagnoses, want none", st.DenialVerdict, calls)
 	}
 }

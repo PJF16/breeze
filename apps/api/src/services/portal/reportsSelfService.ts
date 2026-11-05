@@ -3,6 +3,7 @@ import { reportRunOwnerColumns } from '../reportRunOwner';
 import { and, count, desc, eq, ne, sql } from 'drizzle-orm';
 import { buildReportPdf, type BuildOpts } from '@breeze/shared/reportPdf';
 import {
+  POSTURE_DEVICE_ROW_CSV_LABELS,
   rowsToCsv,
   type HardwareLifecycleSummary,
   type PortalRunDto,
@@ -457,6 +458,8 @@ function toDto(row: {
   startedAt: Date | null;
   completedAt: Date | null;
   rowCount: number | null;
+  // Mirrors renderRunCsv's gate: CSV renders only from an array `rows`.
+  csvAvailable?: boolean;
   createdAt: Date;
 }): PortalRunDto {
   return {
@@ -468,6 +471,7 @@ function toDto(row: {
     startedAt: row.startedAt?.toISOString() ?? null,
     completedAt: row.completedAt?.toISOString() ?? null,
     rowCount: row.rowCount,
+    csvAvailable: row.csvAvailable === true,
     createdAt: row.createdAt.toISOString(),
   };
 }
@@ -532,6 +536,8 @@ export async function listPortalRuns(
     startedAt: reportRuns.startedAt,
     completedAt: reportRuns.completedAt,
     rowCount: reportRuns.rowCount,
+    // Computed in SQL so the (large) result blob is not shipped to list runs.
+    csvAvailable: sql<boolean>`coalesce(jsonb_typeof(${reportRuns.result} -> 'rows') = 'array', false)`,
     createdAt: reportRuns.createdAt,
   }).from(reportRuns)
     .innerJoin(reports, eq(reportRuns.reportId, reports.id))
@@ -651,6 +657,7 @@ export async function generatePortalReport(args: {
 
       return toDto({
         ...completed!,
+        csvAvailable: Array.isArray(result.rows),
         name: definition.name,
         type: definition.type as PortalReportType,
       });
@@ -805,6 +812,14 @@ export async function renderRunPdf(
   return Buffer.from(document.output('arraybuffer'));
 }
 
+/**
+ * Customer-facing header labels per report type for the portal CSV (#9964). A
+ * type without an entry keeps its row keys as the header.
+ */
+const PORTAL_CSV_HEADER_LABELS: Partial<Record<string, Readonly<Record<string, string>>>> = {
+  security_compliance_posture: POSTURE_DEVICE_ROW_CSV_LABELS,
+};
+
 export async function renderRunCsv(
   runId: string,
   orgId: string,
@@ -814,5 +829,5 @@ export async function renderRunCsv(
   if (!result || !Array.isArray(result.rows)) {
     throw new PortalReportNoTabularDataError();
   }
-  return rowsToCsv(result.rows);
+  return rowsToCsv(result.rows, { headerLabels: PORTAL_CSV_HEADER_LABELS[row.type] });
 }

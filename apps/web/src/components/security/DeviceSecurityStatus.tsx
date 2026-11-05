@@ -15,10 +15,16 @@ import { formatDateTime } from "@/lib/dateTimeFormat";
 import { friendlyFetchError } from "@/lib/utils";
 import { errorKindOf, throwIfNotOk, type LoadErrorKind } from "@/lib/httpError";
 import AccessDenied from "../shared/AccessDenied";
+// Provider 'unknown' = collection failed (#8538): render the localized
+// unknown-provider copy instead of the server's English fallback name.
+function knownProvider<T extends { id?: string }>(p: T | null): T | null {
+  return p && p.id !== "unknown" ? p : null;
+}
 type DeviceSecurity = {
   deviceId: string;
   deviceName: string;
   provider: {
+    id?: string;
     name: string;
     vendor: string;
   } | null;
@@ -95,6 +101,11 @@ export default function DeviceSecurityStatus({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ scanType: "quick" }),
       });
+      // #10057 gap 2: a Scan now already waiting for a slot on this device.
+      if (response.status === 409) {
+        setError(t("errors:SCAN_ALREADY_QUEUED"));
+        return;
+      }
       throwIfNotOk(response);
       await fetchStatus();
     } catch (err) {
@@ -210,11 +221,11 @@ export default function DeviceSecurityStatus({
               {t("securityDeviceSecurityStatus.detectedAV")}
             </p>
             <p className="mt-2 text-sm font-medium">
-              {data.provider?.name ??
+              {knownProvider(data.provider)?.name ??
                 t("securityDeviceSecurityStatus.unknownProvider")}
             </p>
             <p className="mt-1 text-xs text-muted-foreground">
-              {data.provider?.vendor ??
+              {knownProvider(data.provider)?.vendor ??
                 t("securityDeviceSecurityStatus.unknownVendor")}
             </p>
           </div>
@@ -273,7 +284,7 @@ export default function DeviceSecurityStatus({
             </h2>
             <p className="text-sm text-muted-foreground">
               {data.deviceName} -{" "}
-              {data.provider?.name ??
+              {knownProvider(data.provider)?.name ??
                 t("securityDeviceSecurityStatus.unknownProvider")}
             </p>
           </div>

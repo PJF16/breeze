@@ -141,27 +141,13 @@ pnpm install
 ```bash
 # Copy environment template
 cp .env.example .env
-
-# Edit .env with your local settings
 ```
 
-**Required Environment Variables:**
-
-```env
-# Database
-DATABASE_URL=postgresql://breeze:breeze@localhost:5432/breeze
-
-# Redis
-REDIS_URL=redis://localhost:6379
-
-# Authentication
-JWT_SECRET=your-super-secret-key-change-in-production
-
-# Optional: MinIO for file storage
-MINIO_ENDPOINT=localhost:9000
-MINIO_ACCESS_KEY=minioadmin
-MINIO_SECRET_KEY=minioadmin
-```
+`.env.example` is the production template. Generate the three required secrets as shown in
+[CONTRIBUTING.md → Development Setup](../../CONTRIBUTING.md#development-setup), then change the
+local-development values listed in [CONTRIBUTING.md → Local `.env` values](../../CONTRIBUTING.md#local-env-values)
+(`NODE_ENV`, `FORCE_HTTPS`, `REDIS_URL`). That section is the one place these are kept, so the two
+guides cannot drift apart.
 
 ### Running Services Locally
 
@@ -174,7 +160,15 @@ docker compose -f docker-compose.yml -f docker-compose.override.yml.dev up -d po
 This starts:
 - PostgreSQL on port 5432
 - Redis on port 6379
-- MinIO on port 9000/9001 (optional)
+
+Object storage is not part of this stack. It is configured through the `S3_*`
+settings in `.env.example`; MinIO is only included in the legacy
+`docker-compose.dev.yml` stack.
+
+These publish on `127.0.0.1` only, so the dev services are reachable from this
+machine alone. Set `BREEZE_DEV_BIND_ADDR=0.0.0.0` only if another machine must
+reach the stack, and change the passwords first if you do — see
+`CONTRIBUTING.md` for which ones.
 
 **2. Initialize the database:**
 
@@ -189,8 +183,11 @@ pnpm db:studio
 **3. Start development servers:**
 
 ```bash
-# Start all services (web + API)
-pnpm dev
+# Start the app services (api + web + portal)
+pnpm dev:app
+
+# `pnpm dev` runs every package, including the Office add-ins, which need the Windows or
+# macOS certificate store; on Linux/WSL they skip themselves with a message.
 ```
 
 | Service | URL |

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"io"
 	"os"
 	"os/signal"
@@ -11,8 +10,10 @@ import (
 
 	"github.com/breeze-rmm/agent/internal/authstate"
 	"github.com/breeze-rmm/agent/internal/config"
+	"github.com/breeze-rmm/agent/internal/ech"
 	"github.com/breeze-rmm/agent/internal/ipc"
 	"github.com/breeze-rmm/agent/internal/logging"
+	"github.com/breeze-rmm/agent/internal/remote/desktop"
 	"github.com/breeze-rmm/agent/internal/secmem"
 	"github.com/breeze-rmm/agent/internal/userhelper"
 	"github.com/spf13/cobra"
@@ -74,7 +75,9 @@ func runDesktopHelper() {
 	// On macOS this resolves to ~/Library/Logs/Breeze, not the root-owned
 	// 0700 shared agent log directory the user-session LaunchAgent cannot
 	// write (#5877). Other platforms keep the shared directory.
-	logDir, homeErr := config.HelperLogDir()
+	// The role argument only matters on Windows; this standalone binary is
+	// the macOS desktop helper, where the euid decides.
+	logDir, homeErr := config.HelperLogDir(false)
 	mkdirErr := os.MkdirAll(logDir, 0700)
 	logPath := filepath.Join(logDir, "desktop-helper.log")
 	var output io.Writer = os.Stdout
@@ -83,6 +86,13 @@ func runDesktopHelper() {
 		output = f
 	}
 	logging.Init("text", "info", output)
+
+	// On macOS the console-user helper keeps its ECH/DNS caches and the
+	// wallpaper recovery record in ~/Library/Application Support/Breeze: the
+	// agent data dir is 0700 root and unreadable here (#10870). Create it
+	// before the ECH dialer and the shipper first persist a cache; a failure
+	// is reported once the shipper is up.
+	stateDir, stateErr := ensureHelperStateDir(runtime.GOOS, os.Geteuid(), config.ProcessDataDir)
 
 	// Use LoadHelperConfig, NOT Load: on macOS the desktop-helper runs as the
 	// logged-in user (Aqua LaunchAgent), and Load() unconditionally reads
@@ -93,6 +103,8 @@ func runDesktopHelper() {
 		log.Warn("helper config load failed; helper log shipping disabled", "error", err)
 		cfg = config.Default()
 	}
+	// The log shipper below dials through the shared ECH dialer.
+	ech.Configure(cfg.ECH, cfg.ECHServerEnabled)
 
 	socketPath := ipc.DefaultSocketPath()
 	if cfg.IPCSocketPath != "" {
@@ -121,6 +133,7 @@ func runDesktopHelper() {
 			AgentVersion: version + "-desktop-helper",
 			MinLevel:     cfg.LogShippingLevel,
 			AuthMonitor:  authMon,
+			HTTPClient:   newShipperHTTPClient(),
 			// The WebRTC/ICE diagnostics live in this process, so it must
 			// follow the agent's set_log_level override too (#7416).
 			LevelOverridePath: config.LogLevelOverridePath(),
@@ -144,46 +157,18 @@ func runDesktopHelper() {
 	// written.
 	logging.EmitLogFileOutcome(log, logPath, openErr, mkdirErr, homeErr)
 
-	// A permission check like any other: one CoreGraphics capture, never
-	// ScreenCaptureKit (#8058). It used to run ScreenCaptureKit twice on
-	// every helper start.
-	startupProbe := collectProbeOutput(probeOptions{capture: true})
-	attrs := []any{
-		"context", startupProbe.Context,
-		"processUser", startupProbe.ProcessUser,
-		"captureGranted", startupProbe.CaptureGranted,
-		"pid", os.Getpid(),
-		"version", version,
+	if stateErr != nil {
+		log.Warn("helper state dir unavailable; ECH/DNS caches and the wallpaper recovery record will not persist", "dir", stateDir, "error", stateErr.Error())
 	}
-	if startupProbe.CaptureError != "" {
-		attrs = append(attrs, "captureError", startupProbe.CaptureError)
-	}
-	if v := startupProbe.ScreenCaptureKitVerdict; v != nil {
-		if v.Present {
-			attrs = append(attrs, "sckVerdict", v.Reason, "sckVerdictApplies", v.Applies)
-		}
-		if v.Error != "" {
-			// Unreadable or refused: sessions will try ScreenCaptureKit, so
-			// the macOS consent dialog can come back (#8058).
-			attrs = append(attrs, "sckVerdictError", v.Error)
-		}
-	}
-	if startupProbe.TCC != nil {
-		remoteDesktop := "unknown"
-		if startupProbe.TCC.RemoteDesktop != nil {
-			remoteDesktop = fmt.Sprintf("%t", *startupProbe.TCC.RemoteDesktop)
-		}
-		attrs = append(attrs,
-			"screenRecording", startupProbe.TCC.ScreenRecording,
-			"accessibility", startupProbe.TCC.Accessibility,
-			"fullDiskAccess", startupProbe.TCC.FullDiskAccess,
-			"remoteDesktop", remoteDesktop,
-		)
-	}
-	if len(startupProbe.Sessions) > 0 {
-		attrs = append(attrs, "sessions", startupProbe.Sessions)
-	}
-	log.Info("desktop helper startup probe", attrs...)
+	// Put back a wallpaper a crash mid-session left black. Runs after the
+	// shipper is up so the recovery is visible in Agent Logs.
+	recoverWallpaperAtStart(runtime.GOOS, os.Geteuid(), contextFlag, func() { _ = desktop.GetWallpaperManager() })
+
+	// A permission check like any other: it never captures (#8390) and never
+	// calls ScreenCaptureKit (#8058). It used to take a real frame on every
+	// helper start, which on macOS 15 raised the monthly acknowledgement alert.
+	startupProbe := collectProbeOutput(startupProbeOptions())
+	log.Info("desktop helper startup probe", startupProbeLogAttrs(startupProbe)...)
 
 	// Shutdown is signalled by closing `done`, NOT by calling Stop on a
 	// captured client. The supervisor builds a fresh client per reconnect
@@ -204,9 +189,8 @@ func runDesktopHelper() {
 	// session. Until that happened the device reported
 	// desktopAccess.reason = "helper_not_connected" while showing as online.
 	//
-	// Keeping the process alive also means the startup capture probe above
-	// runs once per login session rather than once per IPC blip, which stops
-	// reconnects from re-firing the macOS Screen Recording prompt.
+	// Keeping the process alive also means the startup probe above runs once
+	// per login session rather than once per IPC blip.
 	sup := &userhelper.Supervisor{
 		Name:   "desktop helper",
 		Policy: desktopHelperReconnectPolicy(),

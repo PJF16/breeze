@@ -1,3 +1,8 @@
+import { findPartnerOwnedGroupIds } from '../services/deviceGroupOwnership';
+vi.mock('../services/deviceGroupOwnership', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/deviceGroupOwnership')>()),
+  findPartnerOwnedGroupIds: vi.fn(async () => [] as string[]),
+}));
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ERROR_CODES } from '@breeze/shared';
 import { Hono } from 'hono';
@@ -18,7 +23,7 @@ vi.mock('../services/avatarStorage', async (importOriginal) => {
     ...actual,
     writeAvatar: vi.fn(async (userId: string, mime: 'image/png' | 'image/jpeg' | 'image/webp', data: Buffer) => {
       avatarStore.set(userId, { mime, data });
-      return { ext: actual.extForMime(mime), size: data.length, avatarUrl: `/api/v1/users/${userId}/avatar`, updatedAt: new Date() };
+      return { ext: actual.extForMime(mime), size: data.length, avatarUrl: `/api/v1/users/${userId}/avatar?v=test-version`, updatedAt: new Date() };
     }),
     statAvatar: vi.fn(async (userId: string) => {
       const a = avatarStore.get(userId);
@@ -347,6 +352,21 @@ function joinChain(rows: unknown[]): any {
 }
 
 describe('user routes', () => {
+  it.each(['POST'])('refuses partner group user scope on invite without persisting (%s)', async (method) => {
+    const groupId = '77777777-7777-4777-8777-777777777777';
+    vi.mocked(findPartnerOwnedGroupIds).mockResolvedValueOnce([groupId]);
+
+    const res = await app.request('/users/invite', {
+      method, headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({email:'tech@example.com',name:'Tech',roleId:groupId,deviceGroupIds:[groupId]}),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: 'PARTNER_GROUP_TARGET_UNSUPPORTED', groupIds: [groupId] });
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+    expect(findPartnerOwnedGroupIds).toHaveBeenCalledWith([groupId]);
+  });
+
   let app: Hono;
 
   function authAsSystem() {
@@ -798,6 +818,8 @@ describe('user routes', () => {
       expect(res.status).toBe(201);
       expect(insertedMemberships).toHaveLength(1);
       expect(insertedMemberships[0]).toMatchObject({ siteIds: [SITE_A] });
+      // #10315: device-group restriction is unenforced, so it is never stored.
+      expect(insertedMemberships[0]!.deviceGroupIds).toBeNull();
     });
 
     it('rejects an explicit site outside the live inviter scope before creating the invitee', async () => {
@@ -1169,6 +1191,81 @@ describe('user routes', () => {
       // The probe is scoped to the caller's partner, not a bare id lookup.
       expect(vi.mocked(inArray)).toHaveBeenCalledWith(organizations.id, [MINE, THEIRS]);
       expect(vi.mocked(eq)).toHaveBeenCalledWith(organizations.partnerId, 'partner-123');
+    });
+
+    describe('scope restrictions the invite cannot honour are rejected, never dropped (#10315)', () => {
+      const ROLE_ID = '22222222-2222-4222-8222-222222222222';
+      const SITE_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+      const GROUP_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+      const ORG_ID = '33333333-3333-4333-8333-333333333333';
+
+      function authAsOrgAdmin() {
+        vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+          c.set('auth', {
+            scope: 'organization',
+            partnerId: 'partner-123',
+            orgId: ORG_ID,
+            allowedSiteIds: null,
+            canAccessSite: () => true,
+            user: { id: 'user-123', email: 'org-admin@example.com' },
+          });
+          return next();
+        });
+      }
+
+      async function invite(extra: Record<string, unknown>) {
+        return app.request('/users/invite', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: 'invitee@example.com', name: 'Invitee', roleId: ROLE_ID, ...extra }),
+        });
+      }
+
+      function expectNoSideEffects() {
+        // Rejected before any role lookup, tombstone sweep, or membership write.
+        expect(db.select).not.toHaveBeenCalled();
+        expect(db.transaction).not.toHaveBeenCalled();
+        expect(resetAllFactorsAndInvalidateMock).not.toHaveBeenCalled();
+      }
+
+      it.each([
+        ['siteIds', { siteIds: [SITE_ID] }],
+        ['siteIds', { siteIds: [] }],
+        ['deviceGroupIds', { deviceGroupIds: [GROUP_ID] }],
+        ['deviceGroupIds', { deviceGroupIds: [] }],
+      ])('partner scope: %s → 400 (partner_users has no site/group axis)', async (field, extra) => {
+        const res = await invite({ orgAccess: 'all', ...extra });
+
+        expect(res.status).toBe(400);
+        const body = await res.json();
+        expect(body.error).toContain(field);
+        expect(body.error).toMatch(/organization scope/i);
+        expectNoSideEffects();
+      });
+
+      it.each([
+        [{ deviceGroupIds: [GROUP_ID] }],
+        [{ deviceGroupIds: [] }],
+        [{ siteIds: [SITE_ID], deviceGroupIds: [GROUP_ID] }],
+      ])('organization scope: deviceGroupIds %j → 400 (not enforced, would grant every group)', async (extra) => {
+        authAsOrgAdmin();
+        const res = await invite(extra);
+
+        expect(res.status).toBe(400);
+        const body = await res.json();
+        expect(body.error).toContain('deviceGroupIds');
+        expectNoSideEffects();
+      });
+
+      it('organization scope: orgIds → 400 (partner-only field)', async () => {
+        authAsOrgAdmin();
+        const res = await invite({ orgIds: [ORG_ID] });
+
+        expect(res.status).toBe(400);
+        const body = await res.json();
+        expect(body.error).toContain('orgIds');
+        expectNoSideEffects();
+      });
     });
 
     it('should require orgIds when orgAccess is selected', async () => {
@@ -1696,6 +1793,17 @@ describe('user routes', () => {
       expect(res.status).toBe(400);
       const body = await res.json();
       expect(body.error).toMatch(message);
+    });
+
+    it.each(['off', 1, null])('rejects a non-boolean characterKeyShortcuts preference %s (#9348)', async (bad) => {
+      const res = await app.request('/users/me', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ preferences: { characterKeyShortcuts: bad } })
+      });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toMatch(/Invalid characterKeyShortcuts value/i);
     });
 
     it('rejects an invalid locale preference', async () => {
@@ -3720,7 +3828,7 @@ describe('user routes', () => {
 
         expect(res.status).toBe(200);
         const data = await res.json();
-        expect(data.avatarUrl).toBe(`/api/v1/users/${ME_ID}/avatar`);
+        expect(data.avatarUrl).toBe(`/api/v1/users/${ME_ID}/avatar?v=test-version`);
         expect(data.mime).toBe('image/png');
         expect(data.size).toBe(PNG_BYTES.length);
       });
@@ -4242,5 +4350,102 @@ describe('/me/ticket-pushover', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ userKeySet: false });
     expect(setMock).toHaveBeenCalledWith(expect.objectContaining({ pushoverUserKeyEncrypted: null }));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Connection health W3 (#8847): /me/email-preferences (My Account digest toggle)
+// ---------------------------------------------------------------------------
+
+const emailOptoutMocks = vi.hoisted(() => ({
+  isOptedOut: vi.fn(),
+  setEmailOptOut: vi.fn(),
+  clearEmailOptOut: vi.fn(),
+}));
+vi.mock('../services/emailOptouts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/emailOptouts')>()),
+  isOptedOut: (...a: unknown[]) => emailOptoutMocks.isOptedOut(...a),
+  setEmailOptOut: (...a: unknown[]) => emailOptoutMocks.setEmailOptOut(...a),
+  clearEmailOptOut: (...a: unknown[]) => emailOptoutMocks.clearEmailOptOut(...a),
+}));
+
+describe('/me/email-preferences', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    authAsDefaultPartner();
+    emailOptoutMocks.isOptedOut.mockResolvedValue(false);
+    emailOptoutMocks.setEmailOptOut.mockResolvedValue({ userExists: true });
+    emailOptoutMocks.clearEmailOptOut.mockResolvedValue(undefined);
+  });
+
+  const app = () => new Hono().route('/users', userRoutes);
+  const patch = (body: unknown) => app().request('/users/me/email-preferences', {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+
+  it('GET reports subscribed by default, for auth.user.id', async () => {
+    const res = await app().request('/users/me/email-preferences');
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ connectionHealthDigest: true });
+    expect(emailOptoutMocks.isOptedOut).toHaveBeenCalledWith('user-123', 'connection_health_digest');
+  });
+
+  it('GET reports unsubscribed when an opt-out exists', async () => {
+    emailOptoutMocks.isOptedOut.mockResolvedValue(true);
+    const res = await app().request('/users/me/email-preferences');
+    expect(await res.json()).toEqual({ connectionHealthDigest: false });
+  });
+
+  it('PATCH false records a settings opt-out and audits', async () => {
+    const res = await patch({ connectionHealthDigest: false });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ connectionHealthDigest: false });
+    expect(emailOptoutMocks.setEmailOptOut).toHaveBeenCalledWith('user-123', 'connection_health_digest', 'settings');
+    expect(emailOptoutMocks.clearEmailOptOut).not.toHaveBeenCalled();
+    expect(writeRouteAuditMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: 'user.email_preferences.update', resourceType: 'user', resourceId: 'user-123',
+      details: { connectionHealthDigest: false },
+    }));
+  });
+
+  it('PATCH false is a 500, not a false success, when nothing could be written', async () => {
+    emailOptoutMocks.setEmailOptOut.mockResolvedValue({ userExists: false });
+    const res = await patch({ connectionHealthDigest: false });
+    expect(res.status).toBe(500);
+    expect(writeRouteAuditMock).not.toHaveBeenCalled();
+  });
+
+  it('PATCH true re-subscribes (clears the opt-out)', async () => {
+    const res = await patch({ connectionHealthDigest: true });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ connectionHealthDigest: true });
+    expect(emailOptoutMocks.clearEmailOptOut).toHaveBeenCalledWith('user-123', 'connection_health_digest');
+    expect(emailOptoutMocks.setEmailOptOut).not.toHaveBeenCalled();
+  });
+
+  it('400 on empty body, a non-boolean, or a smuggled userId (strict)', async () => {
+    expect((await patch({})).status).toBe(400);
+    expect((await patch({ connectionHealthDigest: 'no' })).status).toBe(400);
+    expect((await patch({ connectionHealthDigest: false, userId: 'someone-else' })).status).toBe(400);
+    expect(emailOptoutMocks.setEmailOptOut).not.toHaveBeenCalled();
+  });
+
+  it("is exempt from the partner-wide management gate for a 'selected' partner user", async () => {
+    // The gate's first select is the membership lookup; if the route were not
+    // exempt, a 'selected' membership would 403 here.
+    const gateLimit = vi.fn(() => Promise.resolve([{ orgAccess: 'selected' }]));
+    vi.mocked(db.select).mockReset().mockReturnValue({
+      from: vi.fn(() => ({ where: vi.fn(() => ({ limit: gateLimit })) })),
+    } as never);
+    vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+      c.set('auth', {
+        scope: 'partner', partnerId: 'partner-123', orgId: null, accessibleOrgIds: [],
+        user: { id: 'user-123', email: 'test@example.com' },
+      });
+      return next();
+    });
+    expect((await app().request('/users/me/email-preferences')).status).toBe(200);
+    expect((await patch({ connectionHealthDigest: false })).status).toBe(200);
+    expect(gateLimit).not.toHaveBeenCalled();
   });
 });

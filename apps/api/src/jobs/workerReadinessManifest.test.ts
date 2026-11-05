@@ -3,6 +3,7 @@ import { WORKER_REGISTRY } from '../services/workerRegistry';
 import { WORKER_READINESS_MANIFEST, declareExpectedConsumers } from './workerReadinessManifest';
 
 const NON_CONSUMERS = [
+  'psaTicketingReconciler',
   'desktopSessionOrphanRecovery',
   'oauthRevocationRetryWorker',
   'topologyOutboxWorker',
@@ -13,6 +14,7 @@ const NON_CONSUMERS = [
   'topologyDiagnosticSweeper',
   'topologyMonitoringWorker',
   'topologyTelemetryMaintenance',
+  'topologyPresenceWorker',
   'incidentCorrelationWorker',
   'incidentTimelineEnricher',
   'incidentSlaMonitor',

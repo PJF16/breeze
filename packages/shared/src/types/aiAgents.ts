@@ -1,10 +1,12 @@
-export const AI_AGENT_KINDS = ['triage', 'patch', 'helpdesk', 'designer', 'research'] as const;
+export const AI_AGENT_KINDS = ['triage', 'patch', 'helpdesk', 'designer', 'research', 'troubleshoot'] as const;
 export type AiAgentKind = (typeof AI_AGENT_KINDS)[number];
 
 /**
  * Kinds that can hold tool actions (and so earn supervised keys / graduation).
  * `research` is read-only with zero actions (AI Suggested Fixes W2), so
  * action-keyed surfaces enumerate this instead of AI_AGENT_KINDS.
+ * `troubleshoot` (#11084) is excluded too: its intents are approval-only
+ * forever (never `act`), so it has no supervised keys and never graduates.
  */
 export const AI_AGENT_ACTING_KINDS = ['triage', 'patch', 'helpdesk', 'designer'] as const satisfies readonly AiAgentKind[];
 
@@ -23,9 +25,20 @@ export const DESIGNER_ALLOWED_MODES: readonly AiAgentMode[] = ['off', 'act'] as 
  * (maxActionsPerRun 0), so `shadow` has nothing to shadow; `act` means "on".
  */
 export const RESEARCH_ALLOWED_MODES: readonly AiAgentMode[] = ['off', 'act'] as const;
+/**
+ * Wisp delegation W1 (#11084) — the system-provisioned `troubleshoot` agent
+ * owns device-troubleshooting runs, which admission forces to `shadow` so every
+ * change becomes an approval intent. `act` would make those intents
+ * policy-decidable, so it is never an allowed mode; `off` switches it off.
+ */
+export const TROUBLESHOOT_ALLOWED_MODES: readonly AiAgentMode[] = ['off', 'shadow'] as const;
+/** The built-in troubleshoot agent's display name and `ai_agents.provisioned_by` value (#11084). */
+export const TROUBLESHOOT_AGENT_NAME = 'Device troubleshooting (built-in)' as const;
+export const TROUBLESHOOT_PROVISIONER = 'system:device_troubleshooting' as const;
 export function allowedModesForKind(kind: AiAgentKind): readonly AiAgentMode[] {
   if (kind === 'designer') return DESIGNER_ALLOWED_MODES;
   if (kind === 'research') return RESEARCH_ALLOWED_MODES;
+  if (kind === 'troubleshoot') return TROUBLESHOOT_ALLOWED_MODES;
   return AI_AGENT_MODES;
 }
 
@@ -1130,9 +1143,17 @@ export type AgentRunVerdict = 'remediated' | 'needs_attention' | 'partial' | 'no
  * that gathers server-side datasets, computes inside a per-run sandbox via
  * the `workspace_*` tools, and ends with `submit_analysis`. Admission is
  * counted against `analysisMaxConcurrentRuns`/`analysisMaxRunsPerHour`.
+ *
+ * Wisp W05 added `assessment`: a grant-bearing, device-less run of the org's
+ * `triage`-kind agent that looks at what changed for one org under a Wisp
+ * grant and reports through outcome tools (concerns, nudges, proposals). It
+ * executes nothing (`maxActionsPerRun` pinned to 0). Admission requires a
+ * grant and is counted against the constants in
+ * `apps/api/src/services/aiAgents/assessmentProfile.ts`, not policy limits.
  */
 export const AI_AGENT_RUN_PROFILES = [
   'full', 'verdict', 'sweep', 'narrative', 'triage', 'design', 'patch', 'analysis', 'remediation_research',
+  'assessment', 'device_troubleshooting',
 ] as const;
 export type AiAgentRunProfile = (typeof AI_AGENT_RUN_PROFILES)[number];
 

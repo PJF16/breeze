@@ -6,10 +6,15 @@ vi.mock('../components/shared/Toast', () => ({ showToast: (a: unknown) => showTo
 // Force the translated path for the validation envelope: with i18n uninitialized
 // (as in the other runAction tests) exists() is false and the envelope no-ops,
 // so we stub it to assert the Step-4 behavior explicitly.
+// Stub of the en `errors:VALIDATION_FAILED` copy. #8369: it must not promise
+// highlighted fields — most forms never map field errors onto inputs.
+const { VALIDATION_HEADLINE } = vi.hoisted(() => ({
+  VALIDATION_HEADLINE: 'Fix the invalid values and try again',
+}));
 vi.mock('./i18n', () => ({
   i18n: {
     exists: (key: string) => key === 'errors:VALIDATION_FAILED',
-    t: (key: string) => (key === 'errors:VALIDATION_FAILED' ? 'Check the highlighted fields' : key),
+    t: (key: string) => (key === 'errors:VALIDATION_FAILED' ? VALIDATION_HEADLINE : key),
   },
 }));
 
@@ -103,6 +108,17 @@ describe('runAction', () => {
       errorFallback: 'Network error',
     })).rejects.toMatchObject({ message: 'Network error', status: 0 });
     expect(showToast).toHaveBeenCalledWith({ message: 'Network error', type: 'error' });
+  });
+
+  it('suppresses the network toast when the caller renders inline feedback', async () => {
+    const suppressErrorToast = vi.fn((status: number) => status === 0);
+    await expect(runAction({
+      request: async () => { throw new Error('network down'); },
+      errorFallback: 'Network error',
+      suppressErrorToast,
+    })).rejects.toMatchObject({ message: 'Network error', status: 0 });
+    expect(suppressErrorToast).toHaveBeenCalledWith(0, undefined);
+    expect(showToast).not.toHaveBeenCalled();
   });
 
   it('successMessage as function receives result and toasts formatted string', async () => {
@@ -260,6 +276,16 @@ describe('runAction', () => {
     expect(showToast).toHaveBeenCalledWith({ message: 'Parse failed', type: 'error' });
   });
 
+  it('suppresses parseSuccess failure toast when the caller renders inline feedback', async () => {
+    await expect(runAction({
+      request: async () => res({ val: 1 }, 200),
+      errorFallback: 'Parse failed',
+      parseSuccess: () => { throw new Error('bad shape'); },
+      suppressErrorToast: () => true,
+    })).rejects.toMatchObject({ message: 'Parse failed', status: 200 });
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
   it('successMessage function throws -> generic success toast, value returned, error logged', async () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const out = await runAction<{ ok: number }>({
@@ -325,7 +351,7 @@ describe('runAction', () => {
 
     expect(showToast).toHaveBeenCalledWith({
       message: specific,
-      detail: 'Check the highlighted fields',
+      detail: VALIDATION_HEADLINE,
       type: 'error',
     });
   });
@@ -348,7 +374,34 @@ describe('runAction', () => {
     ).rejects.toBeInstanceOf(ActionError);
 
     expect(showToast).toHaveBeenCalledWith({
-      message: 'Check the highlighted fields',
+      message: VALIDATION_HEADLINE,
+      type: 'error',
+    });
+  });
+
+  it('partner-settings AI budget 400: readable field label + headline detail (#8369)', async () => {
+    await expect(
+      runAction({
+        request: async () =>
+          res(
+            {
+              error: 'settings.aiBudgets.monthlyBudgetCents: Too small: expected number to be >=0',
+              details: {
+                formErrors: [],
+                fieldErrors: {
+                  'settings.aiBudgets.monthlyBudgetCents': ['Too small: expected number to be >=0'],
+                },
+              },
+            },
+            400
+          ),
+        errorFallback: 'fb',
+      })
+    ).rejects.toBeInstanceOf(ActionError);
+
+    expect(showToast).toHaveBeenCalledWith({
+      message: 'Monthly budget: Too small: expected number to be >=0',
+      detail: VALIDATION_HEADLINE,
       type: 'error',
     });
   });

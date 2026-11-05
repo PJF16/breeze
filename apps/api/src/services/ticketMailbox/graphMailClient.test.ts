@@ -3,12 +3,38 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const fetchMock = vi.fn();
 vi.stubGlobal('fetch', fetchMock);
 
-import { listInboxDelta, markRead, listMessageAttachments, getFileAttachmentBytes } from './graphMailClient';
+import { isDeltaCursorExpired, listInboxDelta, markRead, listMessageAttachments, getFileAttachmentBytes } from './graphMailClient';
 
 const SELECT = '%24select'; // encodeURIComponent('$select')
 
 describe('listInboxDelta', () => {
   beforeEach(() => fetchMock.mockReset());
+
+  // #10863: Microsoft documents an expired delta token as "a 40X-series error with
+  // error codes such as syncStateNotFound", so 410 alone would stop the mailbox.
+  it.each([
+    [410, '', true],
+    [400, JSON.stringify({ error: { code: 'syncStateNotFound', message: 'gone' } }), true],
+    [404, JSON.stringify({ error: { code: 'SyncStateNotFound' } }), true],
+    [400, JSON.stringify({ error: { code: 'BadRequest' } }), false],
+    [400, 'not json', false],
+    [401, JSON.stringify({ error: { code: 'syncStateNotFound' } }), false],
+    [403, JSON.stringify({ error: { code: 'syncStateNotFound' } }), false],
+    [500, JSON.stringify({ error: { code: 'syncStateNotFound' } }), false],
+  ])('a %i with body %s reports an expired cursor: %s', async (status, body, expected) => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status, headers: new Map(), text: async () => body });
+
+    const err = await listInboxDelta('tok', 'support@a.com', 'https://graph.microsoft.com/delta-old').catch((e) => e);
+
+    expect((err as { status?: number }).status).toBe(status);
+    expect(isDeltaCursorExpired(err)).toBe(expected);
+  });
+
+  it('does not read an expired cursor into errors with no Graph response', () => {
+    expect(isDeltaCursorExpired(new Error('boom'))).toBe(false);
+    expect(isDeltaCursorExpired(null)).toBe(false);
+    expect(isDeltaCursorExpired(undefined)).toBe(false);
+  });
 
   it('follows @odata.nextLink, aggregates messages, returns the final deltaLink', async () => {
     fetchMock
@@ -91,6 +117,15 @@ describe('markRead', () => {
   });
 });
 
+describe('markRead failures', () => {
+  beforeEach(() => fetchMock.mockReset());
+
+  it('rejects with the HTTP status when Graph refuses the PATCH', async () => {
+    fetchMock.mockResolvedValue({ ok: false, status: 403, headers: new Map(), text: async () => 'denied' });
+    await expect(markRead('tok', 'support@a.com', 'm1')).rejects.toMatchObject({ status: 403 });
+  });
+});
+
 describe('listMessageAttachments (#6688)', () => {
   beforeEach(() => fetchMock.mockReset());
 
@@ -124,6 +159,17 @@ describe('listMessageAttachments (#6688)', () => {
   it('throws with the HTTP status on a non-OK response', async () => {
     fetchMock.mockResolvedValueOnce({ ok: false, status: 404, headers: new Map(), text: async () => 'gone' });
     await expect(listMessageAttachments('tok', 'support@a.com', 'm1')).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('refuses an attachments nextLink off the Graph origin instead of sending the token there', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: new Map(),
+      json: async () => ({ value: [{ id: 'a1' }], '@odata.nextLink': 'https://attacker.example/att-page-2' }),
+    });
+    await expect(listMessageAttachments('tok', 'support@a.com', 'm1')).rejects.toThrow(/not on the Graph origin/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

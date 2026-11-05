@@ -47,7 +47,7 @@ vi.mock('./aiTools', () => ({
       manage_alerts: 1,
       // Billing/ticketing write tools
       manage_invoices: 2,
-      manage_catalog: 2,
+      manage_billing_catalog: 2,
       manage_contracts: 2,
       manage_quotes: 2,
       // P2-5 (#4192): mirrors the real registry entry
@@ -176,8 +176,6 @@ describe('checkGuardrails — fleet tool tier escalation', () => {
       ['manage_patches', 'decline'],
       ['manage_patches', 'defer'],
       ['manage_patches', 'bulk_approve'],
-      ['manage_groups', 'add_devices'],
-      ['manage_groups', 'remove_devices'],
       ['manage_automations', 'enable'],
       ['manage_automations', 'disable'],
       ['generate_report', 'create'],
@@ -188,6 +186,7 @@ describe('checkGuardrails — fleet tool tier escalation', () => {
       ['manage_tickets', 'log_time_entry'],
       ['manage_tickets', 'start_timer'],
       ['manage_tickets', 'stop_timer'],
+      ['manage_tickets', 'update_time_entry'],
       ['file_operations', 'list'],
     ];
 
@@ -265,6 +264,10 @@ describe('checkGuardrails — fleet tool tier escalation', () => {
       ['manage_groups', 'create'],
       ['manage_groups', 'update'],
       ['manage_groups', 'delete'],
+      // #10149 (QW9): membership writes feed agent run scope and group-targeted
+      // policies, and schedule peripheral reconciliation — supervised.
+      ['manage_groups', 'add_devices'],
+      ['manage_groups', 'remove_devices'],
       ['manage_automations', 'run'],
       // W01-D3 (#6755): handler-disabled today, escalated so re-enabling the
       // handler cannot silently reopen an unallowlisted agent write.
@@ -858,8 +861,8 @@ describe('checkGuardrails — manage_tickets tier escalation', () => {
     }
   });
 
-  it('log_time_entry/start_timer/stop_timer resolve to Tier 2 (auto-execute + audit)', () => {
-    for (const action of ['log_time_entry', 'start_timer', 'stop_timer']) {
+  it('log_time_entry/start_timer/stop_timer/update_time_entry resolve to Tier 2 (auto-execute + audit)', () => {
+    for (const action of ['log_time_entry', 'start_timer', 'stop_timer', 'update_time_entry']) {
       const result = checkGuardrails('manage_tickets', { action });
       expect(result.tier).toBe(2);
       expect(result.allowed).toBe(true);
@@ -877,6 +880,15 @@ describe('checkGuardrails — manage_tickets tier escalation', () => {
     const result = checkGuardrails('manage_tickets', { action: 'move_org' });
     expect(result.tier).toBe(3);
     expect(result.requiresApproval).toBe(true);
+  });
+
+  it('merge_preview is Tier 1 (read) and merge is Tier 3 with approval (#8972)', () => {
+    const preview = checkGuardrails('manage_tickets', { action: 'merge_preview' });
+    expect(preview.tier).toBe(1);
+    expect(preview.requiresApproval).toBe(false);
+    const merge = checkGuardrails('manage_tickets', { action: 'merge' });
+    expect(merge.tier).toBe(3);
+    expect(merge.requiresApproval).toBe(true);
   });
 
   // P2-4 (#4191): new ticket-triage actions, same family as update_fields.
@@ -919,7 +931,7 @@ describe('buildApprovalDescription — manage_tickets copy (P2-4, #4191)', () =>
       ticketId: TICKET_ID,
       content: 'the secret triage note body',
     });
-    expect(result.description).toBe(`Post private AI triage note on ticket #${TICKET_ID.slice(0, 8)}...`);
+    expect(result.description).toBe(`Post internal note on ticket #${TICKET_ID.slice(0, 8)}...`);
     expect(result.description).not.toContain('secret triage note body');
   });
 
@@ -948,7 +960,7 @@ describe('buildApprovalDescription — manage_tickets copy (P2-4, #4191)', () =>
 
   it('other manage_tickets actions keep the pre-existing generic description shape (no regression)', () => {
     const result = checkGuardrails('manage_tickets', { action: 'assign', ticketId: TICKET_ID });
-    expect(result.description).toBe('manage_tickets: assign');
+    expect(result.description).toBe('Manage tickets: assign');
   });
 });
 
@@ -1000,7 +1012,7 @@ describe('buildApprovalDescription — manage_ai_agents copy (P2-5, #4192)', () 
 
   it('other manage_ai_agents actions keep the generic description shape (no regression)', () => {
     const result = checkGuardrails('manage_ai_agents', { action: 'rotate_something' });
-    expect(result.description).toBe('manage_ai_agents: rotate_something');
+    expect(result.description).toBe('Manage ai agents: rotate something');
   });
 });
 

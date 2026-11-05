@@ -3,6 +3,7 @@ import { eq, sql } from 'drizzle-orm';
 import { captureMessage } from './sentry';
 import { tightenLockTimeout, lockTimeoutWasChanged } from '../db/lockTimeout';
 import { devices } from '../db/schema';
+import { assertNoUnresolvedIsolation } from './networkIsolation/lifecycle';
 // Shared postgres-js/drizzle row-count reader. Imported rather than re-derived:
 // this repo already has several copies of the same three-shape check, and
 // getting it wrong here reports the opposite of the truth (see the lock check
@@ -10,14 +11,22 @@ import { devices } from '../db/schema';
 // `jobs/`, which would drag BullMQ + ioredis into a plain DELETE's module graph.
 import { extractRowCount } from '../db/rowCount';
 import { resolveAlertsForRemovedComponents } from './hardwareHealth/retire';
-import { deleteOriginDeviceTopologyAlerts } from './siteOwnedAlerts';
+import { detachOriginDeviceTopologyAlerts } from './siteOwnedAlerts';
 import { deleteDeviceFixOutcomes } from './fixMemory/store';
 import {
   DEVICE_DETACH_DEVICE_ID_TABLES,
   DEVICE_LINKED_DEVICE_ID_TABLES,
   DEVICE_LINK_DEPENDENT_COLUMNS,
+  DEVICE_CASCADE_DELETE_PREDICATES,
   getDeviceCascadeDeleteTables,
+  type DeviceCurrentOwnership,
 } from '../routes/devices/core';
+
+/** postgres-js returns the row array itself; node-postgres wraps it in `.rows`. */
+function asRows<T>(result: unknown): T[] {
+  const value = (result as { rows?: T[] } | null)?.rows ?? result;
+  return Array.isArray(value) ? (value as T[]) : [];
+}
 
 /**
  * Device-cascade tables that are append-only evidence with DELETE fully
@@ -98,14 +107,14 @@ export interface DeviceDeletionTx {
  * Caller supplies the transaction: the route pairs this with link-group
  * dissolution, and the reaper runs it standalone.
  *
- * Returns `removedTopologyAlerts`: site-owned topology alerts (M3-D6) this
+ * Returns `detachedTopologyAlerts`: site-owned topology alerts (M3-D6) this
  * device originated, which may belong to ANOTHER org after a move-org — the
  * caller's audit row records the count.
  */
 export async function deleteDeviceCascade(
   tx: DeviceDeletionTx,
   deviceId: string,
-): Promise<{ removedTopologyAlerts: number }> {
+): Promise<{ detachedTopologyAlerts: number }> {
   // Take the PARENT lock first, before any child table is touched.
   //
   // FK constraints force children-before-parent for the DELETEs themselves, so
@@ -222,6 +231,8 @@ export async function deleteDeviceCascade(
     });
   }
 
+  await assertNoUnresolvedIsolation(tx, { deviceId }, 'delete', { lockDevices: false });
+
   // Keep the device's backup storage objects (#7982), exactly as org erasure
   // keeps an erased org's (#7980). The cascade below deletes the device's
   // backup_snapshots, backup_snapshot_retirements and
@@ -264,15 +275,18 @@ export async function deleteDeviceCascade(
   const componentKeys = (hardwareRows as { component_key: string }[]).map(row => row.component_key);
   if (componentKeys.length) await resolveAlertsForRemovedComponents(deviceId, componentKeys);
 
-  // Site-owned topology alerts this device ORIGINATED (M3-D6). After a
-  // move-org they stay in the site's org (ownership guard) while device_id
-  // still points here, so they are removed explicitly — with their NO ACTION
-  // children — and counted for the caller's audit, rather than left to the
-  // generic device_id sweep below (which only reaches them because every
-  // caller runs this in a SYSTEM context; see the FOR UPDATE note above).
-  const removedTopologyAlerts = await deleteOriginDeviceTopologyAlerts(tx, sql`${deviceId}::uuid`);
+  // Site-owned topology alerts keep their history when their provenance
+  // device is deleted (#7269). Detach PSA mappings first as they can name
+  // BOTH the surviving alert and this device; either device_id delete sweep
+  // below would otherwise remove the mapping despite preserving the alert.
+  await tx.execute(sql`UPDATE psa_ticket_mappings SET device_id = NULL
+    WHERE device_id = ${deviceId}
+      AND alert_id IN (SELECT id FROM alerts WHERE owner_kind = 'topology_site')`);
+  const detachedTopologyAlerts = await detachOriginDeviceTopologyAlerts(tx, deviceId);
 
-  const deviceAlertIds = sql`(SELECT id FROM alerts WHERE device_id = ${deviceId})`;
+  // Only device-owned alerts go with the device. Topology alert children and
+  // references stay attached to the site's surviving alert, even across orgs.
+  const deviceAlertIds = sql`(SELECT id FROM alerts WHERE device_id = ${deviceId} AND owner_kind = 'device')`;
   const deviceAiSessionIds = sql`(SELECT id FROM ai_sessions WHERE device_id = ${deviceId})`;
 
   await tx.execute(sql`DELETE FROM ai_tool_executions WHERE session_id IN ${deviceAiSessionIds}`);
@@ -280,13 +294,14 @@ export async function deleteDeviceCascade(
   await tx.execute(sql`DELETE FROM ai_action_plans WHERE session_id IN ${deviceAiSessionIds}`);
   await tx.execute(sql`DELETE FROM alert_correlations WHERE parent_alert_id IN ${deviceAlertIds} OR child_alert_id IN ${deviceAlertIds}`);
   await tx.execute(sql`DELETE FROM alert_notifications WHERE alert_id IN ${deviceAlertIds}`);
-  // psa_ticket_mappings.alert_id -> alerts(id) has NO explicit ON DELETE (so
-  // NO ACTION), and 'alerts' sits in the "Monitoring & logs" block of
+  // psa_ticket_mappings.device_id -> devices(id) has NO explicit ON DELETE (so
+  // NO ACTION). Its alert_id FK is ON DELETE CASCADE since 2027-01-17-210000
+  // (#10499 W2-A), but 'alerts' sits in the "Monitoring & logs" block of
   // CORE_DEVICE_CASCADE_DELETE_TABLES, ~30 entries AHEAD of
-  // 'psa_ticket_mappings' in "Portal & integrations". The list-driven loop
-  // below therefore deletes the alerts first and raises 23503 on any mapping
-  // that referenced one. Clear both FK arms here, with the other transitive
-  // alert children. The list entry stays — this just makes it a no-op.
+  // 'psa_ticket_mappings' in "Portal & integrations", and a mapping can name
+  // this device without naming one of its alerts. Clear both arms here, with
+  // the other transitive alert children. The list entry stays — this just
+  // makes it a no-op.
   await tx.execute(sql`DELETE FROM psa_ticket_mappings WHERE alert_id IN ${deviceAlertIds} OR device_id = ${deviceId}`);
   await tx.execute(sql`UPDATE log_correlations SET alert_id = NULL WHERE alert_id IN ${deviceAlertIds}`);
   await tx.execute(sql`UPDATE network_change_events SET alert_id = NULL WHERE alert_id IN ${deviceAlertIds}`);
@@ -394,7 +409,23 @@ export async function deleteDeviceCascade(
     await tx.execute(sql`select set_config('lock_timeout', ${`${fixMemoryPriorMs}ms`}, true)`);
   }
 
+  // PAM chain + ownership lineage delete by the device's EXACT current epoch
+  // (W2, #8204): earlier epochs are another org's evidence and outlive the
+  // device. Read once, under the row lock taken above. No device row means
+  // there is no current epoch to delete, so those tables match nothing.
+  const [ownershipRow] = asRows<{ org_id: string; ownership_epoch: number }>(await tx.execute(
+    sql`SELECT org_id::text AS org_id, ownership_epoch FROM devices WHERE id = ${deviceId}`,
+  ));
+  const ownership: DeviceCurrentOwnership | null = ownershipRow
+    ? { deviceId, orgId: ownershipRow.org_id, ownershipEpoch: Number(ownershipRow.ownership_epoch) }
+    : null;
+
   for (const table of getDeviceCascadeDeleteTables()) {
+    // Everything without a per-table predicate deletes by device_id.
+    const epochPredicate = DEVICE_CASCADE_DELETE_PREDICATES.get(table);
+    const predicate = epochPredicate
+      ? (ownership ? epochPredicate(ownership) : sql`false`)
+      : sql`device_id = ${deviceId}`;
     if (DEVICE_CASCADE_AUDIT_ADMIN_TABLES.has(table)) {
       // Append-only evidence: breeze_app has no DELETE grant (see
       // DEVICE_CASCADE_AUDIT_ADMIN_TABLES above). Arm both layers only for
@@ -402,11 +433,11 @@ export async function deleteDeviceCascade(
       // continuing through ordinary child tables.
       await tx.execute(sql`SET LOCAL ROLE breeze_audit_admin`);
       await tx.execute(sql`SET LOCAL breeze.allow_audit_retention = '1'`);
-      await tx.execute(sql`DELETE FROM ${sql.identifier(table)} WHERE device_id = ${deviceId}`);
+      await tx.execute(sql`DELETE FROM ${sql.identifier(table)} WHERE ${predicate}`);
       await tx.execute(sql`RESET ROLE`);
       continue;
     }
-    await tx.execute(sql`DELETE FROM ${sql.identifier(table)} WHERE device_id = ${deviceId}`);
+    await tx.execute(sql`DELETE FROM ${sql.identifier(table)} WHERE ${predicate}`);
   }
 
   // #8165 (EDR provider framework W01, spec D14 applied to hard delete — plan
@@ -434,5 +465,5 @@ export async function deleteDeviceCascade(
   // path only, like the lock_timeout restore: on error the rollback to the
   // enclosing savepoint undoes the SET LOCAL anyway.
   await tx.execute(sql`SELECT set_config('breeze.backup_erasure_org', ${priorFenceOrg}, true)`);
-  return { removedTopologyAlerts };
+  return { detachedTopologyAlerts };
 }

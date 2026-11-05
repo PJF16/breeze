@@ -1,10 +1,10 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { postScriptExecute, type ScriptExecuteResult, type ScriptRunTarget } from '@/lib/scriptExecute';
 import { Terminal, RefreshCw, Eye, X, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Loader2, AlertOctagon, RotateCcw, Square } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
 import { formatDateTime as formatUserDateTime } from '@/lib/dateTimeFormat';
 import { fetchWithAuth } from '../../stores/auth';
-import { extractApiError } from '@/lib/apiError';
 import { navigateTo } from '@/lib/navigation';
 import { handleActionError } from '@/lib/runAction';
 import {
@@ -17,15 +17,17 @@ import { deviceScriptsViewHash, scriptsViewFromHash, type ScriptsView } from '@/
 import { groupExecutionsByScript, outputExcerpt } from './scriptLatestResults';
 import { showToast } from '../shared/Toast';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
+import { ScopeBadge } from '../shared/ScopeBadge';
 import ScriptExecutionModal from '../scripts/ScriptExecutionModal';
 import {
   executionRowStatusConfig,
   executionDetailStatusConfig,
+  resolveExecutionStatusDescription,
   resolveExecutionStatusLabel,
 } from '../scripts/executionStatus';
 import type { Script } from '../scripts/ScriptList';
 import type { ScriptParameter } from '../scripts/ScriptForm';
-import type { CancelState, ExecutionStatus, ScriptAdmissionResult } from '@breeze/shared';
+import type { CancelState, ExecutionStatus } from '@breeze/shared';
 import { RunContextChip, type RunContextValue } from '../common/RunContext';
 import { AiInitiatorChip } from '../common/AiInitiatorChip';
 import type { AiInitiatorKind, AiOriginSummaryDto } from '@breeze/shared';
@@ -34,6 +36,12 @@ type ScriptExecution = {
   id?: string;
   scriptId?: string;
   scriptName?: string;
+  // #9935 — the script's ownership, so a catalog script and its imported copy
+  // (same name) don't render as two identical rows. All null when the script
+  // has since been deleted; absent on rows from an older API.
+  scriptIsSystem?: boolean | null;
+  scriptOrgId?: string | null;
+  scriptPartnerId?: string | null;
   name?: string;
   status?: string;
   exitCode?: number;
@@ -79,6 +87,10 @@ type DeviceScriptHistoryProps = {
   // the operator here to watch. Comes from the `#scripts/<executionId>` hash
   // (DeviceDetails.tsx); undefined for an ordinary tab visit.
   highlightExecutionId?: string;
+  // #9563 — the viewed device's own status (devices.status). A `queued` run
+  // says "device offline" only when this is 'offline'; otherwise it is
+  // awaiting agent pickup. Omitted → the neutral awaiting-pickup copy.
+  deviceStatus?: string;
 };
 
 // #5318 — the DB enum has 8 values; this tab used to print the raw lowercase
@@ -88,6 +100,22 @@ type DeviceScriptHistoryProps = {
 function toExecutionStatus(raw: string | undefined): ExecutionStatus | null {
   const status = (raw ?? '').toLowerCase();
   return status in executionRowStatusConfig ? (status as ExecutionStatus) : null;
+}
+
+// #9935 — System / Partner-wide / Organization, so a catalog script and its
+// imported copy (same name) are told apart. Nothing when the script row is
+// gone (left join → null) or the API predates the field.
+function ScriptSourceBadge({ execution, testId }: { execution: ScriptExecution; testId: string }) {
+  if (typeof execution.scriptIsSystem !== 'boolean') return null;
+  return (
+    <ScopeBadge
+      testId={testId}
+      className="ml-2 align-middle"
+      isSystem={execution.scriptIsSystem}
+      orgId={execution.scriptOrgId ?? null}
+      partnerId={execution.scriptPartnerId ?? null}
+    />
+  );
 }
 
 // #4767 — the only statuses a Stop request is meaningful against. `cancelling`
@@ -245,6 +273,7 @@ function ExecutionStatusBadge({
   status,
   rawStatus,
   cancelState,
+  deviceStatus,
   testId,
 }: {
   executionId: string;
@@ -252,6 +281,7 @@ function ExecutionStatusBadge({
   status: ExecutionStatus | null;
   rawStatus: string;
   cancelState?: CancelState | null;
+  deviceStatus?: string;
 }) {
   const { t } = useTranslation('scripts');
   if (!status) {
@@ -272,12 +302,12 @@ function ExecutionStatusBadge({
       className={cn('inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium', config.color)}
     >
       <StatusIcon className={cn('h-3 w-3', (status === 'running' || status === 'cancelling') && 'animate-spin')} />
-      {t(/* i18n-dynamic */ `executionHistory.${resolveExecutionStatusLabel(status, cancelState)}`)}
+      {t(/* i18n-dynamic */ `executionHistory.${resolveExecutionStatusLabel(status, cancelState, deviceStatus)}`)}
     </span>
   );
 }
 
-export default function DeviceScriptHistory({ deviceId, orgId, timezone, highlightExecutionId }: DeviceScriptHistoryProps) {
+export default function DeviceScriptHistory({ deviceId, orgId, timezone, highlightExecutionId, deviceStatus }: DeviceScriptHistoryProps) {
   const { t } = useTranslation('devices');
   const { t: tScripts } = useTranslation('scripts');
   const [executions, setExecutions] = useState<ScriptExecution[]>([]);
@@ -489,20 +519,17 @@ export default function DeviceScriptHistory({ deviceId, orgId, timezone, highlig
 
   const handleExecuteRunAgain = async (
     scriptId: string,
-    deviceIds: string[],
+    target: ScriptRunTarget,
     parameters: Record<string, string | number | boolean>,
     runAs: 'system' | 'user'
-  ): Promise<ScriptAdmissionResult> => {
-    const response = await fetchWithAuth(`/scripts/${scriptId}/execute`, {
-      method: 'POST',
-      body: JSON.stringify({ deviceIds, parameters, runAs })
-    });
-
-    const data = await response.json().catch(() => ({})) as ScriptAdmissionResult & { error?: string };
-
-    if (!response.ok) {
-      throw new Error(extractApiError(data, tScripts('scriptExecutionsPage.errors.execute')));
-    }
+  ): Promise<ScriptExecuteResult> => {
+    const data = await postScriptExecute(
+      scriptId,
+      target,
+      parameters,
+      runAs,
+      tScripts('scriptExecutionsPage.errors.execute'),
+    );
 
     if (data.targets.some(target => target.admission === 'admitted')) {
       await fetchHistory(true);
@@ -524,13 +551,19 @@ export default function DeviceScriptHistory({ deviceId, orgId, timezone, highlig
           )}
           onClick={() => setSelectedExecution(row.raw)}
         >
-          <td className="px-4 py-3 font-medium">{row.name}</td>
+          <td className="px-4 py-3 font-medium">
+            {row.name}
+            {/* A nested run (rowTestId set) sits under its script's group row,
+                which already carries the badge. */}
+            {!rowTestId && <ScriptSourceBadge execution={row.raw} testId={`device-script-source-${row.id}`} />}
+          </td>
           <td className="px-4 py-3">
             <ExecutionStatusBadge
               executionId={row.id}
               status={row.executionStatus}
               rawStatus={row.status}
               cancelState={row.raw.cancelState}
+              deviceStatus={deviceStatus}
             />
           </td>
           <td className="px-4 py-3 text-xs text-muted-foreground">{row.startedAt}</td>
@@ -685,6 +718,7 @@ export default function DeviceScriptHistory({ deviceId, orgId, timezone, highlig
                                 : <ChevronRight className="h-4 w-4 text-muted-foreground" />}
                               {group.name}
                             </button>
+                            <ScriptSourceBadge execution={group.latest.raw} testId={`device-script-latest-source-${group.key}`} />
                             <span className="ml-2 text-xs font-normal text-muted-foreground">
                               {t('deviceScriptHistory.runCount', { count: group.runs.length })}
                             </span>
@@ -696,6 +730,7 @@ export default function DeviceScriptHistory({ deviceId, orgId, timezone, highlig
                               status={group.latest.executionStatus}
                               rawStatus={group.latest.status}
                               cancelState={group.latest.raw.cancelState}
+                              deviceStatus={deviceStatus}
                             />
                           </td>
                           <td className="px-4 py-3 text-xs text-muted-foreground">{group.latest.startedAt}</td>
@@ -792,12 +827,12 @@ export default function DeviceScriptHistory({ deviceId, orgId, timezone, highlig
                   )} />
                   <div>
                     <p className={cn('text-lg font-semibold', config.color)}>
-                      {tScripts(/* i18n-dynamic */ `executionDetails.${resolveExecutionStatusLabel(selectedStatus, selectedExecution.cancelState)}`)}
+                      {tScripts(/* i18n-dynamic */ `executionDetails.${resolveExecutionStatusLabel(selectedStatus, selectedExecution.cancelState, deviceStatus)}`)}
                     </p>
                     <p className="text-sm text-muted-foreground">
                       {selectedStatus === 'failed' && selectedExecution.errorMessage
                         ? selectedExecution.errorMessage
-                        : tScripts(/* i18n-dynamic */ `executionDetails.statusDescription.${selectedStatus}`)}
+                        : tScripts(/* i18n-dynamic */ `executionDetails.${resolveExecutionStatusDescription(selectedStatus, deviceStatus)}`)}
                     </p>
                   </div>
                 </div>

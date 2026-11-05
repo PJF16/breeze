@@ -575,6 +575,92 @@ describe('Fleet Design savepoint executor propagation (W05c2 Task 16)', () => {
   });
 });
 
+describe('monitor lifecycle overrides (alert re-arm W2, #10765)', () => {
+  function createExecutor(created: Record<string, unknown>) {
+    const values = vi.fn().mockReturnValue({ returning: async () => [created] });
+    const tx = { insert: vi.fn().mockReturnValue({ values }) };
+    const executor = {
+      select: vi.fn(),
+      transaction: vi.fn(async (callback: (transaction: typeof tx) => unknown) => callback(tx)),
+    };
+    return { values, executor };
+  }
+
+  function updateExecutor(row: Record<string, unknown>) {
+    const query = (result: unknown[]) => ({ from: () => ({ where: () => ({ limit: async () => result }) }) });
+    const select = vi.fn().mockReturnValue(query([row]));
+    const set = vi.fn((_values: Record<string, unknown>) => ({ where: () => ({ returning: async () => [row] }) }));
+    const tx = { update: vi.fn(() => ({ set })) };
+    return { set, executor: { select, transaction: vi.fn(async (work: (value: typeof tx) => Promise<unknown>) => work(tx)) } };
+  }
+
+  async function withCompileStub<T>(work: () => Promise<T>): Promise<T> {
+    const compile = vi.spyOn(monitorCompiler, 'compileMonitorInTx').mockResolvedValue({
+      alertTemplateId: 'template', alertRuleId: 'rule', automationId: 'automation', hash: 'hash',
+    } as Awaited<ReturnType<typeof monitorCompiler.compileMonitorInTx>>);
+    try { return await work(); } finally { compile.mockRestore(); }
+  }
+
+  it('create without cooldownMinutes stores null (inherit)', async () => {
+    const { values, executor } = createExecutor(existingRow());
+    await withCompileStub(() => createMonitorDefinition(
+      input({ cooldownMinutes: undefined, autoResolve: undefined }), auth(), {},
+      executor as unknown as monitorCompiler.DbExecutor,
+    ));
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({
+      cooldownMinutes: null, autoResolve: null, rearmMode: null, rearmDelayMinutes: null,
+    }));
+  });
+
+  it('create stores explicit overrides, including 0 and false', async () => {
+    const { values, executor } = createExecutor(existingRow());
+    await withCompileStub(() => createMonitorDefinition(
+      input({ cooldownMinutes: 0, autoResolve: false, rearmMode: 'after_delay', rearmDelayMinutes: 30 }), auth(), {},
+      executor as unknown as monitorCompiler.DbExecutor,
+    ));
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({
+      cooldownMinutes: 0, autoResolve: false, rearmMode: 'after_delay', rearmDelayMinutes: 30,
+    }));
+  });
+
+  const patch = async (row: Record<string, unknown>, update: Record<string, unknown>) => {
+    const { set, executor } = updateExecutor(row);
+    await withCompileStub(() => updateMonitorDefinition(row.id as string, update,
+      auth(), executor as unknown as Parameters<typeof updateMonitorDefinition>[3]));
+    return set.mock.calls[0]![0];
+  };
+
+  it('update omitting cooldownMinutes leaves it unchanged', async () => {
+    const row = existingRow({ cooldownMinutes: 10, autoResolve: true, rearmMode: 'after_delay', rearmDelayMinutes: 30 });
+    expect(await patch(row, { description: 'x' })).toMatchObject({
+      cooldownMinutes: 10, autoResolve: true, rearmMode: 'after_delay', rearmDelayMinutes: 30,
+    });
+  });
+
+  it('update with null saves inherit, where it used to keep the stored value', async () => {
+    const row = existingRow({ cooldownMinutes: 10, autoResolve: true });
+    expect(await patch(row, { cooldownMinutes: null, autoResolve: null })).toMatchObject({
+      cooldownMinutes: null, autoResolve: null,
+    });
+  });
+
+  it('clearing the re-arm mode clears its delay too, so the pair CHECK holds', async () => {
+    const row = existingRow({ rearmMode: 'after_delay', rearmDelayMinutes: 30 });
+    expect(await patch(row, { rearmMode: null })).toMatchObject({ rearmMode: null, rearmDelayMinutes: null });
+    expect(await patch(row, { rearmMode: 'new_evidence' })).toMatchObject({ rearmMode: 'new_evidence', rearmDelayMinutes: null });
+  });
+
+  it('a delay-only patch adjusts an after_delay monitor', async () => {
+    const row = existingRow({ rearmMode: 'after_delay', rearmDelayMinutes: 30 });
+    expect(await patch(row, { rearmDelayMinutes: 45 })).toMatchObject({ rearmMode: 'after_delay', rearmDelayMinutes: 45 });
+  });
+
+  it('a delay-only patch on a monitor that is not after_delay is rejected on the merged row', async () => {
+    const row = existingRow({ rearmMode: null, rearmDelayMinutes: null });
+    await expect(patch(row, { rearmDelayMinutes: 45 })).rejects.toBeInstanceOf(MonitorValidationError);
+  });
+});
+
 describe('listMonitorDefinitions / listMonitorDefinitionsPage paging (#6735)', () => {
   /** A select chain that records every builder call and resolves to `rows`. */
   function recordingChain(rows: unknown[]) {
@@ -876,5 +962,101 @@ describe('monitor read projection for org-scope callers', () => {
     // redaction is keyed on `orgId === null`, not applied blanket to every
     // row in the list.
     expect(rows[1]).toMatchObject({ orgId: ORG, responses: [] });
+  });
+});
+
+describe('per-monitor PSA board override (#10528, W2-A)', () => {
+  const fullPartner = () => auth({ scope: 'partner', partnerId: PARTNER, partnerOrgAccess: 'all', orgId: null });
+  const stubCompile = () => vi.spyOn(monitorCompiler, 'compileMonitorInTx').mockResolvedValue({
+    alertTemplateId: 't', alertRuleId: 'r', automationId: 'a', hash: 'h',
+  } as Awaited<ReturnType<typeof monitorCompiler.compileMonitorInTx>>);
+
+  function captureUpdate(row: Record<string, unknown>) {
+    const query = (result: unknown[]) => ({ from: () => ({ where: () => ({ limit: async () => result }) }) });
+    const select = vi.fn().mockReturnValue(query([row]));
+    const set = vi.fn((values: Record<string, unknown>) => ({ where: () => ({ returning: async () => [{ ...row, ...values }] }) }));
+    const tx = { update: vi.fn(() => ({ set })) };
+    const executor = { select, transaction: vi.fn(async (work: (value: typeof tx) => Promise<unknown>) => work(tx)) };
+    return { executor: executor as unknown as Parameters<typeof updateMonitorDefinition>[3], set };
+  }
+
+  it('an org-scope caller cannot set a board on create', async () => {
+    await expect(createMonitorDefinition(input({ psaBoardId: 12 }), auth()))
+      .rejects.toBeInstanceOf(MonitorOwnershipError);
+    expect(dbMock.transaction).not.toHaveBeenCalled();
+  });
+
+  it('a partner user without full org access cannot set a board on an org monitor', async () => {
+    await expect(createMonitorDefinition(
+      input({ psaBoardId: 12 }),
+      auth({ scope: 'partner', partnerId: PARTNER, partnerOrgAccess: 'selected', accessibleOrgIds: [ORG] }),
+    )).rejects.toBeInstanceOf(MonitorOwnershipError);
+  });
+
+  it('a partner admin may set a board on an org-owned monitor (reaches the write)', async () => {
+    await expect(createMonitorDefinition(input({ orgId: ORG, psaBoardId: 12 }), fullPartner()))
+      .rejects.toThrow('transaction should not be reached in these cases');
+  });
+
+  it('a partner admin\'s board reaches the insert; an omitted board inserts null', async () => {
+    const compile = stubCompile();
+    try {
+      for (const [psaBoardId, expected] of [[12, 12], [undefined, null]] as const) {
+        const values = vi.fn((row: Record<string, unknown>) => ({ returning: async () => [{ ...existingRow(), ...row }] }));
+        const tx = { insert: vi.fn(() => ({ values })) };
+        const executor = { select: vi.fn(), transaction: vi.fn(async (work: (value: typeof tx) => Promise<unknown>) => work(tx)) };
+        await createMonitorDefinition(
+          input({ orgId: ORG, ...(psaBoardId !== undefined ? { psaBoardId } : {}) }),
+          fullPartner(),
+          {},
+          executor as unknown as Parameters<typeof createMonitorDefinition>[3],
+        );
+        expect(values).toHaveBeenCalledWith(expect.objectContaining({ psaBoardId: expected }));
+      }
+    } finally { compile.mockRestore(); }
+  });
+
+  it('an explicit null board is allowed for anyone (it sets nothing)', async () => {
+    await expect(createMonitorDefinition(input({ psaBoardId: null }), auth()))
+      .rejects.toThrow('transaction should not be reached in these cases');
+  });
+
+  it('an org-scope caller editing other fields keeps the stored board', async () => {
+    const row = existingRow({ psaBoardId: 12 });
+    const { executor, set } = captureUpdate(row);
+    const compile = stubCompile();
+    try {
+      await updateMonitorDefinition(row.id as string, { description: 'x' }, auth(), executor);
+      expect(set).toHaveBeenCalledWith(expect.objectContaining({ psaBoardId: 12 }));
+      // Re-sending the unchanged value is not a change either.
+      set.mockClear();
+      await updateMonitorDefinition(row.id as string, { psaBoardId: 12 } as UpdateMonitorDefinitionInput, auth(), executor);
+      expect(set).toHaveBeenCalledWith(expect.objectContaining({ psaBoardId: 12 }));
+    } finally { compile.mockRestore(); }
+  });
+
+  it('an org-scope caller cannot change or clear the board', async () => {
+    for (const psaBoardId of [14, null]) {
+      const { executor, set } = captureUpdate(existingRow({ psaBoardId: 12 }));
+      await expect(updateMonitorDefinition('monitor-1', { psaBoardId } as UpdateMonitorDefinitionInput, auth(), executor))
+        .rejects.toBeInstanceOf(MonitorOwnershipError);
+      expect(set).not.toHaveBeenCalled();
+    }
+  });
+
+  it('a partner admin can change and clear the board', async () => {
+    const compile = stubCompile();
+    try {
+      for (const psaBoardId of [14, null]) {
+        const { executor, set } = captureUpdate(existingRow({ psaBoardId: 12 }));
+        await updateMonitorDefinition('monitor-1', { psaBoardId } as UpdateMonitorDefinitionInput, fullPartner(), executor);
+        expect(set).toHaveBeenCalledWith(expect.objectContaining({ psaBoardId }));
+      }
+    } finally { compile.mockRestore(); }
+  });
+
+  it('is hidden from an org-scope viewer of a partner-wide monitor', async () => {
+    mockExisting(existingRow({ orgId: null, partnerId: PARTNER, psaBoardId: 12 }));
+    expect(await getMonitorDefinition('monitor-1', auth())).toMatchObject({ psaBoardId: null });
   });
 });

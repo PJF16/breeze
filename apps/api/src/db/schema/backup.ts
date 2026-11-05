@@ -320,6 +320,13 @@ export const backupJobs = pgTable(
     //    made the stall rule unreachable for a live-but-wedged agent.
     lastProgressAt: timestamp('last_progress_at', { withTimezone: true }),
     lastKeepaliveAt: timestamp('last_keepalive_at', { withTimezone: true }),
+    // #11013: until when a scheduled job that found its device offline may still
+    // run on the next agent connect. Set only while the job waits; see
+    // jobs/backupCatchUp.ts for its lifecycle.
+    catchUpUntil: timestamp('catch_up_until', { withTimezone: true }),
+    // #11013: backup_configs.approval_generation the waiting job was queued
+    // against (site-ceiling gate contract §3). NULL for a job queued without one.
+    catchUpConfigGeneration: integer('catch_up_config_generation'),
     totalFiles: integer('total_files'),
     // Incremental-backup dedup stats: files/bytes referenced from a prior
     // snapshot instead of re-transferred this run. NULL = agent didn't report
@@ -364,6 +371,10 @@ export const backupJobs = pgTable(
     baseSnapshotIdIdx: index('backup_jobs_base_snapshot_id_idx')
       .on(table.baseSnapshotId)
       .where(sql`base_snapshot_id IS NOT NULL`),
+    // #11013: probed on every agent connect; holds deferred rows only.
+    catchUpDeviceIdx: index('backup_jobs_catch_up_device_idx')
+      .on(table.deviceId)
+      .where(sql`status = 'pending' AND catch_up_until IS NOT NULL`),
   })
 );
 
@@ -417,10 +428,13 @@ export const backupSnapshots = pgTable(
     // — the W02 sweep self-heals a NULL row from the storage listing; there
     // is no follow-up NOT NULL migration.
     storageIdentity: text('storage_identity'),
-    // Object-key layout the snapshot was written with. Every writer produces
-    // 'legacy_flat' (snapshots/<snapshotId>/...); readers refuse any other
-    // value (services/backupKeyLayout.ts).
+    // Key root the snapshot's objects live under (#7081): 'legacy_flat' +
+    // NULL prefix (snapshots/<snapshotId>/...) or 'prefixed_flat' + the
+    // normalized destination prefix (<prefix>/snapshots/<snapshotId>/...).
+    // Copied from the id's reservation at publish and immutable (DB
+    // triggers). Readers refuse any other value (services/backupKeyLayout.ts).
     keyLayout: text('key_layout').notNull().default('legacy_flat'),
+    keyPrefix: text('key_prefix'),
     // Bare-metal recovery (W01): disk layout captured at run time and the
     // guard verdict. NULL verdict = not assessed (file-only run / old agent).
     layoutManifest: jsonb('layout_manifest'),
@@ -558,6 +572,9 @@ export const backupSnapshotRetirements = pgTable(
     // Set by the GC sweep (W02) once the prefix is confirmed empty. NULL =
     // not yet swept. Rows are pruned 30d after this is set.
     sweptAt: timestamp('swept_at', { withTimezone: true }),
+    // Key root of the retired snapshot's objects (#7081); immutable.
+    keyLayout: text('key_layout').notNull().default('legacy_flat'),
+    keyPrefix: text('key_prefix'),
   },
   (table) => ({
     orgIdIdx: index('backup_snapshot_retirements_org_id_idx').on(table.orgId),

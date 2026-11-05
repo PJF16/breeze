@@ -1,6 +1,13 @@
 import { z } from 'zod';
 import { automationActionSchema } from './automationActions';
 import { TIME_SYNC_FINDING_CODES } from '../constants/timeSync';
+import type { RearmMode } from '../utils/alertLifecycle';
+import {
+  alertCooldownMinutesSchema,
+  isValidRearmPair,
+  REARM_PAIR_MESSAGE,
+  rearmFieldsShape,
+} from './alertLifecycle';
 
 /**
  * Monitor definitions (#5287 W02).
@@ -34,6 +41,9 @@ export const MONITOR_KINDS = [
   'hardware_health',
   // W02 (time sync): root-only, evaluates accepted time-sync snapshot findings.
   'time_sync',
+  // W06 (workload inventory, #8195): root-only, server-evaluated from the
+  // upstream_* columns the image-currency pass writes on device_workloads.
+  'container_image_currency',
 ] as const;
 export type MonitorKind = (typeof MONITOR_KINDS)[number];
 export const monitorKindSchema = z.enum(MONITOR_KINDS);
@@ -249,6 +259,13 @@ const leafConditionSchemas = {
       consecutiveSnapshots: z.number().int().min(1).max(10).default(2),
     })
     .strict(),
+  // One subject per image repository:tag on the device; breaching once the
+  // image has been `behind` for at least `minDaysBehind` days (behind_since).
+  container_image_currency: z
+    .object({
+      minDaysBehind: z.number().int().min(0).max(365).default(7),
+    })
+    .strict(),
 } satisfies Record<Exclude<MonitorKind, 'composite'>, z.ZodTypeAny>;
 
 const compositeChildSchema = z
@@ -304,24 +321,46 @@ const monitorDefinitionFields = {
   name: z.string().min(1).max(200),
   description: z.string().max(2000).optional(),
   kind: monitorKindSchema,
-  enabled: z.boolean().default(true),
+  enabled: z.boolean(),
   condition: z.record(z.string(), z.unknown()),
   severity: monitorSeveritySchema,
-  cooldownMinutes: z.number().int().min(0).max(1440).default(5),
-  autoResolve: z.boolean().default(false),
+  // Alert lifecycle overrides (#10765): null or omitted on create = inherit the
+  // device's org override, then its partner default. No create default: a new
+  // monitor inherits. The re-arm pair rule is in `refineDefinition`.
+  cooldownMinutes: alertCooldownMinutesSchema.nullable().optional(),
+  autoResolve: z.boolean().nullable().optional(),
+  ...rearmFieldsShape,
   autoResolveConditions: z.record(z.string(), z.unknown()).nullable().optional(),
-  responses: monitorResponsesSchema.default([]),
-  deliveryMode: monitorDeliveryModeSchema.default('inherit'),
-  deliveryChannelIds: z.array(z.string().uuid()).max(20).default([]),
+  responses: monitorResponsesSchema,
+  deliveryMode: monitorDeliveryModeSchema,
+  deliveryChannelIds: z.array(z.string().uuid()).max(20),
   escalationPolicyId: z.string().uuid().nullable().optional(),
   recurrenceThreshold: z.number().int().min(2).max(100).nullable().optional(),
   recurrenceWindowHours: z.number().int().min(1).max(8760).nullable().optional(),
-  recurrenceActions: monitorResponsesSchema.default([]),
-  pauseResponsesOnEscalation: z.boolean().default(true),
+  recurrenceActions: monitorResponsesSchema,
+  pauseResponsesOnEscalation: z.boolean(),
   aiAgentId: z.string().uuid().nullable().optional(),
+  // Alert → PSA ticket (#10528): the PSA board this monitor's tickets go to,
+  // overriding the bound connection's board. Partner-level config: the API
+  // refuses a change from a caller who cannot manage partner-wide config.
+  psaBoardId: z.number().int().positive().max(2_147_483_647).nullable().optional(),
 };
 
 const baseDefinition = z.object(monitorDefinitionFields);
+
+/**
+ * Defaults belong to CREATE only. Zod's `.partial()` still applies a field's
+ * `.default()` to an omitted key, so a default in `monitorDefinitionFields`
+ * would make every PATCH overwrite that stored setting.
+ */
+const createOnlyDefaults = {
+  enabled: monitorDefinitionFields.enabled.default(true),
+  responses: monitorDefinitionFields.responses.default([]),
+  deliveryMode: monitorDefinitionFields.deliveryMode.default('inherit'),
+  deliveryChannelIds: monitorDefinitionFields.deliveryChannelIds.default([]),
+  recurrenceActions: monitorDefinitionFields.recurrenceActions.default([]),
+  pauseResponsesOnEscalation: monitorDefinitionFields.pauseResponsesOnEscalation.default(true),
+};
 
 interface MonitorDefinitionShape {
   kind?: MonitorKind;
@@ -332,6 +371,8 @@ interface MonitorDefinitionShape {
   deliveryChannelIds?: string[];
   responses?: Array<{ type: string }>;
   aiAgentId?: string | null;
+  rearmMode?: RearmMode | null;
+  rearmDelayMinutes?: number | null;
 }
 
 /**
@@ -340,7 +381,9 @@ interface MonitorDefinitionShape {
  * The condition check is skipped when `kind` is absent, which only happens on a
  * PATCH that does not change the kind — the service re-validates the MERGED
  * definition against the stored kind, so a partial update can never persist a
- * condition that does not match.
+ * condition that does not match. The delivery check skips an absent
+ * `deliveryChannelIds` for the same reason: create always has it from its
+ * default, and an absent list on a PATCH means the stored channels stay.
  */
 function refineDefinition<T extends z.ZodType<MonitorDefinitionShape>>(schema: T) {
   return schema
@@ -356,14 +399,15 @@ function refineDefinition<T extends z.ZodType<MonitorDefinitionShape>>(schema: T
       message: 'recurrenceThreshold and recurrenceWindowHours must be set together',
       path: ['recurrenceThreshold'],
     })
-    .refine((v) => v.deliveryMode !== 'channels' || (v.deliveryChannelIds?.length ?? 0) > 0, {
+    .refine((v) => v.deliveryMode !== 'channels' || v.deliveryChannelIds === undefined || v.deliveryChannelIds.length > 0, {
       message: 'deliveryChannelIds required when deliveryMode is channels',
       path: ['deliveryChannelIds'],
     })
     .refine((v) => !(v.responses ?? []).some((a) => a.type === 'ai_triage') || !!v.aiAgentId, {
       message: 'ai_triage responses require aiAgentId',
       path: ['responses'],
-    });
+    })
+    .refine(isValidRearmPair, { message: REARM_PAIR_MESSAGE, path: ['rearmDelayMinutes'] });
 }
 
 /**
@@ -373,6 +417,7 @@ function refineDefinition<T extends z.ZodType<MonitorDefinitionShape>>(schema: T
  */
 export const createMonitorDefinitionSchema = refineDefinition(
   baseDefinition.extend({
+    ...createOnlyDefaults,
     ownerScope: z.enum(['organization', 'partner']).default('organization'),
     orgId: z.string().uuid().optional(),
   }),

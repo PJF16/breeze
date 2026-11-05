@@ -17,6 +17,7 @@ import {
   withAuthDbAccessContext,
 } from '../middleware/auth';
 import { aiScriptAuthoringEnabled } from '../config/env';
+import { WispSessionError } from '../services/wisp/sessionGrant';
 import { loadScriptProposalReviewerDisagreements } from '../services/scriptProposals/metrics';
 import {
   createSession,
@@ -26,6 +27,7 @@ import {
   getSessionMessages,
   handleApproval,
   isIntentBackedExecution,
+  getDecidedExecutionOutcome,
   searchSessions,
   listM365Connections,
   sanitizeErrorForClient,
@@ -35,13 +37,16 @@ import { runPreFlightChecks, abortActivePlan, settleBlockedTurnForNewMessage } f
 import { sanitizeThrownToolError } from '../services/aiToolErrors';
 import { redactPersistedToolInput } from '../services/aiToolOutput';
 import { streamingSessionManager } from '../services/streamingSessionManager';
+import { registerAiAttachRoute } from './aiAttach';
 import { drainPendingRunResults } from '../services/workspace/chatRunBridge';
 import {
   checkBudgetDetailed,
   getUsageSummary,
+  getAggregateUsageSummary,
   updateBudget,
   getSessionHistory,
 } from '../services/aiCostTracker';
+import { aiDenialBody } from '../services/aiDenialCode';
 import { createTicket, changeTicketStatus, TicketServiceError, type TicketActor } from '../services/ticketService';
 import { createTimeEntry, TimeEntryServiceError } from '../services/timeEntryService';
 import { writeRouteAudit } from '../services/auditEvents';
@@ -91,6 +96,8 @@ import { oneShotUnavailableAnswer } from '../services/aiModels/oneShotUnavailabl
 import { settleInvocation } from '../services/aiModels/settleInvocation';
 import { resolveSessionTurn } from '../services/aiModels/sessionModel';
 import { loadContinuationSummary, withContinuationContext } from '../services/aiModels/continuation';
+// A leaf module (db + sanitizer): it does not load the Wisp graph.
+import { loadFiredCheckIns, markCheckInsConsumed, renderCheckInBlock, type FiredCheckIn } from '../services/wisp/checkInTurn';
 import { AI_NOT_CONFIGURED_BODY, LlmNotConfiguredError } from '../services/llm/llmAvailability';
 import type { ResolvedModel } from '../services/aiModels/resolveModel';
 import { liveQueryKey, turnBindingFrom, withCarriedRates } from '../services/aiModels/turnBinding';
@@ -161,7 +168,10 @@ const createAiSessionSchema = sharedCreateAiSessionSchema.extend({
   deviceId: z.string().guid().optional(),
   // Let the caller pick the approval posture (e.g. plan-first for open-ended
   // device tasks). Defaults to the column default (per_step) when omitted.
-  approvalMode: z.enum(['per_step', 'action_plan', 'auto_approve', 'hybrid_plan']).optional()
+  approvalMode: z.enum(['per_step', 'action_plan', 'auto_approve', 'hybrid_plan']).optional(),
+  // Wisp W04: open the session under the caller's own delegation grant.
+  // Validated (flag, ownership, status, entitlement, scope) in createSession.
+  wispGrantId: z.string().guid().optional()
 });
 
 /**
@@ -251,6 +261,7 @@ aiRoutes.post(
       });
       return c.json(session, 201);
     } catch (err) {
+      if (err instanceof WispSessionError) return c.json({ error: err.message, code: err.code }, err.status);
       if (err instanceof LlmNotConfiguredError) return c.json(AI_NOT_CONFIGURED_BODY, 503);
       if (err instanceof InvalidSessionModelError) return c.json({ error: err.message, code: err.code }, 400);
       if (err instanceof LlmUnavailableError) return c.json(llmUnavailableBody(err), 503);
@@ -343,6 +354,10 @@ aiRoutes.get(
     return c.json({ ...result, session: { ...result.session, lastTurnModel }, lastTurnModel });
   }
 );
+
+// GET /sessions/:id/stream - Attach to the session's current turn (#9427).
+// Same ownership surface as GET /sessions/:id; see routes/aiAttach.ts.
+registerAiAttachRoute(aiRoutes);
 
 // DELETE /sessions/:id - Close a session
 aiRoutes.delete(
@@ -514,7 +529,7 @@ aiRoutes.post(
     // reserveAiBudget enforces caps, NOT prepaid credits or the plan gate —
     // check them with the resolved funding before reserving.
     const denial = await checkBudgetDetailed(session.orgId, turn.funding);
-    if (denial) return c.json({ error: denial.message }, 402);
+    if (denial) return c.json(aiDenialBody(denial), 402);
 
     const binding = turnBindingFrom(turn);
     // S8: no stable request identity reaches this surface — the client sends
@@ -792,10 +807,10 @@ aiRoutes.post(
     // between them with no connection checked out.
     const inRequestDb = <T>(fn: () => Promise<T>): Promise<T> => withAuthDbAccessContext(auth, fn);
 
-    // Pre-flight checks (rate limits, budget, session status, input sanitization)
-    const preflight = await inRequestDb(() =>
-      runPreFlightChecks(sessionId, body.content, auth, body.pageContext, c, body.model),
-    );
+    // Pre-flight checks (rate limits, budget, session status, input sanitization).
+    // #10415: not wrapped in inRequestDb — the pre-flight opens its own DB
+    // phases with it and runs the Redis rate limit between them.
+    const preflight = await runPreFlightChecks(sessionId, body.content, auth, body.pageContext, c, body.model, inRequestDb);
     if (!preflight.ok) {
       const err = preflight.error;
       if (err === 'ai_not_configured') return c.json(AI_NOT_CONFIGURED_BODY, 503);
@@ -803,6 +818,8 @@ aiRoutes.post(
       // W03: a stored model that went ineligible is recoverable (choose another), never a silent switch.
       if (preflight.code) return c.json({ error: err, code: preflight.code, recoverable: true }, preflight.status === 503 ? 503 : 409);
       if (preflight.status === 503) return c.json({ error: err }, 503);
+      // The credit / plan gate (and spend caps): 402, with a code the client can act on.
+      if (preflight.status === 402) return c.json(preflight.billingCode ? { error: err, code: preflight.billingCode } : { error: err }, 402);
       if (err === 'Session not found') return c.json({ error: err }, 404);
       if (err.includes('rate limit') || err.includes('Rate limit')) return c.json({ error: err }, 429);
       if (err.includes('budget') || err.includes('Budget')) return c.json({ error: err }, 402);
@@ -870,6 +887,29 @@ aiRoutes.post(
       captureException(new Error('continuation summary missing on first turn'), undefined, { org_id: dbSession.orgId });
     }
 
+    // Wisp check-in timers W04 (#10995; spec §4): check-ins this grant's
+    // timers fired since the last turn ride on THIS turn as delimited,
+    // sanitised, untrusted background (services/wisp/checkInTurn.ts) — never
+    // the system prompt. Read here, before anything is reserved or claimed;
+    // consumed only once the turn is dispatched (below), so a refused turn
+    // leaves them for the next one. A failed read never blocks the turn.
+    // Only the rows actually rendered into the block are consumed later.
+    let firedCheckIns: FiredCheckIn[] = [];
+    let checkInBlock: string | null = null;
+    const wispGrantId = !topology ? dbSession.wispGrantId : null;
+    if (wispGrantId) {
+      try {
+        const rows = await inRequestDb(() => loadFiredCheckIns(wispGrantId, auth.user.id));
+        checkInBlock = renderCheckInBlock(rows);
+        firedCheckIns = rows;
+      } catch (err) {
+        console.warn('[AI] failed to read fired Wisp check-ins; sending the turn without them', {
+          orgId: dbSession.orgId, sessionId, grantId: wispGrantId, error: err instanceof Error ? err.message : String(err),
+        });
+        captureException(err, c, { wisp_check_in_phase: 'read' }, { fingerprint: ['wisp-check-in-turn', 'read'] });
+      }
+    }
+
     // A Claude SDK query's maxBudgetUsd is immutable after creation. Finish any
     // approval-only prior turn, then rotate the idle query so this turn is
     // created with the exact durable reservation ceiling.
@@ -888,10 +928,12 @@ aiRoutes.post(
       const settle = await settleBlockedTurnForNewMessage(priorSession);
       if (settle !== 'concluded') {
         await abortTopology();
+        // #9427: coded so a client can attach to the running turn instead.
         return c.json({
           error: settle === 'not_blocked_on_approvals'
             ? 'A message is already being processed for this session'
             : 'The assistant is wrapping up the previous turn — please try again in a moment',
+          code: 'turn_in_progress',
         }, 409);
       }
     }
@@ -1043,7 +1085,7 @@ aiRoutes.post(
       // The topology runtime is bound by the transition itself, and only when
       // this request wins the slot (PR #7147 F1).
       if (!streamingSessionManager.tryTransitionToProcessing(activeSession, budgetDispatch.reservationId, { topologyInvestigation: topology?.runtime, turnBinding: binding, turnDisplay: turnDisplayFrom(model) })) {
-        return { kind: 'refused', response: c.json({ error: 'A message is already being processed for this session' }, 409) };
+        return { kind: 'refused', response: c.json({ error: 'A message is already being processed for this session', code: 'turn_in_progress' }, 409) };
       }
 
       writeRouteAudit(c, {
@@ -1055,11 +1097,17 @@ aiRoutes.post(
       });
 
       try {
-        await db.insert(aiMessages).values({
+        const [userRow] = await db.insert(aiMessages).values({
           sessionId,
           role: 'user',
           content: sanitizedContent,
-        });
+        }).returning({ id: aiMessages.id });
+        // #9427: the anchor an attaching client splices this turn's replay
+        // after. Set before the turn is pushed.
+        activeSession.turnUserMessageId = userRow?.id ?? null;
+        if (!userRow) {
+          console.warn('[AI] User message insert returned no row; attaching clients get no turn anchor', { sessionId });
+        }
       } catch (err) {
         console.error('[AI] Failed to save user message to DB:', err);
         activeSession.state = 'idle';
@@ -1091,9 +1139,12 @@ aiRoutes.post(
       // above) as delimited, sanitised, untrusted background — never the
       // system prompt. The persisted user row above keeps the plain text, so
       // the prefix reaches only the model.
-      const turnContent = topology
+      const baseTurn = topology
         ? topology.prompt
         : continuationSummary ? withContinuationContext(continuationSummary, sanitizedContent) : sanitizedContent;
+      // W04 (#10995): fired check-ins go between any analysis results
+      // (outermost) and the user's own text, which stays last.
+      const turnContent = checkInBlock ? `${checkInBlock}\n\n${baseTurn}` : baseTurn;
       // Subscribe BEFORE the turn is pushed: the session event bus has no
       // replay, and a fast transport can publish the turn's events (even its
       // error and done) before the SSE callback below would run.
@@ -1115,12 +1166,44 @@ aiRoutes.post(
       // own system transaction never runs beside a held request connection.
       await abortTopology();
       await releaseUnusedTurn(dbSession.orgId, budgetDispatch);
+      // Wisp W04: getOrCreate refuses a grant-pinned session it cannot gate
+      // (services/wisp/chatCeiling.ts WispSessionUnavailableError) — a typed
+      // 409, never a 500 and never an ungated turn. Matched on `code` so this
+      // route does not load the Wisp graph.
+      if (dispatch.kind === 'failed' && (dispatch.error as { code?: unknown } | null)?.code === 'wisp_session_unavailable') {
+        return c.json({ error: (dispatch.error as Error).message, code: 'wisp_session_unavailable' }, 409);
+      }
       if (dispatch.kind === 'failed') throw dispatch.error;
       return dispatch.response;
     }
     const { activeSession, events } = dispatch;
 
+    // W04 (#10995): the turn carrying the check-ins is dispatched, so they are
+    // consumed now (fired → consumed; a row cancelled meanwhile stays
+    // cancelled). A failure only means they are prepended again next turn.
+    if (wispGrantId && firedCheckIns.length > 0) {
+      const ids = firedCheckIns.map((row) => row.id);
+      try {
+        const consumed = await inRequestDb(() => markCheckInsConsumed({ grantId: wispGrantId, ids }));
+        if (consumed === 0) {
+          // Every row was cancelled since the read — or the UPDATE matched
+          // nothing under RLS, which would re-prepend them every turn.
+          console.warn('[AI] no Wisp check-in was marked consumed', { orgId: dbSession.orgId, sessionId, grantId: wispGrantId, ids });
+        }
+      } catch (err) {
+        console.warn('[AI] failed to mark Wisp check-ins consumed; they will be prepended again next turn', {
+          orgId: dbSession.orgId, sessionId, grantId: wispGrantId, ids, error: err instanceof Error ? err.message : String(err),
+        });
+        captureException(err, c, { wisp_check_in_phase: 'consume' }, { fingerprint: ['wisp-check-in-turn', 'consume'] });
+      }
+    }
+
     return streamSSE(c, async (stream) => {
+      // #9427: a client that goes away stops listening at once; the turn is
+      // NOT interrupted (another surface may be attached to it).
+      stream.onAbort(() => {
+        activeSession.eventBus.unsubscribe(subscriptionId);
+      });
 
       try {
         for await (const event of events) {
@@ -1233,6 +1316,17 @@ aiRoutes.post(
           via: 'intent',
           message: 'This action needs approval in the Approvals area or the Breeze mobile app.',
         });
+      }
+      // #9431: a stale card (decided in another window, in Approvals, on
+      // mobile, or timed out). handleApproval's CAS already refused a second
+      // decision; say so, with the outcome, so the card can show it.
+      const decided = await getDecidedExecutionOutcome(executionId, sessionId);
+      if (decided) {
+        return c.json({
+          error: 'This request was already decided.',
+          code: 'approval_already_decided',
+          outcome: decided,
+        }, 409);
       }
       return c.json({ error: 'Execution not found or already processed' }, 404);
     }
@@ -1444,20 +1538,11 @@ aiRoutes.get(
     const orgId = c.req.query('orgId') || auth.orgId;
 
     if (!orgId) {
-      // System/partner users without a specific org: no org to resolve an
-      // effective budget for, so budget stays null. #4388: alerts.fired must
-      // still be present (empty) so callers can read it unconditionally.
-      return c.json({
-        daily: { inputTokens: 0, outputTokens: 0, totalCostCents: 0, messageCount: 0 },
-        monthly: { inputTokens: 0, outputTokens: 0, totalCostCents: 0, messageCount: 0 },
-        budget: null,
-        billedTo: 'platform' as const,
-        // #4388 W04: present (null) on every /ai/usage response, same
-        // rationale as `alerts.fired` above: callers read `usage.credits`
-        // unconditionally.
-        credits: null,
-        alerts: { fired: [] },
-      });
+      // System/partner users on "All organizations" (#9667): aggregate usage
+      // over exactly the orgs this caller can access. No single org means no
+      // effective budget to resolve, so budget stays null. #4388: alerts.fired
+      // is present (empty) so callers can read it unconditionally.
+      return c.json(await getAggregateUsageSummary(auth.accessibleOrgIds));
     }
 
     if (orgId !== auth.orgId && !auth.canAccessOrg(orgId)) {
@@ -1764,6 +1849,9 @@ aiRoutes.get(
         completed: drizzleSql<number>`COUNT(*) FILTER (WHERE ${aiToolExecutions.status} = 'completed')`,
         failed: drizzleSql<number>`COUNT(*) FILTER (WHERE ${aiToolExecutions.status} = 'failed')`,
         rejected: drizzleSql<number>`COUNT(*) FILTER (WHERE ${aiToolExecutions.status} = 'rejected')`,
+        // #10411: platform refusals (guardrail, RBAC, rate limit, validation)
+        // are their own series; `rejected` stays the approval outcome.
+        refused: drizzleSql<number>`COUNT(*) FILTER (WHERE ${aiToolExecutions.status} = 'refused')`,
       })
       .from(aiToolExecutions)
       .innerJoin(aiSessions, eq(aiToolExecutions.sessionId, aiSessions.id))
@@ -1813,6 +1901,7 @@ aiRoutes.get(
         completed: Number(row.completed),
         failed: Number(row.failed),
         rejected: Number(row.rejected),
+        refused: Number(row.refused),
       })),
       executions: executions.map((execution) => ({
         ...execution,

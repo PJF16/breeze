@@ -3,17 +3,19 @@
  * (replaces W03's aiProviderAuthority.integration.test.ts; its still-relevant
  * cases are ported here). The key probe and the discovery queue are stubbed;
  * everything else is real.
- *  - connect moves every platform reference except patch_test onto the key,
- *    keeps options, rows and explicit choices, and disables the platform
- *    offerings left routing nothing;
+ *  - connect moves every platform reference onto the key, keeps options, rows
+ *    and explicit choices, and disables the platform offerings left routing
+ *    nothing (patch_test has no partner row since #9496: it runs on the
+ *    partnerless platform default whatever the partner connects);
  *  - rotate is in place by id; assignments do not move;
  *  - a connection id of another partner is refused and writes nothing;
  *  - disconnect moves only that connection's references back to the platform
  *    and SOFT-disconnects it (#7700 finding 1): the row stays keyless, its
  *    offerings disabled, config_version bumped; a reconnect is a NEW id;
  *  - a soft-disconnected id is refused by every write and never revived;
- *  - a rotated or disconnected key never survives in partner_llm_configs
- *    (#7700 finding 4);
+ *  - a partner may hold several Anthropic connections (W08b dropped
+ *    compat_uq): a later one moves nothing, and deleting one moves only its
+ *    own references back to the platform;
  *  - a registry-native edit (options, verbatim fallback list, org override,
  *    explicit session model) survives rotate and disconnect (W03, W09).
  */
@@ -36,12 +38,10 @@ import {
 import { loadOfferingCandidate } from '../../services/aiModels/candidateLoader';
 import { connectionPrimaryModelId } from '../../services/aiModels/connectionRemap';
 import { __resetRegistryCutoverMemoForTests, ensurePartnerCutover } from '../../services/aiModels/registryCutover';
-import { columnAad } from '../../services/encryptedColumnRegistry';
 import { chatReadinessInSystemContext } from '../../services/aiModels/readiness';
 import { resolveModel } from '../../services/aiModels/resolveModel';
 import { markPartnerLlmError } from '../../services/llm/llmConfigResolver';
-import { encryptSecret } from '../../services/secretCrypto';
-import { closeRegistryFixtures, fixtureSql, keySpec, seedByokConnection, seedOffering, seedPricedPlatformModel } from './aiModelRegistryFixtures';
+import { closeRegistryFixtures, fixtureSql, seedOffering, seedPricedPlatformModel } from './aiModelRegistryFixtures';
 import { createOrganization, createPartner, createUser } from './db-utils';
 import { seedPricedPlatformModel as seedW03PlatformModel, seedRegistryPartner } from './helpers/aiModelRegistrySeed';
 
@@ -109,7 +109,7 @@ afterEach(() => {
 });
 
 describe.skipIf(!RUN)('Anthropic connection lifecycle (W08)', () => {
-  it('connect moves platform references except patch_test onto the key; rotate is in place', async () => {
+  it('connect moves every platform reference onto the key; rotate is in place', async () => {
     const { partnerId, userId } = await bootstrappedPartner();
     const before = await partnerRows(partnerId);
     const platformOffering = before.find((r) => r.surface === 'chat')!.defaultOfferingId;
@@ -118,13 +118,11 @@ describe.skipIf(!RUN)('Anthropic connection lifecycle (W08)', () => {
     expect(configVersion).toBe(1);
     const after = await partnerRows(partnerId);
     expect(after.map((r) => r.surface).sort()).toEqual(before.map((r) => r.surface).sort());
-    for (const r of after) {
-      const o = await offering(r.defaultOfferingId);
-      if (r.surface === 'patch_test') expect(o!.connectionId).toBeNull();
-      else expect(o!.connectionId).toBe(connectionId);
-    }
-    // The platform offering still serves patch_test, so it stays enabled.
-    expect((await offering(platformOffering))!.enabled).toBe(true);
+    expect(after.map((r) => r.surface)).not.toContain('patch_test');
+    for (const r of after) expect((await offering(r.defaultOfferingId))!.connectionId).toBe(connectionId);
+    // Nothing routes to the platform offering any more, so it is not left enabled
+    // (an inert patch_test row used to pin it, #9496).
+    expect((await offering(platformOffering))!.enabled).toBe(false);
 
     const rotated = await rotateAnthropicKey({ partnerId, connectionId, apiKey: 'sk-ant-test-2222222222', userId });
     expect(rotated).toEqual({ last4: '2222', configVersion: 2 });
@@ -147,7 +145,7 @@ describe.skipIf(!RUN)('Anthropic connection lifecycle (W08)', () => {
     expect(row).toMatchObject({ partnerId: b.partnerId, keyLast4: '3333', configVersion: 1, status: 'active' });
   });
 
-  it('connecting keeps options, rows and explicit choices; a live session follows the key; nothing is written to partner_llm_configs', async () => {
+  it('connecting keeps options, rows and explicit choices; a live session follows the key', async () => {
     const s = await seedRegistryPartner('platform');
     await fixtureSql`UPDATE ai_model_assignments SET options = '{"effort":"low"}'::jsonb
       WHERE partner_id = ${s.partnerId} AND surface = 'catalog_enrichment'`;
@@ -169,7 +167,6 @@ describe.skipIf(!RUN)('Anthropic connection lifecycle (W08)', () => {
     expect(session).toEqual({ conn: row!.conn, model_id: s.modelId });
     // …and the platform offering nothing routes to any more is not left enabled.
     expect(await offering(s.offeringId)).toMatchObject({ enabled: false });
-    expect(await fixtureSql`SELECT 1 FROM partner_llm_configs WHERE partner_id = ${s.partnerId}`).toHaveLength(0);
     expect(await liveConnection(s.partnerId)).toMatchObject({ status: 'active', key_last4: '0001' });
   });
 
@@ -231,7 +228,7 @@ describe.skipIf(!RUN)('Anthropic connection lifecycle (W08)', () => {
     expect(session!.connection_id).toBeNull();
   });
 
-  it('a disconnected connection is unusable everywhere, and a reconnect creates a NEW connection id (compat_uq ignores it)', async () => {
+  it('a disconnected connection is unusable everywhere, and a reconnect creates a NEW connection id', async () => {
     const s = await seedRegistryPartner('byok');
     expect(await deleteAnthropicConnection({ partnerId: s.partnerId, connectionId: s.connectionId! })).toBe(true);
     // A second disconnect finds nothing to disconnect.
@@ -268,12 +265,27 @@ describe.skipIf(!RUN)('Anthropic connection lifecycle (W08)', () => {
     expect(await offering(s.offeringId)).toMatchObject({ enabled: false });
   });
 
-  it('a second Anthropic connection is refused while the R1 cap and compat_uq exist', async () => {
+  it("two Anthropic connections: the second moves nothing; deleting one leaves the other's assignments (W08b)", async () => {
     const { partnerId, userId } = await bootstrappedPartner();
-    await createAnthropicKeyConnection({ partnerId, apiKey: 'sk-ant-test-6666666666', userId });
-    await expect(createAnthropicKeyConnection({ partnerId, apiKey: 'sk-ant-test-7777777777', userId }))
-      .rejects.toMatchObject({ status: 409 });
-    expect(await fixtureSql`SELECT 1 FROM partner_ai_connections WHERE partner_id = ${partnerId}`).toHaveLength(1);
+    const defaults = async () => (await partnerRows(partnerId))
+      .map((r) => `${r.surface}/${r.role}=${r.defaultOfferingId}`).sort();
+    const first = await createAnthropicKeyConnection({ partnerId, apiKey: 'sk-ant-test-6666666666', userId });
+    const onFirst = await defaults();
+    expect((await chatDefault(partnerId)).conn).toBe(first.connectionId);
+
+    const second = await createAnthropicKeyConnection({ partnerId, apiKey: 'sk-ant-test-7777777777', userId });
+    expect(second.connectionId).not.toBe(first.connectionId);
+    expect(await fixtureSql`SELECT id FROM partner_ai_connections WHERE partner_id = ${partnerId} AND status = 'active'`).toHaveLength(2);
+    expect(await defaults()).toEqual(onFirst);
+
+    expect(await deleteAnthropicConnection({ partnerId, connectionId: second.connectionId })).toBe(true);
+    expect(await defaults()).toEqual(onFirst);
+    expect((await chatDefault(partnerId)).conn).toBe(first.connectionId);
+
+    expect(await deleteAnthropicConnection({ partnerId, connectionId: first.connectionId })).toBe(true);
+    const rows = (await partnerRows(partnerId)).filter((r) => r.defaultOfferingId !== null);
+    expect(rows.length).toBeGreaterThan(0);
+    for (const r of rows) expect((await offering(r.defaultOfferingId))!.connectionId).toBeNull();
   });
 
   it('a registry-native edit survives later writes (rotate, disconnect): options, the fallback list verbatim, an org override, an explicit session model', async () => {
@@ -416,36 +428,6 @@ describe.skipIf(!RUN)('Anthropic connection lifecycle (W08)', () => {
       // The default landing on an entry of its own fallback list is the W09 inert self-entry: kept.
       fallback_offering_ids: [platformTwin],
     });
-  });
-
-  it('a revoked key never survives in partner_llm_configs: rotate and disconnect remove the legacy ciphertext (#7700 finding 4)', async () => {
-    // The legacy table still exists in this release (W08b drops it); seed a
-    // pre-cutover partner the way W02 left it: a legacy row plus its byte copy.
-    const seedLegacy = async (suffix: string) => {
-      const partner = await createPartner();
-      await createOrganization({ partnerId: partner.id });
-      const user = await createUser({ partnerId: partner.id });
-      const legacyId = randomUUID();
-      const sealed = encryptSecret(`sk-ant-api03-legacy-${suffix}`, { aad: columnAad(keySpec('partner_ai_connections'), legacyId) })!;
-      await fixtureSql`INSERT INTO partner_llm_configs (id, partner_id, api_key_encrypted, key_last4, key_fingerprint, connected_by)
-                       VALUES (${legacyId}, ${partner.id}, ${sealed}, ${suffix}, 'fp', ${user.id})`;
-      await seedByokConnection(partner.id, legacyId);
-      return { partnerId: partner.id, userId: user.id, connectionId: legacyId, sealed };
-    };
-    const holdsCiphertext = (sealed: string) => fixtureSql`SELECT 1 FROM partner_llm_configs WHERE api_key_encrypted = ${sealed}`;
-
-    // Rotation (bootstraps the partner onto its copied connection first, then rotates in place).
-    const rotated = await seedLegacy('0011');
-    await rotateAnthropicKey({ partnerId: rotated.partnerId, connectionId: rotated.connectionId, apiKey: 'sk-ant-api03-lifecycle-0012', userId: rotated.userId });
-    expect(await liveConnection(rotated.partnerId)).toMatchObject({ id: rotated.connectionId, key_last4: '0012' });
-    expect(await holdsCiphertext(rotated.sealed)).toHaveLength(0);
-    expect(await fixtureSql`SELECT 1 FROM partner_llm_configs WHERE partner_id = ${rotated.partnerId}`).toHaveLength(0);
-
-    // Disconnect.
-    const disconnected = await seedLegacy('0013');
-    expect(await deleteAnthropicConnection({ partnerId: disconnected.partnerId, connectionId: disconnected.connectionId })).toBe(true);
-    expect(await holdsCiphertext(disconnected.sealed)).toHaveLength(0);
-    expect(await fixtureSql`SELECT 1 FROM partner_llm_configs WHERE partner_id = ${disconnected.partnerId}`).toHaveLength(0);
   });
 
   it('the resolver reads the connection: a runtime credential failure marks it, and a rotation clears it', async () => {

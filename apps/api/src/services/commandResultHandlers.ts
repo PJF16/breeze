@@ -13,6 +13,8 @@
  */
 
 import { z } from 'zod';
+import { CommandTypes } from './commandTypes';
+import { applyWakeRelayResult } from './wakeAttempts';
 import { requestLikeFromSnapshot, writeAuditEvent } from './auditEvents';
 import {
   AGENT_UPDATE_REQUIRED_ERROR,
@@ -44,7 +46,7 @@ import { describeZodIssues } from '../lib/zodIssues';
 import { redactSecretsFromOutput, redactOptionalSecretText } from './secretRedaction';
 import { updateRestoreJobByCommandId } from './restoreResultPersistence';
 import { applyRebuildCommandResult } from './bareMetalRecoveryService';
-import { captureException } from './sentry';
+import { captureException, captureMessage } from './sentry';
 import { applyScriptCustomFieldWrites } from './customFields/scriptWriteBack';
 import type { ScriptCustomFieldWriteSummary } from '../db/schema/scripts';
 import { PG_UUID_REGEX, UUID_REGEX } from '../utils/uuid';
@@ -69,6 +71,13 @@ import {
 // task exited, so the agent's result must close the device out here rather than
 // through the executor's poll.
 import { handleInstallPatchesResult } from './patchJobFinalizer';
+// #6354 W02: caller verification's workstation tier. Both transports reach
+// this one leaf handler; it decides nothing itself (W01 applyDecision does).
+import { handleCallerVerifyResult } from './callerVerification/workstationResult';
+import { handleNotifyUserResult, handleRetractMessageResult } from './endpointMessaging/commandResults';
+import { handleChatMessageResult, handleChatOpenResult } from './endpointMessaging/chatResults';
+// #9662: AI/incident containment actions follow their command's real outcome.
+import { handleExecuteContainmentResult } from './incidentContainmentResults';
 
 export type CommandResultHandlerOutcome =
   | { kind: 'pam'; classification: PamActuationResultClassification }
@@ -576,9 +585,12 @@ async function handleScriptResult({ agentId, command, result, resolvedDeviceId, 
       //     process reached a real outcome, so keep it (OD9-C) and record the
       //     losing cancel request in `cancel_state` alone. `status` is never
       //     `cancelled` here: we cannot prove the stop.
-      const cancelledMarker = (result as Record<string, unknown> | null)?.cancelled === true;
-      const rawMarkerCommandId = (result as Record<string, unknown> | null)?.cancelledByCommandId;
-      const markerCommandId = typeof rawMarkerCommandId === 'string' ? rawMarkerCommandId : null;
+      //
+      // Both fields are declared on `commandResultSchema` (#10377). Until they
+      // were, the transport parse stripped them and the PROVEN write below was
+      // unreachable from a real agent.
+      const cancelledMarker = result.cancelled === true;
+      const markerCommandId = result.cancelledByCommandId ?? null;
 
       phase = 'cancel-confirm-cas';
       let cancelClosed: TerminalExecution[] = [];
@@ -939,6 +951,27 @@ async function handleCisResult({ command, result, stdout }: Parameters<CommandRe
   } as any);
 }
 
+/**
+ * #10376: the websocket transport dispatches ONLY through this registry, so
+ * until the security types were listed here every WS-delivered security
+ * result was dropped — a `security_scans` row stayed `running` (and an IOC
+ * sweep never finished), no threat was ingested, and quarantine/remove/restore
+ * never moved the threat row. The REST route keeps its inline call (these
+ * types are deliberately absent from its REGISTRY_DISPATCHED_COMMAND_TYPES),
+ * so each transport runs the same leaf exactly once.
+ */
+async function handleSecurityResult({ command, result, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  const { handleSecurityCommandResult } = await import('../routes/agents/helpers');
+  await handleSecurityCommandResult(command, {
+    status: result.status,
+    exitCode: result.exitCode,
+    stdout,
+    stderr: result.stderr,
+    durationMs: result.durationMs,
+    error: result.error,
+  });
+}
+
 const peripheralPolicyResultV2Schema = z.object({
   schemaVersion: z.literal(2),
   phase: z.enum(['clear_legacy', 'enforce']),
@@ -1039,11 +1072,16 @@ async function handleFilesystemAnalysisResult({
     .where(eq(devices.id, resolvedDeviceId))
     .limit(1);
   if (!device) {
-    const message = `[commandResultHandlers] filesystem_analysis result for unknown device ${resolvedDeviceId}`;
-    console.warn(message);
+    console.warn(
+      `[commandResultHandlers] filesystem_analysis result ${commandId} for unknown device ${resolvedDeviceId}; dropped`
+    );
     // A dropped scan result is silent data loss otherwise: nothing but this
-    // console line (which most deployments don't ship) ever showed it.
-    captureException(new Error(message), undefined, { commandId, resolvedDeviceId });
+    // console line (which most deployments don't ship) ever showed it. An event
+    // code, not captureException: scrubEvent redacts an exception's value and
+    // drops the unallowlisted id tags, so that report arrived contentless (#8024).
+    captureMessage('filesystem_analysis result dropped: unknown device', {
+      eventCode: 'filesystem_analysis_result_unknown_device',
+    });
     return;
   }
   await handleFilesystemAnalysisCommandResult(command, result, device.orgId);
@@ -1214,7 +1252,19 @@ export async function handleSystemCleanupRunResult(
   });
 }
 
+async function handleWakeOnLanResult({ command, result, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  const payload = command.payload as Record<string, unknown> | null;
+  const attemptId = payload?.wakeAttemptId;
+  if (typeof attemptId !== 'string' || !PG_UUID_REGEX.test(attemptId)) return;
+  const parsed = parseAgentJson(z.object({ packetsSent: z.number().int().nonnegative() }), stdout);
+  if (result.status === 'completed' && parsed === null) {
+    console.warn('[wakeAttempts] relay reported completed with unreadable output; recording send_failed', { commandId: command.id, attemptId });
+  }
+  await applyWakeRelayResult(attemptId, result.status === 'completed' && parsed !== null && parsed.packetsSent > 0);
+}
+
 export const commandResultHandlers: Record<string, CommandResultHandler> = {
+  [CommandTypes.WAKE_ON_LAN]: handleWakeOnLanResult,
   network_discovery: handleDiscoveryResult,
   backup_verify: handleBackupVerificationResult,
   backup_test_restore: handleBackupVerificationResult,
@@ -1240,6 +1290,12 @@ export const commandResultHandlers: Record<string, CommandResultHandler> = {
   quarantine_file: handleSensitiveDataResult,
   cis_benchmark: handleCisResult,
   apply_cis_remediation: handleCisResult,
+  // #10376: security results over the websocket (REST calls the same leaf inline).
+  security_collect_status: handleSecurityResult,
+  security_scan: handleSecurityResult,
+  security_threat_quarantine: handleSecurityResult,
+  security_threat_remove: handleSecurityResult,
+  security_threat_restore: handleSecurityResult,
   peripheral_policy_sync_v2: handlePeripheralPolicyV2Result,
   pam_apply_v2: handlePamActuationV2Result,
   pam_cleanup_v2: handlePamActuationV2Result,
@@ -1247,4 +1303,18 @@ export const commandResultHandlers: Record<string, CommandResultHandler> = {
   system_cleanup_run: handleSystemCleanupRunResult,
   filesystem_analysis: handleFilesystemAnalysisResult,
   file_delete: handleFileDeleteResult,
+  caller_verify: handleCallerVerifyResult,
+  // #8742 W02: endpoint-message deliveries follow their notify_user result.
+  notify_user: handleNotifyUserResult,
+  retract_message: handleRetractMessageResult,
+  // #8743 W03: endpoint live chat. chat_close carries no state to record.
+  chat_open: handleChatOpenResult,
+  chat_message: handleChatMessageResult,
+  // #9662: the incident action (and, on success, the incident) follows the
+  // agent's containment result.
+  execute_containment: handleExecuteContainmentResult,
+  release_containment: async args => {
+    const { handleReleaseContainmentResult } = await import('./networkIsolation/finalizer');
+    return handleReleaseContainmentResult(args);
+  },
 };

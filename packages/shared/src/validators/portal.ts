@@ -1,10 +1,10 @@
 import { z } from 'zod';
 
-// Admin-writable subset of portal_branding (feature toggles + support contact,
-// plus customCss as of #5952). Visual branding (logo, colors) and
-// customDomain/domainVerified are deliberately NOT writable here — they ship
-// with the domain-verification project. `.strict()` is the enforcement:
-// unknown keys are rejected.
+// Admin-writable subset of portal_branding: feature toggles, support contact,
+// customCss (#5952), primaryColor (#9962), logoUrl and secondaryColor (#9673).
+// faviconUrl, accentColor and customDomain/domainVerified are deliberately NOT
+// writable here — they ship with the domain-verification project. `.strict()`
+// is the enforcement: unknown keys are rejected.
 
 export const PORTAL_CUSTOM_CSS_MAX_LENGTH = 65_536;
 
@@ -14,8 +14,20 @@ export const PORTAL_CUSTOM_CSS_MAX_LENGTH = 65_536;
 // apps/api re-exports it from services/portal/portalFlags.ts. Waves 5 and 6 of
 // the portal advanced visibility feature (#7730) add enablePatchDetail and
 // enableVulnerabilityDetail.
-export const PORTAL_SENSITIVE_FLAG_KEYS = ['enableNetworkAlerts'] as const;
+// enableHourBlock (block hours W04) exposes a prepaid-hours balance.
+// enablePatchDetail (visibility W05) exposes per-host missing/pending patches.
+// enableVulnerabilityDetail (visibility W06) exposes per-host CVE findings.
+// enablePhysicalPlacement (environment visibility W1) exposes rack and room.
+export const PORTAL_SENSITIVE_FLAG_KEYS = ['enableNetworkAlerts', 'enableHourBlock', 'enablePatchDetail', 'enableVulnerabilityDetail', 'enablePhysicalPlacement'] as const;
 export type PortalSensitiveFlag = typeof PORTAL_SENSITIVE_FLAG_KEYS[number];
+
+// Portal flags that grant portal users a WRITE permission rather than a view.
+// Never set by "Enable all", and not a visibility tier, so they are listed
+// apart from both lists above. enableTrustPageEditing (Trust Center W3d) lets
+// the org's admin contacts edit part of the trust page draft; the MSP still
+// publishes.
+export const PORTAL_PERMISSION_FLAG_KEYS = ['enableTrustPageEditing'] as const;
+export type PortalPermissionFlag = typeof PORTAL_PERMISSION_FLAG_KEYS[number];
 
 // This CSS is served verbatim to end users of the customer portal (no
 // authoring-time sandbox), so a handful of legacy attack vectors are rejected
@@ -83,7 +95,10 @@ export function findUnsafePortalCssPattern(css: string): string | null {
   return null;
 }
 
-const portalCustomCssSchema = z
+// Shared by both Custom CSS write paths: the org portal settings
+// (updatePortalSettingsSchema below) and the partner's branding settings
+// (PATCH /partners/me, #9674), whose CSS reaches every child org's portal.
+export const portalCustomCssSchema = z
   .string()
   .max(PORTAL_CUSTOM_CSS_MAX_LENGTH, `Custom CSS exceeds maximum size (${PORTAL_CUSTOM_CSS_MAX_LENGTH} characters)`)
   .nullable()
@@ -98,6 +113,34 @@ const portalCustomCssSchema = z
       });
     }
   });
+
+/** #rgb / #rrggbb — the only shape an org document accent may take (#9962). */
+export const PORTAL_PRIMARY_COLOR_PATTERN = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
+
+/** Matches MAX_LOGO_BYTES in the web logo encoder and the partner Branding cap. */
+export const PORTAL_LOGO_MAX_LENGTH = 400_000;
+
+const PORTAL_LOGO_DATA_URI = /^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/;
+const PORTAL_LOGO_HTTPS_URL = /^https:\/\/[^\s"'<>\\]+$/;
+
+/**
+ * Whether a value may be stored as an org logo (#9673): an uploaded PNG data
+ * URI (the editor always encodes PNG, and PNG is the one format every renderer
+ * embeds, report PDFs included), or an https URL so a customer's browser never
+ * loads it insecurely (PDFs print the company name instead of a URL logo). The
+ * value goes unchanged into `<img src>` on the portal and customer documents, so
+ * anything else is refused at write.
+ */
+export function isPortalLogoUrl(value: string): boolean {
+  if (value.length > PORTAL_LOGO_MAX_LENGTH) return false;
+  if (PORTAL_LOGO_DATA_URI.test(value)) return true;
+  if (!PORTAL_LOGO_HTTPS_URL.test(value)) return false;
+  try {
+    return new URL(value).hostname.length > 0;
+  } catch {
+    return false;
+  }
+}
 
 export const updatePortalSettingsSchema = z.object({
   enableTickets: z.boolean().optional(),
@@ -126,10 +169,50 @@ export const updatePortalSettingsSchema = z.object({
   // Customer Portal Network Visibility (#5861): fail closed by default.
   enableNetworkVisibility: z.boolean().optional(),
   enableNetworkAlerts: z.boolean().optional(),
+  // EDR provider framework W02 (#8166): managed endpoint protection, fail closed.
+  // Strict but NOT sensitive: "Enable all" sets it.
+  enableEdrVisibility: z.boolean().optional(),
+  // Block hours W04 (#8179): fail closed, default false. NOT a visibility
+  // flag ("Enable all" never sets it).
+  enableHourBlock: z.boolean().optional(),
+  // Portal advanced visibility W05 (#7735): patch detail, fail closed. Sensitive:
+  // "Enable all" never sets it.
+  enablePatchDetail: z.boolean().optional(),
+  // Portal advanced visibility W06 (#7736): vulnerability detail, fail closed. Sensitive:
+  // "Enable all" never sets it.
+  enableVulnerabilityDetail: z.boolean().optional(),
+  // Environment visibility W1 (#8775): physical placement, fail closed. Sensitive:
+  // "Enable all" never sets it.
+  enablePhysicalPlacement: z.boolean().optional(),
+  // Trust Center W3d: a permission flag, fail closed. Org-scoped admin contacts
+  // with a portal login may edit part of the trust page draft. Never in "Enable all".
+  enableTrustPageEditing: z.boolean().optional(),
   supportEmail: z.string().email().max(255).nullable().optional(),
   supportPhone: z.string().max(50).nullable().optional(),
   welcomeMessage: z.string().max(2000).nullable().optional(),
   footerText: z.string().max(2000).nullable().optional(),
+  // #9962: the org level of the one document-accent chain — partner Branding
+  // colour → this org override (resolveDocumentBrand, partnerDocumentBrand.ts).
+  // Written by the org Branding tab; null = inherit the partner colour. It is
+  // emitted into a <style> element on customer documents, so only a strict
+  // #rgb / #rrggbb hex is accepted.
+  primaryColor: z
+    .string()
+    .regex(PORTAL_PRIMARY_COLOR_PATTERN, 'Primary color must be a hex colour such as #2563eb')
+    .nullable()
+    .optional(),
+  // #9673: the org level of the secondary colour and logo in the same chain.
+  // Null = inherit the partner's value.
+  secondaryColor: z
+    .string()
+    .regex(PORTAL_PRIMARY_COLOR_PATTERN, 'Secondary color must be a hex colour such as #0f766e')
+    .nullable()
+    .optional(),
+  logoUrl: z
+    .string()
+    .refine(isPortalLogoUrl, 'Logo must be a PNG image of at most 400 KB, or an https URL')
+    .nullable()
+    .optional(),
   // #5952: canonical write path for portal_branding.custom_css. Rejected
   // (not silently stripped) on a disallowed pattern — see
   // findUnsafePortalCssPattern above.

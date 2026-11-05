@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import BackupTab from './BackupTab';
+import BackupTab, { buildInlineSettings, inflateSettings } from './BackupTab';
 import { fetchWithAuth } from '../../../stores/auth';
 
 const saveMock = vi.fn();
@@ -539,6 +539,39 @@ describe('BackupTab', () => {
     );
   });
 
+  it('disables Save while the destination key prefix is invalid, and re-enables it once fixed (#7081)', async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (url === '/backup/configs' && method === 'GET') {
+        return makeJsonResponse({ data: [] });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(
+      <BackupTab
+        policyId="policy-1"
+        existingLink={undefined}
+        linkedPolicyId={null}
+        onLinkChanged={vi.fn()}
+      />
+    );
+
+    await screen.findByPlaceholderText(/Production S3 Backups/i);
+    const save = screen.getByRole('button', { name: /^Save$/i });
+    expect(save).not.toBeDisabled();
+
+    const prefixInput = screen.getByPlaceholderText('backups/breeze/');
+    fireEvent.change(prefixInput, { target: { value: 'a//b' } });
+    expect(screen.getByText('Invalid key prefix: it must not contain empty, "." or ".." segments.')).toBeTruthy();
+    expect(screen.getByRole('button', { name: /^Save$/i })).toBeDisabled();
+
+    fireEvent.change(prefixInput, { target: { value: 'msp/acme' } });
+    expect(screen.queryByText(/Invalid key prefix/)).toBeNull();
+    expect(screen.getByRole('button', { name: /^Save$/i })).not.toBeDisabled();
+  });
+
   it('auto-fills the region from an S3-compatible endpoint', async () => {
     fetchMock.mockImplementation(async (input, init) => {
       const url = String(input);
@@ -664,6 +697,20 @@ describe('BackupTab', () => {
     );
     expect(screen.getByText('GFS Retention')).toBeTruthy();
     expect(screen.getByText('Backup Window')).toBeTruthy();
+  });
+
+  it('keeps runMissedBackupsOnConnect through a save of the form (#11013)', () => {
+    const inflated = inflateSettings({
+      schedule: { frequency: 'daily', time: '05:00', runMissedBackupsOnConnect: false },
+    });
+
+    expect(buildInlineSettings(inflated, 'file', {}).schedule).toMatchObject({ runMissedBackupsOnConnect: false });
+  });
+
+  it('adds no runMissedBackupsOnConnect to a policy that never set it (#11013)', () => {
+    const inflated = inflateSettings({ schedule: { frequency: 'daily', time: '05:00' } });
+
+    expect(buildInlineSettings(inflated, 'file', {}).schedule).not.toHaveProperty('runMissedBackupsOnConnect');
   });
 
   it('auto-opens the advanced disclosure when saved settings use it', async () => {

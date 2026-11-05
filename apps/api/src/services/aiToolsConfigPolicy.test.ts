@@ -72,6 +72,13 @@ vi.mock('../db', () => ({
   },
 }));
 
+const { ruleSetGateMock } = vi.hoisted(() => ({
+  ruleSetGateMock: vi.fn(async (): Promise<unknown> => ({ ok: true })),
+}));
+vi.mock('../routes/configurationPolicies/securityRuleSetGate', () => ({
+  checkSecurityRuleSetsWrite: ruleSetGateMock,
+}));
+
 vi.mock('../db/schema', () => ({
   configurationPolicies: {
     id: 'configurationPolicies.id',
@@ -131,6 +138,7 @@ import {
   registerConfigPolicyTools,
   MAINTENANCE_LINK_MACHINE_PRINCIPAL_DENIED,
   MAINTENANCE_LINK_FEATURE_TYPE_REQUIRED,
+  CONTAINMENT_LINK_FEATURE_TYPE_REQUIRED,
 } from './aiToolsConfigPolicy';
 import {
   addFeatureLink,
@@ -142,6 +150,7 @@ import {
 } from './configurationPolicy';
 import { onedriveHelperInlineSettingsSchema } from '@breeze/shared/validators';
 import { GENERIC_TOOL_ERROR_MESSAGE } from './aiToolErrors';
+import { AI_AUTO_INSTALL_REFUSAL_MESSAGE } from './aiToolsSoftwarePolicyAudit';
 import { MFA_GATED_TOOL_ACTIONS, isMfaGatedToolAction, isToolWhollyMfaGated, mfaGatedActionsForTool } from './aiToolMfaGate';
 
 const ORG_ID = '11111111-1111-1111-1111-111111111111';
@@ -295,9 +304,11 @@ describe('configuration policy AI/MCP mutation MFA boundary', () => {
   // #8340: MFA_GATED_TOOL_ACTIONS is the list the MCP catalog advertises from.
   // These two pin that it is also exactly what the handlers enforce, so the
   // catalog cannot drift from the gate again.
-  it('every MFA_GATED_TOOL_ACTIONS entry names a real tool and real actions', () => {
+  it('every config-policy MFA_GATED_TOOL_ACTIONS entry names a real tool and real actions', () => {
+    // Repo-wide (every gated tool against the full registry): aiToolSchemas.securityPolicy.test.ts.
     const registered = tools();
-    for (const [toolName, gated] of Object.entries(MFA_GATED_TOOL_ACTIONS)) {
+    const configPolicyTools = ['manage_configuration_policy', 'apply_configuration_policy', 'remove_configuration_policy_assignment', 'manage_policy_feature_link'];
+    for (const [toolName, gated] of Object.entries(MFA_GATED_TOOL_ACTIONS).filter(([name]) => configPolicyTools.includes(name))) {
       const tool = registered.get(toolName);
       expect(tool, toolName).toBeDefined();
       if (gated === '*') continue;
@@ -322,7 +333,9 @@ describe('configuration policy AI/MCP mutation MFA boundary', () => {
   });
 
   it.each(
-    Object.keys(MFA_GATED_TOOL_ACTIONS).flatMap((toolName) => {
+    // The config-policy tools this suite registers; other modules' gated tools (e.g. the W11 security policy tools,
+    // #6781) carry their own MFA refusal tests next to their handlers.
+    Object.keys(MFA_GATED_TOOL_ACTIONS).filter((toolName) => tools().has(toolName)).flatMap((toolName) => {
       const definition = tools().get(toolName)!.definition;
       const actionEnum: string[] | undefined = definition.input_schema.properties.action?.enum;
       return (actionEnum ?? [undefined]).map((action) => [toolName, action] as const);
@@ -722,6 +735,49 @@ describe('configuration policy AI tools', () => {
     expect(added.error).toContain('needs a human');
     expect(added.error).not.toBe(GENERIC_TOOL_ERROR_MESSAGE);
     expect(updated.error).toContain('needs a human');
+  });
+
+  // #8188: policy-level app rules / auto-approval are retired. A patch link
+  // write that still carries them succeeds; the service strips the keys.
+  it('accepts a patch link add and update that still carry the retired approval keys', async () => {
+    vi.mocked(getConfigPolicy).mockResolvedValue({
+      id: POLICY_ID,
+      orgId: ORG_ID,
+      partnerId: null,
+      name: 'Org policy',
+    } as any);
+    vi.mocked(addFeatureLink).mockResolvedValueOnce({ id: 'link-1', featureType: 'patch' } as any);
+    vi.mocked(updateFeatureLink).mockResolvedValueOnce({ id: 'link-1', featureType: 'patch' } as any);
+    mockSelectRows([{ featureType: 'patch' }]);
+
+    const tools = new Map<string, any>();
+    registerConfigPolicyTools(tools);
+    const stale = {
+      sources: ['os'],
+      autoApprove: true,
+      autoApproveSeverities: ['critical'],
+      apps: [{ source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' }],
+    };
+
+    const added = JSON.parse(await tools.get('manage_policy_feature_link')!.handler({
+      action: 'add',
+      configPolicyId: POLICY_ID,
+      featureType: 'patch',
+      inlineSettings: stale,
+    }, makeAuth()));
+    const updated = JSON.parse(await tools.get('manage_policy_feature_link')!.handler({
+      action: 'update',
+      configPolicyId: POLICY_ID,
+      featureLinkId: 'link-1',
+      inlineSettings: stale,
+    }, makeAuth()));
+
+    for (const res of [added, updated]) {
+      expect(res.error).toBeUndefined();
+      expect(res.success).toBe(true);
+    }
+    expect(addFeatureLink).toHaveBeenCalledTimes(1);
+    expect(updateFeatureLink).toHaveBeenCalledTimes(1);
   });
 
   // #1724 regression: partner-OWNED policies (org_id NULL) were invisible to the
@@ -1469,6 +1525,70 @@ describe('manage_policy_feature_link maintenance inlineSettings validation (#631
     expect(vi.mocked(addFeatureLink)).not.toHaveBeenCalled();
   });
 
+  it.each(['add', 'update'])('containment %s validates inline settings before mutation', async action => {
+    const tools = toolsWithPolicy();
+    if (action === 'update') mockSelectRows([{ featureType: 'containment' }]);
+    vi.mocked(addFeatureLink).mockResolvedValue({ id: 'link-1', featureType: 'containment' } as any);
+    vi.mocked(updateFeatureLink).mockResolvedValue({ id: 'link-1', featureType: 'containment' } as any);
+    const output = await tools.get('manage_policy_feature_link')!.handler({
+      action, configPolicyId: POLICY_ID, featureLinkId: 'link-1', featureType: 'containment',
+      inlineSettings: { version: 1, defaultTtlHours: 0 },
+    }, makeAuth());
+    expect(JSON.parse(output).error).toMatch(/defaultTtlHours/);
+    expect(addFeatureLink).not.toHaveBeenCalled();
+    expect(updateFeatureLink).not.toHaveBeenCalled();
+  });
+
+  it.each(['add', 'update'])('containment %s refuses a standalone reference', async action => {
+    const tools = toolsWithPolicy();
+    if (action === 'update') mockSelectRows([{ featureType: 'containment' }]);
+    vi.mocked(addFeatureLink).mockResolvedValue({ id: 'link-1', featureType: 'containment' } as any);
+    vi.mocked(updateFeatureLink).mockResolvedValue({ id: 'link-1', featureType: 'containment' } as any);
+    const output = await tools.get('manage_policy_feature_link')!.handler({
+      action, configPolicyId: POLICY_ID, featureLinkId: 'link-1', featureType: 'containment',
+      featurePolicyId: POLICY_ID, inlineSettings: { version: 1 },
+    }, makeAuth());
+    expect(JSON.parse(output).error).toMatch(/featurePolicyId/);
+    expect(addFeatureLink).not.toHaveBeenCalled();
+    expect(updateFeatureLink).not.toHaveBeenCalled();
+  });
+
+  it('anti-bypass (#10100): a containment update WITHOUT featureType is refused so the tier-3 escalation cannot be skipped', async () => {
+    const tools = toolsWithPolicy();
+    mockSelectRows([{ featureType: 'containment' }]);
+    const output = await tools.get('manage_policy_feature_link')!.handler({
+      action: 'update', configPolicyId: POLICY_ID, featureLinkId: 'link-1',
+      inlineSettings: { version: 1, extraAllow: [{ cidr: '198.51.100.0/24', proto: 'tcp', ports: [443], label: 'x' }] },
+    }, makeUserAuth());
+    expect(JSON.parse(output).error).toBe(CONTAINMENT_LINK_FEATURE_TYPE_REQUIRED);
+    expect(vi.mocked(updateFeatureLink)).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, null])('containment add with inlineSettings %s returns a field-level version error', async inlineSettings => {
+    const tools = toolsWithPolicy();
+    vi.mocked(addFeatureLink).mockResolvedValue({ id: 'link-1', featureType: 'containment' } as any);
+    const output = await tools.get('manage_policy_feature_link')!.handler({
+      action: 'add', configPolicyId: POLICY_ID, featureType: 'containment', inlineSettings,
+    }, makeAuth());
+    expect(JSON.parse(output).error).toMatch(/containment/i);
+    expect(addFeatureLink).not.toHaveBeenCalled();
+  });
+
+  it('system_protection (#4754): returns a field-level error for an unknown key, not the generic tool error', async () => {
+    vi.mocked(addFeatureLink).mockResolvedValue({ id: 'link-1', featureType: 'system_protection' } as any);
+
+    const output = await toolsWithPolicy().get('manage_policy_feature_link')!.handler({
+      action: 'add',
+      configPolicyId: POLICY_ID,
+      featureType: 'system_protection',
+      inlineSettings: { beforeScripts: true, onFailure: 'abort' },
+    }, makeAuth());
+
+    const parsed = JSON.parse(output);
+    expect(parsed.error).toMatch(/onFailure|unrecognized/i);
+    expect(vi.mocked(addFeatureLink)).not.toHaveBeenCalled();
+  });
+
   it('refuses a negative durationHours on update', async () => {
     const tools = toolsWithPolicy();
     mockSelectRows([{ featureType: 'maintenance' }]);
@@ -1576,6 +1696,63 @@ describe('manage_policy_feature_link security auto-quarantine warning', () => {
     }, makeAuth());
 
     expect(JSON.parse(output)).not.toHaveProperty('warning');
+  });
+});
+
+// #6263 W03: the AI tool writes `security` links too, so it must run the same
+// ruleSetIds gate as the HTTP route (tenancy review finding on #9156).
+describe('manage_policy_feature_link security ruleSetIds gate', () => {
+  const SET = 'aaaaaaaa-0000-4000-8000-00000000000a';
+  const REFUSAL = { ok: false, status: 400, body: { error: 'nope', code: 'YARA_RULE_SET_NOT_ATTACHABLE', ruleSetIds: [SET] } };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(db.select).mockReset();
+    vi.mocked(getConfigPolicy).mockReset();
+    vi.mocked(addFeatureLink).mockReset();
+    vi.mocked(updateFeatureLink).mockReset();
+    canManagePartnerWidePoliciesMock.mockReset().mockReturnValue(true);
+    policyAccessConditionMock.mockReset().mockReturnValue(undefined);
+    ruleSetGateMock.mockReset().mockResolvedValue({ ok: true });
+    enable2faState.value = true;
+  });
+
+  function toolsWithPolicy(owner: { orgId: string | null; partnerId: string | null } = { orgId: ORG_ID, partnerId: null }) {
+    vi.mocked(getConfigPolicy).mockResolvedValue({ id: POLICY_ID, ...owner, name: 'Policy' } as any);
+    const tools = new Map<string, any>();
+    registerConfigPolicyTools(tools);
+    return tools;
+  }
+
+  it('add: a refused list is an error and nothing is written; the gate sees the policy owner', async () => {
+    ruleSetGateMock.mockResolvedValue(REFUSAL);
+    const output = await toolsWithPolicy().get('manage_policy_feature_link')!.handler({
+      action: 'add', configPolicyId: POLICY_ID, featureType: 'security',
+      inlineSettings: { autoQuarantine: false, ruleSetIds: [SET] },
+    }, makeAuth());
+    expect(JSON.parse(output)).toMatchObject({ error: 'nope', code: 'YARA_RULE_SET_NOT_ATTACHABLE' });
+    expect(ruleSetGateMock).toHaveBeenCalledWith({ orgId: ORG_ID, partnerId: null }, expect.objectContaining({ ruleSetIds: [SET] }));
+    expect(addFeatureLink).not.toHaveBeenCalled();
+  });
+
+  it('update: a refused list is an error and nothing is written', async () => {
+    const tools = toolsWithPolicy();
+    mockSelectRows([{ featureType: 'security' }]);
+    ruleSetGateMock.mockResolvedValue(REFUSAL);
+    const output = await tools.get('manage_policy_feature_link')!.handler({
+      action: 'update', configPolicyId: POLICY_ID, featureLinkId: 'link-1',
+      inlineSettings: { autoQuarantine: false, ruleSetIds: [SET] },
+    }, makeAuth());
+    expect(JSON.parse(output).error).toBe('nope');
+    expect(updateFeatureLink).not.toHaveBeenCalled();
+  });
+
+  it('a non-security link never consults the gate', async () => {
+    vi.mocked(addFeatureLink).mockResolvedValue({ id: 'link-1', featureType: 'patch' } as any);
+    await toolsWithPolicy().get('manage_policy_feature_link')!.handler({
+      action: 'add', configPolicyId: POLICY_ID, featureType: 'patch', inlineSettings: {},
+    }, makeAuth());
+    expect(ruleSetGateMock).not.toHaveBeenCalled();
   });
 });
 
@@ -1774,5 +1951,99 @@ describe('manage_configuration_policy owner-org authority (#6667, #6668)', () =>
 
     expect(JSON.parse(output).success).toBe(true);
     expect(vi.mocked(updateConfigPolicy)).toHaveBeenCalledWith(POLICY_ID, { name: 'Renamed' }, expect.any(Object));
+  });
+});
+
+// ============================================================
+// manage_policy_feature_link — security_agents (#6960 W01)
+// ============================================================
+
+describe('manage_policy_feature_link security_agents (#6960)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(db.select).mockReset();
+    vi.mocked(getConfigPolicy).mockReset();
+    vi.mocked(addFeatureLink).mockReset();
+    vi.mocked(updateFeatureLink).mockReset();
+    canManagePartnerWidePoliciesMock.mockReset().mockReturnValue(true);
+    policyAccessConditionMock.mockReset().mockReturnValue(undefined);
+    enable2faState.value = true;
+  });
+
+  function toolsWithPolicy() {
+    vi.mocked(getConfigPolicy).mockResolvedValue({ id: POLICY_ID, orgId: ORG_ID, partnerId: null, name: 'Org policy' } as any);
+    const tools = new Map<string, any>();
+    registerConfigPolicyTools(tools);
+    return tools;
+  }
+
+  const DISABLED = { version: 1, agents: [{ vendor: 'huntress', enabled: false }] };
+  const ENABLED = { version: 1, agents: [{ vendor: 'huntress', enabled: true }] };
+
+  async function add(args: Record<string, unknown>) {
+    return JSON.parse(await toolsWithPolicy().get('manage_policy_feature_link')!.handler({
+      action: 'add', configPolicyId: POLICY_ID, featureType: 'security_agents', ...args,
+    }, makeAuth()));
+  }
+
+  it('refuses enabled:true with the AI auto-install refusal — an assistant never arms installs', async () => {
+    const out = await add({ inlineSettings: ENABLED });
+    expect(out.error).toBe(AI_AUTO_INSTALL_REFUSAL_MESSAGE);
+    expect(vi.mocked(addFeatureLink)).not.toHaveBeenCalled();
+  });
+
+  it.each(['controld', 'nextdns'])('refuses enabled:true for the DNS vendor %s too (#6960 W05: AI callers never arm installs, whatever the registry says)', async (vendor) => {
+    const out = await add({ inlineSettings: { version: 1, agents: [{ vendor, enabled: true }] } });
+    expect(out.error).toBe(AI_AUTO_INSTALL_REFUSAL_MESSAGE);
+    expect(vi.mocked(addFeatureLink)).not.toHaveBeenCalled();
+  });
+
+  it('refuses a featurePolicyId', async () => {
+    const out = await add({ featurePolicyId: '44444444-4444-4444-4444-444444444444', inlineSettings: DISABLED });
+    expect(out.error).toMatch(/featurePolicyId/);
+    expect(vi.mocked(addFeatureLink)).not.toHaveBeenCalled();
+  });
+
+  it('refuses an unknown key with a field-level error and does not echo the value', async () => {
+    const out = await add({ inlineSettings: { ...DISABLED, apiKey: '<acct-key>' } });
+    expect(out.error).toMatch(/apiKey|unrecognized/i);
+    expect(JSON.stringify(out)).not.toContain('<acct-key>');
+    expect(vi.mocked(addFeatureLink)).not.toHaveBeenCalled();
+  });
+
+  it('saves a disabled-only link without claiming arming authority', async () => {
+    vi.mocked(addFeatureLink).mockResolvedValue({ id: 'link-1', featureType: 'security_agents' } as any);
+    const out = await add({ inlineSettings: DISABLED });
+    expect(out.success).toBe(true);
+    const call = vi.mocked(addFeatureLink).mock.calls[0]!;
+    expect(call.slice(0, 4)).toEqual([POLICY_ID, 'security_agents', null, DISABLED]);
+    // No options argument → securityAgentsArmAuthorized is absent (false).
+    expect((call[6] as { securityAgentsArmAuthorized?: boolean } | undefined)?.securityAgentsArmAuthorized).not.toBe(true);
+  });
+
+  it('maps a service-backstop refusal to a readable result, not the generic tool error', async () => {
+    const { SecurityAgentsLinkWriteError } = await import('./securityAgents/securityAgentsLinkWrite');
+    vi.mocked(addFeatureLink).mockRejectedValue(new SecurityAgentsLinkWriteError({
+      status: 400,
+      body: { error: 'Security agent huntress cannot be enabled yet.', code: 'vendor_not_enableable', vendors: ['huntress'] },
+    }));
+    const out = await add({ inlineSettings: DISABLED });
+    expect(out).toEqual({ error: 'Security agent huntress cannot be enabled yet.', code: 'vendor_not_enableable' });
+  });
+
+  it('update: refuses enabled:true and a featurePolicyId on an existing security_agents link', async () => {
+    const tools = toolsWithPolicy();
+    mockSelectRows([{ featureType: 'security_agents' }]);
+    const armed = JSON.parse(await tools.get('manage_policy_feature_link')!.handler({
+      action: 'update', configPolicyId: POLICY_ID, featureLinkId: 'link-1', inlineSettings: ENABLED,
+    }, makeAuth()));
+    expect(armed.error).toBe(AI_AUTO_INSTALL_REFUSAL_MESSAGE);
+
+    mockSelectRows([{ featureType: 'security_agents' }]);
+    const linked = JSON.parse(await tools.get('manage_policy_feature_link')!.handler({
+      action: 'update', configPolicyId: POLICY_ID, featureLinkId: 'link-1', featurePolicyId: '44444444-4444-4444-4444-444444444444',
+    }, makeAuth()));
+    expect(linked.error).toMatch(/featurePolicyId/);
+    expect(vi.mocked(updateFeatureLink)).not.toHaveBeenCalled();
   });
 });

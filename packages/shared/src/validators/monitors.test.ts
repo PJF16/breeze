@@ -34,6 +34,7 @@ describe('monitor definition validators (#5289)', () => {
       'composite',
       'hardware_health',
       'time_sync',
+      'container_image_currency',
     ]);
   });
 
@@ -104,6 +105,43 @@ describe('monitor definition validators (#5289)', () => {
     const r = updateMonitorDefinitionSchema.safeParse({ ownerScope: 'partner', name: 'renamed' });
     expect(r.success).toBe(true);
     expect(r.success && 'ownerScope' in r.data).toBe(false);
+  });
+
+  it('update leaves an omitted key omitted, so a partial PATCH cannot reset stored config', () => {
+    expect(updateMonitorDefinitionSchema.parse({ description: 'x' })).toStrictEqual({ description: 'x' });
+    expect(updateMonitorDefinitionSchema.parse({})).toStrictEqual({});
+    expect(updateMonitorDefinitionSchema.parse({ enabled: false })).toStrictEqual({ enabled: false });
+  });
+
+  it('create still fills its defaults', () => {
+    const data = createMonitorDefinitionSchema.parse({
+      name: 'x',
+      kind: 'offline',
+      severity: 'high',
+      condition: { durationMinutes: 15 },
+    });
+    expect(data).toMatchObject({
+      ownerScope: 'organization',
+      enabled: true,
+      responses: [],
+      deliveryMode: 'inherit',
+      deliveryChannelIds: [],
+      recurrenceActions: [],
+      pauseResponsesOnEscalation: true,
+    });
+  });
+
+  // The service re-checks the merged definition, and only it can see the stored
+  // channels this PATCH keeps.
+  it('update accepts deliveryMode channels when deliveryChannelIds is omitted', () => {
+    expect(updateMonitorDefinitionSchema.parse({ deliveryMode: 'channels' })).toStrictEqual({
+      deliveryMode: 'channels',
+    });
+  });
+
+  it('update still rejects deliveryMode channels with an explicitly empty channel list', () => {
+    const r = updateMonitorDefinitionSchema.safeParse({ deliveryMode: 'channels', deliveryChannelIds: [] });
+    expect(r.success).toBe(false);
   });
 
   it('inline settings carry attachment items', () => {
@@ -381,5 +419,54 @@ describe('network_check condition (W05e widening)', () => {
       ...base, degradedIsFailure: false, pollingIntervalSeconds: 60,
       timeoutSeconds: 5, consecutiveFailures: 2,
     });
+  });
+});
+
+describe('monitor lifecycle overrides (alert re-arm W2, #10765)', () => {
+  const base = { name: 'x', kind: 'offline', severity: 'high', condition: { durationMinutes: 15 } } as const;
+
+  it('create without cooldownMinutes or autoResolve inherits: no default fills them', () => {
+    const data = createMonitorDefinitionSchema.parse(base);
+    expect(data.cooldownMinutes).toBeUndefined();
+    expect(data.autoResolve).toBeUndefined();
+    expect(data.rearmMode).toBeUndefined();
+    expect(data.rearmDelayMinutes).toBeUndefined();
+  });
+
+  it('accepts null as an explicit inherit, and real values including 0 and false', () => {
+    expect(createMonitorDefinitionSchema.parse({ ...base, cooldownMinutes: null, autoResolve: null }))
+      .toMatchObject({ cooldownMinutes: null, autoResolve: null });
+    expect(createMonitorDefinitionSchema.parse({ ...base, cooldownMinutes: 0, autoResolve: false }))
+      .toMatchObject({ cooldownMinutes: 0, autoResolve: false });
+  });
+
+  it('update omitting cooldownMinutes leaves it omitted, and null is kept to mean inherit', () => {
+    expect(updateMonitorDefinitionSchema.parse({ description: 'x' })).toStrictEqual({ description: 'x' });
+    expect(updateMonitorDefinitionSchema.parse({ cooldownMinutes: null, autoResolve: null }))
+      .toStrictEqual({ cooldownMinutes: null, autoResolve: null });
+  });
+
+  it('bounds cooldownMinutes to 0–1440', () => {
+    expect(updateMonitorDefinitionSchema.safeParse({ cooldownMinutes: 1441 }).success).toBe(false);
+    expect(updateMonitorDefinitionSchema.safeParse({ cooldownMinutes: -1 }).success).toBe(false);
+  });
+
+  it('after_delay requires minutes on create and update', () => {
+    const create = createMonitorDefinitionSchema.safeParse({ ...base, rearmMode: 'after_delay' });
+    expect(create.success).toBe(false);
+    expect(create.error?.issues[0]?.path).toEqual(['rearmDelayMinutes']);
+    expect(updateMonitorDefinitionSchema.safeParse({ rearmMode: 'after_delay' }).success).toBe(false);
+    expect(updateMonitorDefinitionSchema.safeParse({ rearmMode: 'after_delay', rearmDelayMinutes: 30 }).success).toBe(true);
+  });
+
+  it('rejects minutes on any other mode, and out-of-range minutes', () => {
+    expect(createMonitorDefinitionSchema.safeParse({ ...base, rearmMode: 'new_evidence', rearmDelayMinutes: 30 }).success).toBe(false);
+    expect(updateMonitorDefinitionSchema.safeParse({ rearmMode: null, rearmDelayMinutes: 30 }).success).toBe(false);
+    expect(updateMonitorDefinitionSchema.safeParse({ rearmMode: 'after_delay', rearmDelayMinutes: 0 }).success).toBe(false);
+    expect(updateMonitorDefinitionSchema.safeParse({ rearmMode: 'after_delay', rearmDelayMinutes: 1441 }).success).toBe(false);
+  });
+
+  it('leaves a delay-only patch to the service, which checks the merged row', () => {
+    expect(updateMonitorDefinitionSchema.safeParse({ rearmDelayMinutes: 45 }).success).toBe(true);
   });
 });

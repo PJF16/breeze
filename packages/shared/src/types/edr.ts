@@ -35,8 +35,23 @@ export const EDR_ACTIONS = [
   'isolate', 'unisolate', 'scan', 'update_agent', 'kill_process', 'rollback',
   'resolve_detection', 'mark_false_positive', 'quarantine_restore', 'quarantine_delete',
 ] as const;
+/** Actions aimed at an endpoint (W03). With EDR_DETECTION_ACTIONS this partitions EDR_ACTIONS. */
+export const EDR_ENDPOINT_ACTIONS = ['isolate', 'unisolate', 'scan', 'update_agent', 'kill_process'] as const;
+/** Actions aimed at one detection / quarantine item (W03). */
+export const EDR_DETECTION_ACTIONS = [
+  'rollback', 'resolve_detection', 'mark_false_positive', 'quarantine_restore', 'quarantine_delete',
+] as const;
 
-export type EdrSeverity = (typeof EDR_SEVERITIES)[number];
+/**
+ * Why the last installer-material fetch for a tenant failed. Stored in
+ * `edr_tenants.installer_fetch_error` and shown on the mapping table: a closed
+ * vocabulary so vendor text can never reach that exported column.
+ */
+export const EDR_INSTALLER_FETCH_ERROR_CODES = [
+  'packages_api_disabled', 'no_package', 'multiple_packages', 'malformed_response', 'url_rejected', 'vendor_error',
+] as const;
+
+export type EdrSeverity =(typeof EDR_SEVERITIES)[number];
 export type EdrDetectionStatus = (typeof EDR_DETECTION_STATUSES)[number];
 export type EdrOpenDetectionStatus = (typeof EDR_OPEN_DETECTION_STATUSES)[number];
 export type EdrEndpointHealth = (typeof EDR_ENDPOINT_HEALTH)[number];
@@ -47,7 +62,136 @@ export type EdrMappingSource = (typeof EDR_MAPPING_SOURCES)[number];
 export type EdrDeviceMatchSource = (typeof EDR_DEVICE_MATCH_SOURCES)[number];
 export type EdrConnectionStatus = (typeof EDR_CONNECTION_STATUSES)[number];
 export type EdrSyncStatus = (typeof EDR_SYNC_STATUSES)[number];
+export type EdrInstallerFetchErrorCode = (typeof EDR_INSTALLER_FETCH_ERROR_CODES)[number];
 export type EdrActionStatus = (typeof EDR_ACTION_STATUSES)[number];
 export type EdrActionRequestedVia = (typeof EDR_ACTION_REQUESTED_VIA)[number];
 export type EdrVendorKind = (typeof EDR_VENDOR_KINDS)[number];
 export type EdrActionKey = (typeof EDR_ACTIONS)[number];
+export type EdrEndpointActionKey = (typeof EDR_ENDPOINT_ACTIONS)[number];
+export type EdrDetectionActionKey = (typeof EDR_DETECTION_ACTIONS)[number];
+
+/**
+ * Whether one action can be taken on one endpoint right now, and why not
+ * (W03). Computed without a vendor call from the connection, tenant and
+ * endpoint rows; the vendor stays authoritative at dispatch.
+ */
+export interface EdrEndpointActionAvailability {
+  action: EdrActionKey;
+  available: boolean;
+  reason: string | null;
+  /**
+   * Set (true) only when the action would be allowed but the session has not
+   * passed MFA, so the UI can prompt for verification instead of a dead button.
+   */
+  mfaRequired?: boolean;
+}
+
+/**
+ * One `edr_actions` ledger row as routes, AI tools and the web UI see it (W03).
+ * The jsonb `payload` is never part of it. `outcomeUnknown` = the request may
+ * have reached the vendor but no answer came back; the reconciler settles it
+ * and nothing re-sends.
+ */
+export interface EdrActionDto {
+  id: string;
+  orgId: string;
+  provider: string;
+  action: EdrActionKey;
+  status: EdrActionStatus;
+  requestedVia: EdrActionRequestedVia;
+  requestedBy: string | null;
+  aiSessionId: string | null;
+  approvalId: string | null;
+  endpointId: string | null;
+  detectionId: string | null;
+  breezeDeviceId: string | null;
+  error: string | null;
+  outcomeUnknown: boolean;
+  requestedAt: string;
+  submittedAt: string | null;
+  completedAt: string | null;
+}
+
+/**
+ * One EDR-framework detection as the read routes, AI tools and web UI see it
+ * (#8166 W02). Vendor jsonb (`details`) and raw payloads are never part of it.
+ * `title`/`threatName`/`filePath`/`processName` are vendor-supplied
+ * (attacker-influenced) text: AI output fences them as raw text.
+ */
+export interface EdrDetectionDto {
+  id: string;
+  /** Omitted for organization-scope callers: they cannot read connections. */
+  connectionId?: string;
+  orgId: string;
+  provider: string;
+  providerLabel: string;
+  vendorDetectionId: string;
+  vendorKind: EdrVendorKind;
+  severity: EdrSeverity;
+  status: EdrDetectionStatus;
+  title: string | null;
+  category: string | null;
+  threatName: string | null;
+  filePath: string | null;
+  processName: string | null;
+  mitreTechniques: string[];
+  detectedAt: string | null;
+  resolvedAt: string | null;
+  endpointId: string | null;
+  breezeDeviceId: string | null;
+  deviceName: string | null;
+  /** The device link was cleared by an org move / device delete (D14). */
+  detached: boolean;
+  promotedIncidentId: string | null;
+}
+
+/**
+ * Coverage disclosure carried by every EDR read (D6): an empty detection list
+ * with `partial: true` is NOT evidence of "no threats". `notes` are
+ * Breeze-generated sentences only, never vendor-supplied text.
+ */
+export interface EdrCoverage {
+  orgsWithEdr: number;
+  partial: boolean;
+  notes: string[];
+}
+
+export interface EdrStatusProviderSummary {
+  provider: string;
+  label: string;
+  /** Partner/system scope only (org tokens cannot read connections/tenants under RLS). */
+  connectionId?: string;
+  connectionStatus?: EdrConnectionStatus;
+  tenantsMapped?: number;
+  tenantsUnmapped?: number;
+  tenantsStale?: number;
+  tenantsFailed?: number;
+  /** Mapped tenants that have never completed a detection sync. */
+  tenantsPending?: number;
+  endpoints: number;
+  linkedEndpoints: number;
+  unhealthyEndpoints: number;
+  openDetections: number;
+  lastDetectionSyncAt: string | null;
+}
+
+/**
+ * A legacy per-vendor integration (Huntress, SentinelOne) that covers part of
+ * the scope outside the EDR provider framework (#10394). Its alerts are read
+ * with that integration's own tools, not the provider detection list.
+ */
+export interface EdrStatusIntegrationSummary {
+  integration: 'huntress' | 'sentinelone';
+  label: string;
+  /** Organizations in the caller's scope with at least one agent from this integration. */
+  orgs: number;
+  agents: number;
+}
+
+export interface EdrStatusSummary {
+  /** EDR provider-framework connections only (the web "Other EDR" tab keys off these). */
+  providers: EdrStatusProviderSummary[];
+  /** Legacy integrations covering the scope. Absent from servers before #10394. */
+  integrations?: EdrStatusIntegrationSummary[];
+  coverage: EdrCoverage;
+}

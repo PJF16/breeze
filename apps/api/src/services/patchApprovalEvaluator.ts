@@ -21,7 +21,7 @@
  */
 
 import type { PatchIneligibleReason } from '@breeze/shared';
-import { canonicalAppRuleKey, policyAppRuleSchema } from '@breeze/shared/validators';
+import { canonicalAppRuleKey, policyAppRuleSchema, type RingFeatureUpdates } from '@breeze/shared/validators';
 import { captureException } from './sentry';
 
 // ============================================
@@ -40,18 +40,6 @@ export interface CategoryRule {
   deferralDaysOverride?: number | null;
 }
 
-/**
- * Policy-level auto-approve (ring-less path). Empty severities while enabled =
- * approve none (fail-closed). The ring auto-approve path is now fail-closed the
- * same way (see evaluatePatchApproval Priority 3), so the two paths share the
- * "enabled but no severities means approve nothing" invariant.
- */
-export interface PolicyAutoApproveConfig {
-  enabled: boolean;
-  severities: string[];
-  deferralDays: number;
-}
-
 export type PolicyAppRule =
   | { source: string; packageId: string; action: 'block' }
   | { source: string; packageId: string; action: 'pin'; pinnedVersion: string };
@@ -59,16 +47,18 @@ export type PolicyAppRule =
 export type AppRuleVerdict = 'allowed' | 'blocked' | 'held';
 
 /**
- * Evaluator input. Carries both ring-level config and policy-level config:
- * sources, app rules, and ring-less auto-approve.
+ * Evaluator input. Carries the ring-level config plus the policy's patch
+ * sources. Auto-approval and per-app rules are ring-owned (#8188).
  */
 export interface ApprovalEvaluationConfig {
   ringId: string | null;
   /**
    * The partner that owns the ring referenced by ringId. Used to guard against
    * a config policy that links a ring from another partner (featurePolicyId is
-   * an unconstrained uuid). If ringPartnerId !== device-org's partner, the ring
-   * is ignored (treated as ringId = null).
+   * an unconstrained uuid). If ringPartnerId !== device-org's partner, the
+   * reference is invalid and fails closed: every candidate is denied with
+   * 'ring_reference_invalid' (#8186). Never fall back to "no ring", or a manual
+   * approval could install an app the ring blocks.
    */
   ringPartnerId?: string | null;
   categoryRules: CategoryRule[];
@@ -87,15 +77,11 @@ export interface ApprovalEvaluationConfig {
   /** Policy-level source selections ('os', 'third_party', ...). Absent/empty = no filtering (legacy). */
   sources?: string[];
   /**
-   * Policy-level auto-approve. Still snapshotted and threaded, but NOT
-   * consulted by `decidePatchApproval`: with a ring the ring decides, and with
-   * no ring only manual approvals apply (see the evaluator test "ring-less
-   * path: only manual approvals apply"). The device Config tab labels it as
-   * unused for that reason (#7625).
-   */
-  policyAutoApprove?: PolicyAutoApproveConfig;
-  /**
-   * Policy-level per-app block/pin rules. Applied to every job approval path;
+   * Legacy per-app block/pin rules, read only from frozen job snapshots: jobs
+   * created before the #8186 cutover carry the policy's rules here, and
+   * W02/W03 snapshots mirrored the ring rules here for older executors. New
+   * snapshots stop writing it (#8188), but the executor keeps parsing it so
+   * an in-flight job keeps its rules. Applied to every job approval path;
    * manual per-device installs do not pass through this evaluator.
    */
   apps?: PolicyAppRule[];
@@ -106,6 +92,18 @@ export interface ApprovalEvaluationConfig {
    * "overrides a manual approval" semantics.
    */
   ringAppRules?: PolicyAppRule[];
+  /**
+   * The ring's Windows feature-release policy (`patch_policies.feature_updates`):
+   * block | allow | pin. Absent = block (the pre-control behaviour, and what a
+   * legacy job snapshot means). See patchEligibility's feature-update gate.
+   */
+  featureUpdates?: RingFeatureUpdates;
+  /**
+   * The policy links a ring reference that does not resolve (#8186). The
+   * evaluator then denies every outstanding candidate with
+   * 'ring_reference_invalid', manual approvals included.
+   */
+  ringReferenceInvalid?: boolean;
 }
 
 /** @deprecated Use ApprovalEvaluationConfig — kept for existing importers. */
@@ -114,6 +112,8 @@ export type RingConfig = ApprovalEvaluationConfig;
 // 'ring_auto_approve' is the #1317 ring-owned auto-approval reason (enabled +
 // severities + deferral). The historical 'legacy_auto_approve' name is kept as
 // an alias so already-stored job rows / callers reading this string still work.
+// 'policy_auto_approve' is never produced (policy-level auto-approve is retired,
+// #8188) and is kept only so historical rows carrying it still type-check.
 export type ApprovalReason =
   | 'manual'
   | 'category_rule'
@@ -292,11 +292,92 @@ export function comparePatchVersions(
   return 0;
 }
 
+/** dpkg's character weight: '~' below everything (end of string included), letters below other symbols. */
+function linuxVersionCharOrder(c: string | undefined): number {
+  if (c === undefined || (c >= '0' && c <= '9')) return 0;
+  if (/[A-Za-z]/.test(c)) return c.charCodeAt(0);
+  if (c === '~') return -1;
+  return c.charCodeAt(0) + 256;
+}
+
+function isAsciiDigit(c: string | undefined): boolean {
+  return c !== undefined && c >= '0' && c <= '9';
+}
+
+/** dpkg `verrevcmp`: alternating non-digit runs (by weight) and digit runs (numerically). */
+function compareLinuxVersionPart(a: string, b: string): number {
+  let i = 0;
+  let j = 0;
+  while (i < a.length || j < b.length) {
+    while ((i < a.length && !isAsciiDigit(a[i])) || (j < b.length && !isAsciiDigit(b[j]))) {
+      const ac = linuxVersionCharOrder(a[i]);
+      const bc = linuxVersionCharOrder(b[j]);
+      if (ac !== bc) return ac - bc;
+      i++;
+      j++;
+    }
+    while (a[i] === '0') i++;
+    while (b[j] === '0') j++;
+    let firstDiff = 0;
+    while (isAsciiDigit(a[i]) && isAsciiDigit(b[j])) {
+      if (firstDiff === 0) firstDiff = a.charCodeAt(i) - b.charCodeAt(j);
+      i++;
+      j++;
+    }
+    if (isAsciiDigit(a[i])) return 1;
+    if (isAsciiDigit(b[j])) return -1;
+    if (firstDiff !== 0) return firstDiff;
+  }
+  return 0;
+}
+
+function splitLinuxVersion(v: string): { epoch: number; upstream: string; revision: string } | null {
+  const colon = v.indexOf(':');
+  let epoch = 0;
+  let rest = v;
+  if (colon >= 0) {
+    const epochText = v.slice(0, colon);
+    if (!/^\d+$/.test(epochText)) return null;
+    epoch = parseInt(epochText, 10);
+    rest = v.slice(colon + 1);
+  }
+  const dash = rest.lastIndexOf('-');
+  return dash >= 0
+    ? { epoch, upstream: rest.slice(0, dash), revision: rest.slice(dash + 1) }
+    : { epoch, upstream: rest, revision: '' };
+}
+
+/**
+ * Version ordering for Linux package pins (#9370), following dpkg:
+ * `[epoch:]upstream[-revision]` — epoch first, then upstream, then revision;
+ * digit runs compare numerically and '~' sorts before everything (so
+ * `1.0~rc1` < `1.0`). RPM `version-release` strings from dnf order the same
+ * way for the usual forms. The tolerant comparator above is wrong here: it
+ * reads `5:10` < `5:9` by codepoint, which would let a pinned package
+ * upgrade past its pin.
+ *
+ * Returns null when either side is blank or the epoch is not numeric;
+ * callers treat null as "cannot prove within pin" (hold).
+ */
+export function compareLinuxPackageVersions(
+  a: string | null | undefined,
+  b: string | null | undefined
+): -1 | 0 | 1 | null {
+  const av = splitLinuxVersion((a ?? '').trim());
+  const bv = splitLinuxVersion((b ?? '').trim());
+  if (!av || !bv || !av.upstream || !bv.upstream) return null;
+  const cmp = av.epoch !== bv.epoch
+    ? av.epoch - bv.epoch
+    : compareLinuxVersionPart(av.upstream, bv.upstream) || compareLinuxVersionPart(av.revision, bv.revision);
+  return cmp === 0 ? 0 : cmp < 0 ? -1 : 1;
+}
+
 /**
  * Canonical lookup key for app rules. The UI presents 'third_party' and
  * 'custom' patch sources as one bucket (manual UI entries hardcode
- * 'third_party'), so both collapse to a canonical 'third_party' key; other
- * sources keep their own key. Delegates to the shared implementation so the
+ * 'third_party'), so both collapse to a canonical 'third_party' key; Linux
+ * keys drop the `apt:`/`yum:` provider prefix (#9370); other sources keep
+ * their own key. Delegates to the shared implementation so the
  * ring app-rule validator's uniqueness check uses the same identity.
  */
 export function appRuleKey(source: string, packageId: string): string {
@@ -331,7 +412,9 @@ export function evaluateAppRule(
   if (!rule) return 'allowed';
   if (rule.action === 'block') return 'blocked';
 
-  const cmp = comparePatchVersions(patch.version, rule.pinnedVersion);
+  const cmp = patch.source === 'linux'
+    ? compareLinuxPackageVersions(patch.version, rule.pinnedVersion)
+    : comparePatchVersions(patch.version, rule.pinnedVersion);
   if (cmp === null) return 'held';
   return cmp > 0 ? 'held' : 'allowed';
 }
@@ -436,7 +519,7 @@ export type PatchApprovalDecision =
    * is held until it can.
    */
   | { denied: 'held_by_deferral'; holdUntil: Date | null }
-  | { denied: Exclude<PatchIneligibleReason, 'not_outstanding' | 'superseded' | 'blocked_by_source' | 'blocked_by_category' | 'blocked_by_app_rule' | 'device_not_in_org' | 'held_by_deferral'> };
+  | { denied: Exclude<PatchIneligibleReason, 'not_outstanding' | 'superseded' | 'blocked_by_source' | 'blocked_by_category' | 'blocked_by_app_rule' | 'blocked_by_feature_update_policy' | 'device_not_in_org' | 'held_by_deferral' | 'ring_reference_invalid' | 'unsupported_user_scope'> };
 
 export function evaluatePatchApproval(
   patch: PatchCandidate,
@@ -456,9 +539,17 @@ export function decidePatchApproval(
   manualApprovalSet: Set<string>,
   categoryRuleMap: Map<string, CategoryRule>,
   ringAutoApprove: RingAutoApproveConfig,
-  now: Date
+  now: Date,
+  declinedSet: Set<string> = new Set()
 ): PatchApprovalDecision {
   const MANUAL: PatchApprovalDecision = { denied: 'awaiting_manual_approval' };
+
+  // Priority 0: an explicit decline is terminal (#9369) — no category rule or
+  // ring auto-approve may re-approve it. The caller resolves decline vs. a
+  // later re-approval into the two sets, so a patch is in at most one.
+  if (declinedSet.has(patch.patchId)) {
+    return { denied: 'explicitly_declined' };
+  }
 
   // Priority 1: Manual approval
   if (manualApprovalSet.has(patch.patchId)) {

@@ -202,7 +202,7 @@ Without an MDM, grant the permissions on the device under **System Settings > Pr
 
 2. **Accessibility** -- open **Privacy & Security > Accessibility** and add the same two binaries.
 
-3. **Screen Recording** -- open **Privacy & Security > Screen & System Audio Recording** (labeled **Screen Recording** on macOS 12-14) and enable `breeze-desktop-helper`. If the helper has already attempted a capture, it appears in the list automatically; otherwise the first remote desktop connection triggers the standard macOS approval prompt.
+3. **Screen Recording** -- open **Privacy & Security > Screen & System Audio Recording** (labeled **Screen Recording** on macOS 12-14) and enable `breeze-desktop-helper`. The helper never captures the screen to check this permission, so it may not appear in the list until you add it with **+** (`/usr/local/bin/breeze-desktop-helper`). On macOS 12-15 the helper asks macOS for the grant once a day while it is missing, and a remote desktop connection is refused (with a `missing_permission` reason in the console) until it is granted; on macOS 26 the first connection is allowed and its own capture decides.
 
 </Steps>
 
@@ -244,11 +244,24 @@ Expect `Authority=Developer ID Application: LanternOps LLC (D8W6N2JYMA)` and `Te
 **The PPPC profile is installed but permissions are not granted.**
 Confirm the profile arrived through MDM (`profiles list` should show it under a device channel). PPPC payloads are ignored when the profile is installed manually. Also verify the code requirement matches the installed binary, at whichever path it runs from: `codesign -d -r- /usr/local/bin/breeze-agent` (or the `/Library/Breeze/bin` path) prints the designated requirement to compare against.
 
+**System Settings shows Screen Recording or Accessibility on, but Breeze reports it missing.**
+macOS honours a grant only while the binary still matches the code requirement recorded with it. If `breeze-desktop-helper` on disk was replaced by a build with a different signature (an ad-hoc or unsigned copy, or a locally built helper), or the grant was written by the permission self-heal in agent 0.105.2 and earlier (which recorded no code requirement), System Settings keeps showing the toggle on while macOS refuses the helper, with no prompt. When the helper sees a denial it explains it: the `desktop helper startup probe` line in the device's agent logs carries `tccVerdict` plus the helper's signing identity, its designated requirement, and, for each denied permission, the TCC row and the requirement stored in it. The agent's `TCC permissions received` line carries the same verdict as `denialVerdict`.
+
+| Verdict | Meaning | Fix |
+|---|---|---|
+| `requirement_mismatch` | The grant was made to a differently signed build | Reinstall the official signed release; the existing grant applies again. If the verdict stays, reset and grant again as in the next row |
+| `legacy_row_no_csreq` | The grant has no code requirement (old self-heal) | `sudo tccutil reset ScreenCapture` and `sudo tccutil reset Accessibility`, then grant again |
+| `not_granted` | No grant for this path, or it is off | Grant it in System Settings |
+| `unexplained` | The grant matches this binary; the cause is elsewhere | Collect the log line and contact support |
+| `unobservable` | The helper could not read the TCC database (it needs Full Disk Access) | Grant Full Disk Access to the helper, or check its signing identity in the same log line |
+
 **Remote desktop connects but shows a black screen.**
 Screen Recording has not been approved for `breeze-desktop-helper`. This permission always requires a one-time user approval -- see the table above.
 
 **macOS keeps asking to let `breeze-desktop-helper` record the screen (macOS 15+).**
-On macOS 15 and later, ScreenCaptureKit can show its own "record this computer's screen and audio" approval, and for the bare helper binary macOS may not keep that approval. The desktop helper's permission checks never use ScreenCaptureKit; only a remote desktop session does. If ScreenCaptureKit cannot capture in a session (the user declines its prompt, or it produces no frames) while Screen Recording is granted, the helper switches to CoreGraphics capture and records that, so later sessions and helper restarts don't ask again. The record lapses when the agent updates, macOS updates, or the Screen Recording grant changes. Run these as the logged-in user, without `sudo`:
+On macOS 15 and later, ScreenCaptureKit can show its own "record this computer's screen and audio" approval, and for the bare helper binary macOS may not keep that approval. macOS 15 also shows a separate acknowledgement alert ("`breeze-desktop-helper` can record this computer's screen") for the first screen capture in each 30-day window, by any API. The desktop helper's permission checks (at startup, on every connect, and in its periodic TCC loop) never capture the screen and never use ScreenCaptureKit; only a remote desktop session captures, so that alert can appear only while a technician is connecting. A helper restart on its own shows nothing.
+
+Where macOS reports the Screen Recording grant unreliably (macOS 26 can say "not granted" while it is), the helper reads other non-capturing signals instead: whether other apps' window titles are visible to it, and whether an earlier remote desktop session captured successfully on this agent version and macOS build. The agent log's `TCC permissions received` line carries `screenRecordingState` (`granted`, `denied` or `unknown`); `unknown` still allows a session, whose own capture decides. If ScreenCaptureKit cannot capture in a session (the user declines its prompt, or it produces no frames) while Screen Recording is granted, the helper switches to CoreGraphics capture and records that, so later sessions and helper restarts don't ask again. The record lapses when the agent updates, macOS updates, or the Screen Recording grant changes. Run these as the logged-in user, without `sudo`:
 
 ```bash
 breeze-desktop-helper capture-backend                    # show the recorded verdict
@@ -258,7 +271,7 @@ breeze-desktop-helper capture-backend reset              # forget it; the next s
 
 From a root shell, such as a Breeze remote terminal, use `launchctl asuser <uid> sudo -u '#<uid>' /usr/local/bin/breeze-desktop-helper capture-backend ...`.
 
-`breeze-desktop-helper probe` doesn't call ScreenCaptureKit unless you pass `--sck`. macOS charges a probe's capture to whatever launched it: Terminal, or `breeze-agent` from a Breeze script or remote terminal. The launchd helper's grants are separate, so the probe can't show them. For the helper's real permission state, look for the `TCC permissions received` line in the device's agent logs.
+`breeze-desktop-helper probe` reports the non-capturing check as `captureAccess` and then takes one real capture (it is the only permission check that does); it doesn't call ScreenCaptureKit unless you pass `--sck`. macOS charges a probe's capture to whatever launched it: Terminal, or `breeze-agent` from a Breeze script or remote terminal. The launchd helper's grants are separate, so the probe can't show them. For the helper's real permission state, look for the `TCC permissions received` line in the device's agent logs.
 
 **Remote desktop is unavailable even though the device shows Online.**
 The desktop helper runs alongside the agent and can briefly lose its connection to it — after an agent update, or when the Mac sleeps and wakes. The helper now reconnects on its own when that happens, so this should clear within moments. Earlier agent versions left the helper stopped until it was relaunched or the user logged out and back in; if you are seeing that, update the agent.

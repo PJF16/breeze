@@ -105,12 +105,7 @@ func TestAppSearchRunsBeforeLaunchConditionsInBothSequences(t *testing.T) {
 // /grant:r alone never touches ownership.
 func TestHardenProgramDataAclSetsExplicitOwner(t *testing.T) {
 	wxs := readWxs(t)
-	re := regexp.MustCompile(`(?s)<CustomAction\s+Id="HardenProgramDataAcl"[^>]*ExeCommand="([^"]*)"`)
-	m := re.FindStringSubmatch(wxs)
-	if m == nil {
-		t.Fatal("expected a HardenProgramDataAcl CustomAction with an ExeCommand")
-	}
-	cmd := m[1]
+	cmd := quietExecCmd(t, wxs, "HardenProgramDataAcl")
 	// One /setowner per hardened directory (root, data, logs), each ahead of
 	// that directory's /inheritance:r /grant:r in the && chain, so a
 	// pre-created directory's owner is fixed before its DACL is trusted.
@@ -294,25 +289,6 @@ func TestKillBreezeProcessesRunsWithoutConsoleWindow(t *testing.T) {
 	}
 }
 
-// No immediate custom action may launch an EXE: it would run on the
-// installing user's desktop and show a console window (#3624). Deferred and
-// rollback EXE CAs with Impersonate="no" run as LocalSystem in session 0 and
-// are invisible.
-func TestNoImmediateExeCustomActions(t *testing.T) {
-	wxs := readWxs(t)
-	elRe := regexp.MustCompile(`(?s)<CustomAction\s+Id="([^"]+)"(.*?)/>`)
-	for _, m := range elRe.FindAllStringSubmatch(wxs, -1) {
-		ca := customActionAttrs(wxs, m[1])
-		if _, isExe := ca["ExeCommand"]; !isExe {
-			continue
-		}
-		exec := ca["Execute"]
-		if exec == "" || exec == "immediate" || exec == "firstSequence" || exec == "oncePerProcess" || exec == "secondSequence" {
-			t.Errorf("custom action %s is an immediate EXE CA (Execute=%q); it will flash a console window. Use WixQuietExec or make it deferred with Impersonate=\"no\"", m[1], exec)
-		}
-	}
-}
-
 // The Util extension supplies the WixQuietExec CA DLL (Wix4UtilCA_*). Every
 // MSI build (this repo's release.yml, the hosted and self-host signing repos)
 // goes through build-msi.ps1, so that script must load the extension or the
@@ -340,12 +316,7 @@ func TestBuildScriptLoadsUtilExtension(t *testing.T) {
 // re-created under a root the user still controls.
 func TestHardenProgramDataAclReplacesPreexistingLinks(t *testing.T) {
 	wxs := readWxs(t)
-	re := regexp.MustCompile(`(?s)<CustomAction\s+Id="HardenProgramDataAcl"[^>]*ExeCommand="([^"]*)"`)
-	m := re.FindStringSubmatch(wxs)
-	if m == nil {
-		t.Fatal("expected a HardenProgramDataAcl CustomAction with an ExeCommand")
-	}
-	cmd := m[1]
+	cmd := quietExecCmd(t, wxs, "HardenProgramDataAcl")
 	q := func(tok string) string { return "&quot;" + tok + ".&quot;" }
 
 	prevGrant := -1
@@ -386,7 +357,7 @@ func TestRecoveryActionsAlsoCoverNonCrashFailures(t *testing.T) {
 		if ca == nil {
 			t.Fatalf("no <CustomAction Id=%q>", id)
 		}
-		cmd := ca["ExeCommand"]
+		cmd := quietExecCmd(t, wxs, id)
 		for _, svc := range []string{"BreezeAgent", "BreezeWatchdog"} {
 			if !strings.Contains(cmd, "sc failure "+svc+" reset= 86400 actions= restart/") {
 				t.Errorf("%s does not arm %s's restart actions: %s", id, svc, cmd)
@@ -395,5 +366,35 @@ func TestRecoveryActionsAlsoCoverNonCrashFailures(t *testing.T) {
 				t.Errorf("%s arms %s's restart actions without `sc failureflag %s 1`", id, svc, svc)
 			}
 		}
+	}
+}
+
+func TestIsolationReleaseOnUninstall(t *testing.T) {
+	wxs := readWxs(t)
+	const id = "IsolationReleaseOnUninstall"
+	// A never-isolated device has no isolation journal (the agent writes one
+	// only once an episode or recovery exists), so uninstall proceeds without
+	// running the agent at all; this also covers a binary raw-swapped to a
+	// build that predates release-all. When a journal (or a set-aside corrupt
+	// one) exists, release-all must succeed: a crashing, blocked or outdated
+	// binary fails the uninstall instead of removing the agent while
+	// Breeze-owned filters may remain.
+	const want = "&quot;[System64Folder]cmd.exe&quot; /c (if not exist &quot;[ProgramDataBreezeDataDir]isolation.json&quot; if not exist &quot;[ProgramDataBreezeDataDir]isolation.json.corrupt&quot; exit /b 0) &amp; &quot;[#filBreezeAgentExe]&quot; containment release-all --reason uninstall"
+	if got := quietExecCmd(t, wxs, id); got != want {
+		t.Fatalf("release command = %q\nwant            %q", got, want)
+	}
+	attrs := customActionAttrs(wxs, id)
+	for key, want := range map[string]string{"DllEntry": "WixQuietExec", "Execute": "deferred", "Impersonate": "no", "Return": "check"} {
+		if attrs[key] != want {
+			t.Errorf("%s = %q, want %q", key, attrs[key], want)
+		}
+	}
+	if !regexp.MustCompile(`<Custom\s+Action="IsolationReleaseOnUninstall"\s+Before="RemoveFiles"\s+Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"\s*/>`).MatchString(wxs) {
+		t.Error("release must run before RemoveFiles only on full uninstall, never nested upgrade removal")
+	}
+	// The server must not be told "uninstalled" by a run whose release then
+	// fails and rolls the uninstall back.
+	if !regexp.MustCompile(`<Custom\s+Action="UninstallNotify"\s+After="IsolationReleaseOnUninstall"\s+Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"\s*/>`).MatchString(wxs) {
+		t.Error("UninstallNotify must run after IsolationReleaseOnUninstall")
 	}
 }

@@ -9,14 +9,18 @@
  * - resolve_device_context (Tier 2): Mark context entry as resolved
  * - manage_tags (Tier 2): List/add/remove device tags
  * - query_custom_fields (Tier 1): Get custom field definitions or device values
+ * - get_fleet_device_stats (Tier 1): Exact fleet-wide device counts by status
  */
 
 import {
+  WORKLOAD_RUNTIMES,
+  WORKLOAD_STATES,
   TIME_SYNC_DOMAIN_ROLES,
   TIME_SYNC_FINDING_CODES,
   TIME_SYNC_HEALTH,
 } from '@breeze/shared';
 import { pageEnvelope, pageParamSchema, readPageArgs } from './aiToolPagination';
+import { orgNameOf, readReachSpansOrgs, splitOrgLegend } from './aiToolOrgLegend';
 import { db } from '../db';
 import {
   devices,
@@ -30,12 +34,17 @@ import {
 } from '../db/schema';
 import { eq, and, asc, desc, sql, inArray, SQL } from 'drizzle-orm';
 import { escapeLike } from '../utils/sql';
+import { sqlTextArray } from '../db/sqlValues';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
 import { verifyDeviceAccess } from './aiTools';
-import { resolveSiteAllowedDeviceIds, runFrozenDeviceIds } from './aiToolsSiteScope';
+import { requestDeviceGroupReevaluationAfterCommit } from '../jobs/deviceGroupJobs';
+import { resolveSiteAllowedDeviceIds, runFrozenDeviceIds, siteScopeCondition, deviceScopeCondition } from './aiToolsSiteScope';
+import { queryDeviceStats } from './deviceStats';
 import { getDeviceHardwareHealthView } from './hardwareHealth/view';
 import { getDeviceTimeStatusView } from './timeSync/view';
+import { getDeviceWorkloadsView } from './workloads/view';
+import { projectWorkloadsForAi } from './workloads/aiProjection';
 import { fleetTimeFiltersSchema, listFleetTimeStatus } from './timeSync/fleet';
 import { getDeviceReliability, getDeviceReliabilityOffenders } from './reliabilityScoring';
 import { projectPublicDevice } from '../routes/devices/helpers';
@@ -167,12 +176,16 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
           siteId: { type: 'string', description: 'Filter by site UUID' },
           search: { type: 'string', description: 'Search by hostname or display name (partial match)' },
           tags: { type: 'array', items: { type: 'string' }, description: 'Filter by tags (devices must have all specified tags)' },
-          ...pageParamSchema(25, 100),
+          // Default 20 (was 25): the 25-row budget-fixture page (DEVICE_ROW in
+          // aiToolsDevice.outputShape.test.ts) sat within ~100 chars of
+          // MAX_TOOL_RESULT_CHARS, leaving no room for the org fields a
+          // multi-org caller gets (#10408).
+          ...pageParamSchema(20, 100),
         }
       }
     },
     handler: async (input, auth) => {
-      const page = readPageArgs('query_devices', input, { defaultLimit: 25, maxLimit: 100 });
+      const page = readPageArgs('query_devices', input, { defaultLimit: 20, maxLimit: 100 });
       if (!page.ok) return JSON.stringify({ error: page.error, code: page.code });
       const { limit, offset, fingerprint } = page;
 
@@ -198,6 +211,12 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
           sql`(${devices.hostname} ILIKE ${searchPattern} OR ${devices.displayName} ILIKE ${searchPattern})`
         );
       }
+      // `tags` is documented as "devices must have ALL specified tags" → array
+      // containment (@>), not overlap (&&). (#9122)
+      if (Array.isArray(input.tags)) {
+        const tagFilter = input.tags.filter((t): t is string => typeof t === 'string' && t.length > 0);
+        if (tagFilter.length > 0) conditions.push(sql`${devices.tags} @> ${sqlTextArray(tagFilter)}`);
+      }
 
       // Site axis (app-layer only; RLS does NOT enforce it): a site-restricted
       // caller may only enumerate devices in their allowed sites. The optional
@@ -217,6 +236,9 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
       const frozenDeviceIds = runFrozenDeviceIds(auth);
       if (frozenDeviceIds) conditions.push(inArray(devices.id, frozenDeviceIds));
 
+      // #10408: a caller reaching several orgs gets each row's org, or it mixes
+      // customers (wrong-org narration, cross-org proposals the write path refuses).
+      const spansOrgs = readReachSpansOrgs(auth);
       const results = await db
         .select({
           id: devices.id,
@@ -228,7 +250,8 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
           agentVersion: devices.agentVersion,
           lastSeenAt: devices.lastSeenAt,
           tags: devices.tags,
-          siteName: sites.name
+          siteName: sites.name,
+          ...(spansOrgs ? { orgId: devices.orgId, orgName: orgNameOf(devices.orgId) } : {}),
         })
         .from(devices)
         .leftJoin(sites, eq(devices.siteId, sites.id))
@@ -250,7 +273,14 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
 
       const total = Number(countResult[0]?.count ?? 0);
 
-      return JSON.stringify(pageEnvelope({ key: 'devices', items: results, limit, offset, fingerprint, total }));
+      if (!spansOrgs) {
+        return JSON.stringify(pageEnvelope({ key: 'devices', items: results, limit, offset, fingerprint, total }));
+      }
+      const legend = splitOrgLegend(results as Array<(typeof results)[number] & { orgId: string; orgName: string | null }>);
+      return JSON.stringify({
+        ...pageEnvelope({ key: 'devices', items: legend.rows, limit, offset, fingerprint, total }),
+        organizations: legend.organizations,
+      });
     }
   });
 
@@ -295,7 +325,7 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
           .where(eq(deviceMemoryModules.deviceId, deviceId))
           .orderBy(asc(deviceMemoryModules.slotIndex), asc(deviceMemoryModules.id)),
         // #8134: room / rack / rack unit / height U, or null when not recorded.
-        readPlacement('device', deviceId),
+        readPlacement('device', deviceId, device.orgId),
       ]);
 
       // Get site name
@@ -358,6 +388,40 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
       JSON.stringify(
         await listFleetTimeStatus(fleetTimeFiltersSchema.parse(input), auth),
       ),
+  });
+
+  // get_fleet_device_stats - Tier 1 (auto-execute). #6797
+  registerTool({
+    tier: 1,
+    domain: 'devices',
+    searchHint: 'how many devices, device count, online offline totals, fleet size, devices by status',
+    definition: {
+      name: 'get_fleet_device_stats',
+      description:
+        'Exact live fleet device counts: total, online, offline, byStatus, migrationRequiredCount, logShippingFailingCount. Use for "how many devices" instead of paging query_devices. Excludes decommissioned, parked and Quick Support devices. Optional orgId narrows to one org.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          orgId: { type: 'string', format: 'uuid', description: 'Narrow to one organization' },
+        },
+      },
+    },
+    handler: async (input, auth) => {
+      const orgId = typeof input.orgId === 'string' ? input.orgId : undefined;
+      // Same tenant narrowing as GET /devices/stats (routes/devices/scope.ts):
+      // org axis + optional orgId (denied when inaccessible), plus the site and
+      // exact-device axes that only the AI surface carries.
+      if (orgId && !auth.canAccessOrg(orgId)) {
+        return JSON.stringify({ error: 'Access to this organization denied' });
+      }
+      const scope = and(
+        auth.orgCondition(devices.orgId),
+        siteScopeCondition(auth, devices.siteId),
+        deviceScopeCondition(auth, devices.id),
+        orgId ? eq(devices.orgId, orgId) : undefined,
+      );
+      return JSON.stringify(await queryDeviceStats(scope));
+    },
   });
 
   // get_device_hardware_health - Tier 1 (auto-execute)
@@ -445,6 +509,44 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
       const access = await verifyDeviceAccess(deviceId, auth);
       if ('error' in access) return JSON.stringify({ error: access.error });
       return JSON.stringify(await getDeviceTimeStatusView(deviceId));
+    },
+  });
+
+  // query_device_workloads - Tier 1 (auto-execute, read-only)
+  registerTool({
+    tier: 1,
+    domain: 'devices',
+    deviceArgs: ['deviceId'],
+    searchHint:
+      'containers, virtual machines, Docker, Podman, Hyper-V, Proxmox, workload inventory, compose projects',
+    definition: {
+      name: 'query_device_workloads',
+      description:
+        'List containers and VMs (Docker, Podman, Hyper-V, Proxmox) on a device with per-runtime status and counts; workloads are capped (see truncated). containerd is detect-only (no counts). Collection is off by default until a configuration policy enables "Workload inventory".',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'The device UUID' },
+          runtime: { type: 'string', enum: [...WORKLOAD_RUNTIMES], description: 'Only workloads of this runtime' },
+          state: { type: 'string', enum: [...WORKLOAD_STATES], description: 'Only workloads in this state' },
+          limit: { type: 'integer', minimum: 1, maximum: 200, default: 200, description: 'Max workloads returned (default 200, max 200)' },
+        },
+        required: ['deviceId'],
+      },
+    },
+    handler: async (input, auth) => {
+      const deviceId = input.deviceId as string;
+      const access = await verifyDeviceAccess(deviceId, auth);
+      if ('error' in access) return JSON.stringify({ error: access.error });
+      const view = await getDeviceWorkloadsView(deviceId);
+      if (!view) return JSON.stringify({ error: 'Device not found or access denied' });
+      return JSON.stringify(
+        projectWorkloadsForAi(deviceId, access.device?.hostname, view, {
+          runtime: input.runtime as (typeof WORKLOAD_RUNTIMES)[number] | undefined,
+          state: input.state as (typeof WORKLOAD_STATES)[number] | undefined,
+          limit: typeof input.limit === 'number' ? input.limit : undefined,
+        }),
+      );
     },
   });
 
@@ -729,16 +831,28 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
           // `${tagsInput}::text[]` is spread by Drizzle into `($1, $2)::text[]`,
           // which Postgres rejects for every list length (#8297).
           const tagsArray = sql`ARRAY[${sql.join(tagsInput.map((tag) => sql`${tag}`), sql`, `)}]::text[]`;
+          // own-device-row-allowlisted: ai-tool-device-tags
           await db.execute(
             sql`UPDATE devices SET tags = (SELECT array_agg(DISTINCT t) FROM unnest(array_cat(tags, ${tagsArray})) t), updated_at = now() WHERE id = ${deviceId}`
           );
         } else {
           for (const tag of tagsInput) {
+            // own-device-row-allowlisted: ai-tool-device-tags
             await db.execute(
               sql`UPDATE devices SET tags = array_remove(tags, ${tag}), updated_at = now() WHERE id = ${deviceId}`
             );
           }
         }
+
+        // Dynamic groups store membership; a tag rule is stale until this
+        // device is re-evaluated (#8832), same as PATCH /devices/:id.
+        requestDeviceGroupReevaluationAfterCommit({
+          deviceId,
+          orgId: access.device.orgId,
+          eventType: 'device.updated',
+          changedFields: ['tags'],
+          reason: 'ai_manage_tags',
+        });
 
         const [updated] = await db
           .select({ tags: devices.tags })

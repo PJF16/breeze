@@ -1,6 +1,9 @@
 import { and, eq, sql } from 'drizzle-orm';
 import type { db } from '../db';
 import { deviceCommands } from '../db/schema';
+import { isNetworkIsolationCommand } from './networkIsolation/bypass';
+import { isolationDeliveryRefusal } from './networkIsolation/deliveryBinding';
+import { isolationUpgradeFloorRefusal } from './networkIsolation/upgradeFloor';
 import {
   propagateCancelledDeviceCommands,
   type DeviceCommandCancelSubject,
@@ -12,10 +15,12 @@ import {
 } from './partnerTrust.commands';
 import type { PartnerTrustState } from '../db/schema/orgs';
 import { captureException } from './sentry';
+import { callerVerificationEnabled, callerVerificationWorkstationEnabled } from '../config/env';
 import { DRAIN_CLAIM_TYPE_ALLOWLIST } from './drainClaimAllowlist';
 import { PARKED_DEVICE_CANCEL_REASON } from './unassignedPool/deliveryEligibility';
 import { isUnassignedPoolOrgType } from './unassignedPool/orgType';
 import { terminalPayloadErasureSet } from './sensitiveCommandPayload';
+import { commandStampIsCurrent, SUPERSEDED_BY_REATTACH_REASON } from './commandIncarnation';
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -33,6 +38,8 @@ export type ClaimCancelReason =
   | 'submitter_org_erased'
   /** A per-type revalidation found the authority the row was issued under gone. */
   | 'scope_changed'
+  | 'isolation_episode_mismatch'
+  | 'network-isolation-version-floor'
   /** The row carries its own absolute expiry and it has passed. */
   | 'expired'
   /** A type that REQUIRES revalidation had none registered — fail closed. */
@@ -42,11 +49,19 @@ export type ClaimCancelReason =
    * removal is delivered. An org-type fact, deliberately not folded into
    * `device_lifecycle` (that one is the device's own status).
    */
-  | typeof PARKED_DEVICE_CANCEL_REASON;
+  | typeof PARKED_DEVICE_CANCEL_REASON
+  /**
+   * #8318 §4.2/§5.2: the row is stamped for an earlier install incarnation of
+   * the device. The install it was queued for is gone, so nothing of it is
+   * delivered to the install that now owns the row — removal included.
+   */
+  | typeof SUPERSEDED_BY_REATTACH_REASON;
 
 /** Why a claim candidate was withheld this heartbeat but left `pending`. */
 export type ClaimHoldReason =
   | 'held_maintenance_suppression'
+  /** A feature-gated type whose feature is currently dark; recoverable when re-enabled. */
+  | 'held_feature_disabled'
   | 'power_state_barrier'
   | 'eligibility_check_failed';
 
@@ -65,11 +80,19 @@ export type ClaimEligibilityDevice = {
    * forget to read it: a holding-org device gets lifecycle removal only.
    */
   orgType: string;
+  /**
+   * `devices.install_incarnation` (#8318). Required for the same reason as
+   * `orgType`: a claim path that forgot to read it could deliver an earlier
+   * install's work.
+   */
+  installIncarnation: number;
 };
 
 export type ClaimCandidate = {
   id: string;
   type: string;
+  /** `device_commands.device_incarnation`; NULL counts as incarnation 1. */
+  deviceIncarnation: number | null;
   createdBy: string | null;
   submittedOrgId: string | null;
   deliverBy: Date | null;
@@ -99,7 +122,10 @@ export type ClaimPartition = {
  * schedule a restart (with its own delay and user deferral), so it does not
  * need to be serialised against other work.
  */
-export const POWER_STATE_BARRIER_TYPES: ReadonlySet<string> = new Set(['reboot', 'shutdown', 'reboot_safe_mode']);
+// `force_reboot` (#8729) is here on purpose: it force-closes apps, but it still
+// waits its turn behind real in-flight work. Mark failed (#8508) is the way past
+// a stuck command, not a barrier bypass.
+export const POWER_STATE_BARRIER_TYPES: ReadonlySet<string> = new Set(['reboot', 'shutdown', 'reboot_safe_mode', 'force_reboot']);
 
 /**
  * Types the UNINSTALL DRAIN owns. Exempt from EVERY claim-time eligibility
@@ -139,7 +165,8 @@ const DRAIN_EXEMPT_TYPES: ReadonlySet<string> = new Set(DRAIN_CLAIM_TYPE_ALLOWLI
  * `LIFECYCLE_COMMAND_TYPES` in partnerTrust.ts).
  *
  * Membership rule: a type is listed ONLY if it reduces capability and carries
- * no operator-chosen content, target, credential or binary. Nothing that
+ * no device-executed operator content, target, credential or binary. A release
+ * reason is audit text only. Nothing that
  * starts, executes, changes or reveals anything may be added (kill_process,
  * stop_service, task_disable and software_uninstall act on the customer's own
  * workload with an operator-chosen target and are deliberately NOT here).
@@ -161,6 +188,7 @@ export const TEARDOWN_CLAIM_EXEMPT_TYPES: ReadonlySet<string> = new Set([
   'backup_stop',
   'pam_cleanup_v2',
   'cancel_reboot',
+  'release_containment',
 ]);
 
 /** Device states in which ordinary queued work must never be delivered. */
@@ -254,6 +282,18 @@ export function __resetCommandRevalidationsForTests(): void {
   for (const key of Object.keys(commandRevalidations)) delete commandRevalidations[key];
 }
 
+function updatesAgentBinary(row: CommandRevalidationRow): boolean {
+  if (row.type === 'update' || row.type === 'update_agent' || row.type === 'agent_rollback_v1') return true;
+  if (row.type !== 'dev_update') return false;
+  const payload = row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload)
+    ? row.payload as Record<string, unknown> : {};
+  return typeof payload.component !== 'string' || !payload.component || payload.component === 'agent';
+}
+
+function needsIsolationRevalidation(row: CommandRevalidationRow): boolean {
+  return updatesAgentBinary(row) || isNetworkIsolationCommand(row.type, row.payload);
+}
+
 /**
  * Runs the registered revalidation for one row, fail-closed for every type in
  * {@link REVALIDATION_REQUIRED_TYPES}. Shared by both delivery legs.
@@ -262,6 +302,18 @@ export async function revalidateCommandForDelivery(
   reader: CommandRevalidationReader,
   row: CommandRevalidationRow,
 ): Promise<ClaimCancelReason | null> {
+  // Built in rather than side-effect registered: HTTP and WebSocket delivery must
+  // always re-derive the episode authority, including for legacy queued commands.
+  // Both isolate and release are bound to the row the service issued (#10919).
+  if (isNetworkIsolationCommand(row.type, row.payload)) {
+    const refusal = await isolationDeliveryRefusal(reader, row);
+    if (refusal) return refusal;
+  }
+  if (updatesAgentBinary(row)) {
+    // Judged by the binary the payload selects, not its version label (#10919).
+    const refusal = await isolationUpgradeFloorRefusal(reader, row);
+    if (refusal) return refusal;
+  }
   const revalidate = commandRevalidations[row.type];
   if (!revalidate) {
     return REVALIDATION_REQUIRED_TYPES.has(row.type) ? 'authority_unavailable' : null;
@@ -386,7 +438,18 @@ export async function partitionClaimable(
   const assertTrusted = createDeviceExecuteBatchGate(device.id, () => readOrgTrustSnapshot(tx, device.orgId));
 
   for (const row of rows) {
-    // Checked FIRST, ahead of every cancel: see DRAIN_EXEMPT_TYPES above.
+    // #8318 §4.2/§5.2 — checked before everything, the drain exemption
+    // included: a row stamped for an earlier install incarnation was queued
+    // for an install that no longer exists. The boundary cancelled every such
+    // row that was open when it ran; this catches one that slipped past it,
+    // so it is terminalised here instead of waiting for the reaper. The flip
+    // to `sent` re-checks the same thing in SQL (commandDispatch.ts).
+    if (!commandStampIsCurrent(row.deviceIncarnation, device.installIncarnation)) {
+      cancelled.push({ id: row.id, reason: SUPERSEDED_BY_REATTACH_REASON });
+      continue;
+    }
+
+    // Checked FIRST among the rest, ahead of every other cancel: see DRAIN_EXEMPT_TYPES above.
     if (DRAIN_EXEMPT_TYPES.has(row.type)) {
       claimable.push(row);
       continue;
@@ -511,7 +574,7 @@ export async function partitionClaimable(
     // another type's reads) rolls back to that savepoint instead of aborting
     // the claim transaction, so only this row is held and the rest of the
     // batch — and the cancel writes below — still run. Types with no
-    // registered revalidation touch no SQL and skip the savepoint.
+    // registered or built-in isolation revalidation touch no SQL and skip the savepoint.
     const revalidationFacts: CommandRevalidationRow = {
       id: row.id,
       type: row.type,
@@ -521,7 +584,7 @@ export async function partitionClaimable(
     };
     let revalidation: ClaimCancelReason | null;
     try {
-      revalidation = commandRevalidations[row.type]
+      revalidation = commandRevalidations[row.type] || needsIsolationRevalidation(revalidationFacts)
         ? await tx.transaction((sp) => revalidateCommandForDelivery(sp, revalidationFacts))
         : await revalidateCommandForDelivery(tx, revalidationFacts);
     } catch (e) {
@@ -546,6 +609,14 @@ export async function partitionClaimable(
     }
     if (revalidation) {
       cancelled.push({ id: row.id, reason: revalidation });
+      continue;
+    }
+
+    // Workstation prompts created before the tier went dark (or while the
+    // feature is off) are not handed to an agent: held, not cancelled, so the
+    // row stays pending and expires normally, or resumes if re-enabled.
+    if (row.type === 'caller_verify' && !(callerVerificationEnabled() && callerVerificationWorkstationEnabled())) {
+      held.push({ id: row.id, reason: 'held_feature_disabled' });
       continue;
     }
 

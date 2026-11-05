@@ -43,6 +43,42 @@
       "description": "Yerleşik monitörleri bir ilkeye ekleyin."
     }
   },
+  "lifecycle": {
+    "autoResolveOn": "Açık",
+    "autoResolveOff": "Kapalı",
+    "rearmLabel": "Yeniden etkinleştirme",
+    "rearmNewEvidence": "Yeni kanıt",
+    "rearmAfterDelay": "N dakika sonra",
+    "rearmAfterMinutes_one": "{{count}} dakika sonra",
+    "rearmAfterMinutes_other": "{{count}} dakika sonra",
+    "rearmDelayLabel": "Şu süre sonra yeniden etkinleştir (dakika)",
+    "rearmHelp": "Yeni kanıt: kapatılmış uyarıyı yalnızca onun henüz görmediği bir olay yeniden açar. N dakika sonra: kapanmasından itibaren N dakika geçtikten sonra daha eski olaylar da onu yeniden açabilir.",
+    "inheritOption": "Devral ({{value}}, {{source}})",
+    "inheritOptionPlain": "Devral",
+    "sources": {
+      "org": "Kuruluş varsayılanı",
+      "partner": "İş ortağı varsayılanı",
+      "builtin": "Yerleşik varsayılan"
+    },
+    "errors": {
+      "cooldown": "0 ile 1440 arasında bir tam sayı girin.",
+      "cooldownOrInherit": "0 ile 1440 arasında bir tam sayı girin veya devralmak için boş bırakın.",
+      "rearmDelay": "1 ile 1440 arasında tam sayı olarak dakika girin."
+    }
+  },
+  "lifecycleDefaults": {
+    "title": "Yaşam döngüsü varsayılanları",
+    "descriptionPartner": "Tüm kuruluşların monitörleri için varsayılan. Bir kuruluş bunu geçersiz kılabilir; bir monitörün kendi ayarı her ikisinden de önceliklidir.",
+    "descriptionOrg": "Bu kuruluş için iş ortağı varsayılanını geçersiz kılar. Devralmak için bir alanı boş bırakın. Bir monitörün kendi ayarı bundan önceliklidir.",
+    "readOnly": "İş ortağı varsayılanını değiştirme izniniz yok.",
+    "saved": "Yaşam döngüsü varsayılanları kaydedildi",
+    "overrideCount_one": "{{count}} monitör bunu geçersiz kılıyor",
+    "overrideCount_other": "{{count}} monitör bunu geçersiz kılıyor",
+    "errors": {
+      "load": "Yaşam döngüsü varsayılanları yüklenemedi.",
+      "save": "Yaşam döngüsü varsayılanları kaydedilemedi."
+    }
+  },
   "editor": {
     "attachedToPolicy": "Monitör oluşturuldu ve ilkeye bağlandı",
     "titleNew": "Yeni monitör",
@@ -53,11 +89,22 @@
     },
     "sections": {
       "watch": "Ne izlenecek",
-      "noise": "Önem ve gürültü",
+      "lifecycle": "Uyarı yaşam döngüsü",
       "respond": "Yanıtla",
       "notify": "Bildir",
       "escalate": "Bir kişiye yükselt",
       "deployed": "Dağıtıldığı yer"
+    },
+    "lifecycle": {
+      "overrides": {
+        "org": "Bu monitör, kuruluş varsayılanını ({{value}}) geçersiz kılıyor",
+        "partner": "Bu monitör, iş ortağı varsayılanını ({{value}}) geçersiz kılıyor",
+        "builtin": "Bu monitör, yerleşik varsayılanı ({{value}}) geçersiz kılıyor",
+        "unknown": "Bu monitör, devralınan varsayılanı geçersiz kılıyor."
+      },
+      "partnerWideHint": "Kendi varsayılanı olan bir kuruluş, burada gösterilen devralınan değer yerine onu kullanır.",
+      "inheritedUnavailable": "Devralınan değerler yüklenemedi. Yine de kaydedebilirsiniz.",
+      "windowWarning": "Olay penceresi ({{window}} dk), bekleme süresinden ({{cooldown}} dk) kısa. Bekleme süresi sırasında gelen yeni bir olay, uyarı yeniden açılmadan önce pencereden çıkabilir."
     },
     "tabs": {
       "settings": "Ayarlar",
@@ -77,7 +124,8 @@
       "recurrenceThreshold": "Şu kadar sonra yükselt",
       "recurrenceWindowDays": "olay, şu gün içinde (gün)",
       "pauseResponses": "Bir kişi sıfırlayana kadar otomatik yanıtları duraklat",
-      "aiAgent": "Yapay zeka aracısı (yapay zeka triyaj yanıtlarını etkinleştirir)"
+      "aiAgent": "Yapay zeka aracısı (yapay zeka triyaj yanıtlarını etkinleştirir)",
+      "psaBoard": "Uyarı ticket’ları için PSA panosu"
     },
     "deliveryModes": {
       "inherit": "Yönlendirme kurallarını kullan",
@@ -122,7 +170,8 @@
     "testDialog": {
       "title": "Bir cihazda test et",
       "selectDevice": "Cihaz",
-      "run": "Testi çalıştır"
+      "run": "Testi çalıştır",
+      "saveToTest": "Değişikliklerinizi test etmek için kaydedin"
     },
     "deliveryPreview": {
       "selectOrg": "Teslimatı önizlemek için bir kuruluş seçin.",
@@ -169,7 +218,11 @@
       "failed": "Varlıklar yüklenemedi",
       "orgRequired": "Varlık bağlamak için kuruluş sahipliğini seçin.",
       "pingName": "{{label}} için ping"
-    }
+    },
+    "psaBoardDefault": "Bağlantının varsayılan panosunu kullan",
+    "psaBoardHelp": "Bu monitörün uyarı ticket’ları, bağlantının varsayılan panosu yerine bu panoda oluşturulur.",
+    "psaBoardReadOnly": "Uyarı ticket’ları PSA panosu #{{id}} içine gider",
+    "psaBoardUnavailable": "PSA panoları yüklenemedi, bu nedenle pano geçersiz kılma şu anda kullanılamıyor."
   },
   "kinds": {
     "composite": "Bileşik (birkaç koşulun tümü veya herhangi biri)",
@@ -192,7 +245,8 @@
     "script": "Betik denetimi",
     "network_check": "Ağ denetimi",
     "hardware_health": "Donanım sağlığı",
-    "time_sync": "Saat eşitleme"
+    "time_sync": "Saat eşitleme",
+    "container_image_currency": "Kapsayıcı imajı güncelliği"
   },
   "fields": {
     "operator": "Karşılaştırma",
@@ -245,8 +299,8 @@
     "nameserver": "Ad sunucusu",
     "degradedIsFailure": "Bozulmuşu hata say",
     "maxResponseMs": "Şundan yavaşsa başarısız (ms)",
-    "eventLogCollectionNoSource": "Bilgi ve Uyarı düzeyindeki Uygulama olayları yalnızca {{providers}} kaynağından toplanır. Diğer kaynakların olayları bu kuralı yalnızca Hata veya Kritik düzeyinde tetikler.",
-    "eventLogCollectionSourceNotCollected": "Aracı, \"{{source}}\" kaynağından Bilgi veya Uyarı düzeyindeki Uygulama olaylarını toplamaz; bu nedenle bu kural yalnızca Hata veya Kritik olaylarıyla eşleşir. Toplanan sağlayıcılar: {{providers}}."
+    "eventLogCollectionNoSource": "Bilgi ve Uyarı düzeyindeki Uygulama olayları yalnızca {{providers}} sağlayıcılarından toplanır. Diğer kaynakların olayları, kaynak bir Olay Günlükleri yapılandırma ilkesinde listelenmedikçe yalnızca Hata veya Kritik düzeyinde bu kuralla eşleşir (Yapılandırma ilkesi → Olay Günlükleri → Uygulama sağlayıcıları).",
+    "eventLogCollectionSourceNotCollected": "Aracı, \"{{source}}\" kaynağından Bilgi veya Uyarı düzeyindeki Uygulama olaylarını, kaynak bir Olay Günlükleri yapılandırma ilkesinde listelenmedikçe toplamaz (Yapılandırma ilkesi → Olay Günlükleri → Uygulama sağlayıcıları). Aksi takdirde bu kural yalnızca kaynağın Hata veya Kritik olaylarıyla eşleşir. Yerleşik sağlayıcılar: {{providers}}."
   },
   "operators": {
     "gt": "büyüktür",
@@ -331,10 +385,13 @@
     "cancel": "İptal",
     "detachConfirm": "{{policy}} politikasından kaldırılsın mı?",
     "errors": {
+      "loadGroups": "Cihaz grupları yüklenemedi.",
       "attach": "Monitör eklenemedi",
       "detach": "Monitör kaldırılamadı",
       "linkedFeature": "Bu ilkenin monitörleri paylaşılan bir özellik ilkesinden geliyor. O ilkeyi düzenleyin veya başka bir ilke seçin."
-    }
+    },
+    "partnerWideGroups": "Tüm kuruluşlar (iş ortağı genelinde)",
+    "organizationGroups": "Kuruluş grupları"
   },
   "policyTab": {
     "title": "Monitörler",
@@ -538,11 +595,13 @@
       "more": "Daha fazla yükle",
       "empty": "Dönüştürme geçmişi yok.",
       "system": "Sistem",
+      "unknownUser": "Bilinmeyen kullanıcı",
       "reverted": "Geri alındı",
       "deadline": "Eski uyarıların emekliye ayrılması kaynak değerlendiriciyi kaldırdıktan sonra geri alma kullanılamaz."
     },
     "errorCodes": {
       "preview_stale": "İlke bu önizlemeden sonra değişti. Dönüştürmeden önce yeniden önizleyin.",
+      "conversion_contended": "Eş zamanlı değişiklikler dönüştürmeyi kesintiye uğrattı. Hiçbir şey değiştirilmedi. Tekrar deneyin.",
       "preview_failed": "Önizleme oluşturulamadı. Daha sonra yeniden deneyin.",
       "equivalence_delta": "Dönüştürülen izleyiciler her cihazda eski kurallar gibi davranmayacak. Dönüştürmeden önce önizlemeyi inceleyin.",
       "CONVERSION_PREREQUISITE_MISSING": "Gerekli bir platform güncellemesi henüz dağıtılmadığı için dönüştürme yapılamıyor.",
@@ -646,6 +705,9 @@
           "policy_not_applied": "Saat ilkesi uygulanmadı",
           "policy_conflict_gpo": "Grup İlkesi saat ayarlarını denetliyor"
         }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "En az gecikme günü"
       }
     }
   },

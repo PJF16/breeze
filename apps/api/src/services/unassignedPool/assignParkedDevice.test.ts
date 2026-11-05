@@ -2,7 +2,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const calls: string[] = [];
 const ledgerRows: any[] = [];
+const unresolvedIsolations: Array<{ isolationId: string; deviceId: string }> = [];
 const fakeTx = {
+  execute: vi.fn(async () => unresolvedIsolations),
   insert: vi.fn(() => ({
     values: (values: any) => ({
       returning: async () => {
@@ -64,6 +66,7 @@ vi.mock('../mfaStepUpGrant', async (importOriginal) => {
 vi.mock('../deviceUninstallDrain', () => ({ isDeviceUninstallDraining: vi.fn() }));
 vi.mock('../../jobs/deviceGroupJobs', () => ({ requestDeviceGroupReevaluation: vi.fn(async () => 'job') }));
 vi.mock('../agentOrgRateLimit', () => ({ invalidateOrgDeviceCount: vi.fn(async () => undefined) }));
+vi.mock('../devicePolicyCache', () => ({ invalidateDevicePolicyCaches: vi.fn(async () => undefined) }));
 vi.mock('../redis', () => ({ getRedis: vi.fn(() => ({ redis: true })) }));
 vi.mock('../../routes/agentWs', () => ({ disconnectAgent: vi.fn(() => 'disconnected') }));
 vi.mock('../deviceIdentityCollisionAlert', () => ({
@@ -72,6 +75,7 @@ vi.mock('../deviceIdentityCollisionAlert', () => ({
 vi.mock('../auditEvents', () => ({ writeAuditEvent: vi.fn() }));
 vi.mock('../../jobs/peripheralJobs', () => ({ schedulePeripheralPolicyDevice: vi.fn(async () => 'job') }));
 vi.mock('../sentry', () => ({ captureException: vi.fn() }));
+vi.mock('../ticketLinkMoveNotes', () => ({ scheduleTicketLinkRemovalNotes: vi.fn() }));
 
 import {
   assignParkedDevice,
@@ -86,6 +90,7 @@ import {
 } from '../deviceOrgMove/moveDeviceOrgInTransaction';
 import { TicketMoveCurrencyBlockedError } from '../ticketMoveCurrencyGuard';
 import { TicketMoveHourBlockError } from '../ticketMoveHourBlockGuard';
+import { TicketMoveApprovalPendingError } from '../ticketMoveApprovalGuard';
 import { PamDeviceMoveBlockedError } from '../pamDeviceMoveGuard';
 import { TicketServiceError } from '../ticketService';
 import { admitPartnerDeviceCapacity, previewPartnerDeviceCapacity } from '../partnerDeviceCapacity';
@@ -94,7 +99,9 @@ import { consumeStepUpGrant } from '../mfaStepUpGrant';
 import { isDeviceUninstallDraining } from '../deviceUninstallDrain';
 import { requestDeviceGroupReevaluation } from '../../jobs/deviceGroupJobs';
 import { captureException } from '../sentry';
+import { scheduleTicketLinkRemovalNotes } from '../ticketLinkMoveNotes';
 import { invalidateOrgDeviceCount } from '../agentOrgRateLimit';
+import { invalidateDevicePolicyCaches } from '../devicePolicyCache';
 import { disconnectAgent } from '../../routes/agentWs';
 import { raiseDeviceIdentityCollisionAlert } from '../deviceIdentityCollisionAlert';
 import { writeAuditEvent } from '../auditEvents';
@@ -165,6 +172,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   calls.length = 0;
   ledgerRows.length = 0;
+  unresolvedIsolations.length = 0;
   ctx.stack.length = 0;
   vi.mocked(steps.lockLiveUserSession).mockImplementation(async () => { calls.push('sessionLock'); return true; });
   vi.mocked(steps.lockDeviceForAssignment).mockImplementation(async (_tx, id) => {
@@ -193,6 +201,8 @@ beforeEach(() => {
       currencyGuard: null,
       alertChildRewrite: null,
       customFieldRehome: { rehomed: 0, dropped: 0 },
+      removedTicketLinks: [],
+      expiredElevationRequests: 0,
     };
   });
 });
@@ -251,9 +261,11 @@ describe('assignParkedDevice', () => {
   it('after commit: re-evaluates groups, drops both device-count caches, disconnects the agent, audits the target org', async () => {
     await single();
     expect(requestDeviceGroupReevaluation).toHaveBeenCalledWith({
-      deviceId: DEVICE, orgId: TARGET_ORG, eventType: 'device.updated', reason: 'parked_device_assigned',
+      deviceId: DEVICE, orgId: TARGET_ORG, eventType: 'device.created', reason: 'parked_device_assigned',
     });
     expect(vi.mocked(invalidateOrgDeviceCount).mock.calls.map((c) => c[1]).sort()).toEqual([HOLDING_ORG, TARGET_ORG].sort());
+    // #8257: the holding org's cached heartbeat policy config is dropped.
+    expect(invalidateDevicePolicyCaches).toHaveBeenCalledWith(DEVICE);
     expect(disconnectAgent).toHaveBeenCalledWith(`agent-${DEVICE.slice(0, 4)}`, 4040, expect.any(String));
     expect(writeAuditEvent).toHaveBeenCalledWith(request, expect.objectContaining({
       orgId: TARGET_ORG,
@@ -264,6 +276,17 @@ describe('assignParkedDevice', () => {
     }));
   });
 
+  it('after commit: schedules the ticket-link removal notes the move returned (#7900 W02)', async () => {
+    const removed = [{ orgId: HOLDING_ORG, sourceTicketId: 't1', targetTicketId: 't2', linkType: 'related' as const, sourceMoved: true, targetMoved: false }];
+    vi.mocked(moveDeviceOrgInTransaction).mockImplementationOnce(async () => ({
+      updated: { id: DEVICE, agentId: 'agent-1' } as any,
+      linkGroupDissolved: false, currencyGuard: null, alertChildRewrite: null,
+      customFieldRehome: { rehomed: 0, dropped: 0 }, removedTicketLinks: removed, expiredElevationRequests: 0,
+    }));
+    await single();
+    expect(scheduleTicketLinkRemovalNotes).toHaveBeenCalledWith(removed);
+  });
+
   it('refuses a device that is not parked, without consuming the grant', async () => {
     vi.mocked(steps.lockDeviceForAssignment).mockResolvedValueOnce(parkedDevice({ orgType: 'customer' }));
     expect(await single()).toMatchObject({ ok: false, code: 'DEVICE_NOT_PARKED' });
@@ -271,6 +294,7 @@ describe('assignParkedDevice', () => {
     expect(moveDeviceOrgInTransaction).not.toHaveBeenCalled();
     expect(writeAuditEvent).not.toHaveBeenCalled();
     expect(disconnectAgent).not.toHaveBeenCalled();
+    expect(invalidateDevicePolicyCaches).not.toHaveBeenCalled();
   });
 
   it("answers another partner's parked device, or a missing one, as not found", async () => {
@@ -385,6 +409,7 @@ describe('assignParkedDevice', () => {
     expect(await single()).toMatchObject({ ok: false, code: 'PARTNER_DEVICE_LIMIT_REACHED' });
     expect(ledgerRows).toEqual([]);
     expect(writeAuditEvent).not.toHaveBeenCalled();
+    expect(scheduleTicketLinkRemovalNotes).not.toHaveBeenCalled();
   });
 
   it('refuses when the grant cannot be consumed inside the transaction', async () => {
@@ -489,8 +514,10 @@ describe('assignParkedDevice — refusals raised by the move engine', () => {
     ['holding org gone', new OrgVanishedDuringMoveError('source'), 'DEVICE_NOT_FOUND'],
     ['currency block', new TicketMoveCurrencyBlockedError('m', {} as any), 'TICKET_MOVE_CURRENCY_BLOCKED'],
     ['block-drawn time', new TicketMoveHourBlockError({ drawnTimeEntries: 1 }), 'HOUR_BLOCK_DRAWN_TIME'],
+    ['pending customer approval', new TicketMoveApprovalPendingError({ pendingApprovalRequests: 1 }), 'APPROVAL_REQUEST_PENDING'],
     ['PAM evidence', new PamDeviceMoveBlockedError(), 'PAM_DEVICE_MOVE_BLOCKED'],
     ['PAM evidence (database guard)', pgPamViolation, 'PAM_DEVICE_MOVE_BLOCKED'],
+    ['isolation database guard', Object.assign(new Error('query failed'), { cause: { code: '55000', message: 'isolation_unresolved: release before moving' } }), 'isolation_unresolved'],
     ['a lock timeout', Object.assign(new Error('canceling statement due to lock timeout'), { cause: { code: '55P03' } }), 'ASSIGNMENT_BUSY'],
     ['a deadlock', Object.assign(new Error('deadlock detected'), { cause: { code: '40P01' } }), 'ASSIGNMENT_BUSY'],
     ['pinned ticket', new TicketServiceError('m', 409, 'DELIVERABLE_TICKET_PINNED'), 'DELIVERABLE_TICKET_PINNED'],
@@ -563,5 +590,31 @@ describe('assignParkedDevice — the signed-in session must still be live', () =
     });
     expect(out.ok && out.results.map((r) => (r.ok ? 'ok' : r.code))).toEqual(['ok', 'STEP_UP_REQUIRED']);
     expect(steps.lockLiveUserSession).toHaveBeenCalledTimes(2);
+  });
+});
+
+
+describe('network isolation assignment refusals', () => {
+  it('refuses before the move while isolation is unresolved and proceeds once resolved', async () => {
+    unresolvedIsolations.push({ isolationId: 'isolation-1', deviceId: DEVICE });
+    expect(await single()).toMatchObject({ ok: false, code: 'isolation_unresolved', message: 'Release network isolation first' });
+    expect(moveDeviceOrgInTransaction).not.toHaveBeenCalled();
+    expect(ledgerRows).toEqual([]);
+    unresolvedIsolations.length = 0;
+    expect(await single()).toMatchObject({ ok: true });
+  });
+
+  it('returns an isolation refusal per item and continues the assignment batch', async () => {
+    fakeTx.execute.mockResolvedValueOnce([]).mockResolvedValueOnce([{ isolationId: 'isolation-1', deviceId: DEVICE }]);
+    const out = await assignParkedDevicesBulk({
+      actor: { auth, partnerId: PARTNER, allowedSiteIds: undefined },
+      items: [DEVICE, DEVICE_2].map(deviceId => ({ deviceId, targetOrgId: TARGET_ORG, targetSiteId: TARGET_SITE })),
+      stepUp: null,
+      audit: request,
+    });
+    expect(out).toMatchObject({ ok: true, results: [
+      { ok: false, deviceId: DEVICE, code: 'isolation_unresolved' },
+      { ok: true, deviceId: DEVICE_2 },
+    ] });
   });
 });

@@ -1,3 +1,4 @@
+import { findPartnerOwnedGroupIds, partnerGroupTargetRefusal } from '../services/deviceGroupOwnership';
 import { Hono } from 'hono';
 import { ERROR_CODES, SUPPORTED_LOCALES, resolveTicketPushPrefs, updateTicketPushPreferencesSchema } from '@breeze/shared';
 import type { SupportedLocale } from '@breeze/shared';
@@ -58,6 +59,7 @@ import {
 import { previewMfaEnrollmentGrace, resolveMfaGraceDays } from '../services/mfaEnrollmentGrace';
 import { requestPendingEmailChange } from '../services/pendingEmail';
 import { resolveDelegatedSiteIds } from '../services/organizationMembershipDelegation';
+import { clearEmailOptOut, isOptedOut, setEmailOptOut } from '../services/emailOptouts';
 
 export const userRoutes = new Hono();
 const supportedLocales = SUPPORTED_LOCALES;
@@ -76,7 +78,8 @@ userRoutes.use('*', async (c, next) => {
   // without this exemption a 'selected'/'none' partner admin would be 403'd on
   // GET/PATCH /me, the top-bar avatar (GET /:id/avatar runs its own scope check
   // in the handler), and (W07, #3901) their own ticket push preferences, which
-  // is the field technician this feature exists for.
+  // is the field technician this feature exists for. /me/email-preferences
+  // (connection health W3, #8847) is the same shape: subject auth.user.id, .strict() body.
   //
   // A route may be added here ONLY if its subject is derived from auth.user.id
   // and never from a path param or request body. The /me/ticket-push-preferences
@@ -86,7 +89,7 @@ userRoutes.use('*', async (c, next) => {
   // including ones whose subject is not auth.user.id. The allowlist is the point.
   const path = c.req.path;
   const isSelfServiceRoute =
-    /\/me(\/avatar|\/ticket-push-preferences|\/ticket-pushover)?$/.test(path) ||
+    /\/me(\/avatar|\/ticket-push-preferences|\/ticket-pushover|\/email-preferences)?$/.test(path) ||
     (c.req.method === 'GET' && /\/avatar$/.test(path));
   if (isSelfServiceRoute) {
     await next();
@@ -162,6 +165,40 @@ const updateOrgAccessSchema = z.object({
 }).strict();
 
 type PartnerOrgAccess = 'all' | 'selected' | 'none';
+
+/**
+ * Restriction fields POST /users/invite accepts but cannot honour in the
+ * caller's scope (#10315). Returns the 400 message, or null when none apply.
+ *
+ * - Partner scope: `partner_users` has no site or device-group axis — partner
+ *   staff reach is `orgAccess`/`orgIds` only.
+ * - Organization scope: `orgIds` is partner-only. `deviceGroupIds` would be
+ *   stored on `organization_users` but nothing reads it for authorization, so
+ *   the invitee would see every device group — reject until it is enforced.
+ *   `siteIds` is enforced and stays allowed.
+ */
+function inviteRestrictionError(
+  scope: ScopeContext['scope'],
+  data: { orgIds?: string[]; siteIds?: string[]; deviceGroupIds?: string[] },
+): string | null {
+  if (scope === 'partner') {
+    if (data.siteIds !== undefined) {
+      return 'siteIds is only valid for organization scope; partner users are scoped with orgAccess/orgIds';
+    }
+    if (data.deviceGroupIds !== undefined) {
+      return 'deviceGroupIds is only valid for organization scope; partner users are scoped with orgAccess/orgIds';
+    }
+  }
+  if (scope === 'organization') {
+    if (data.orgIds !== undefined) {
+      return 'orgIds is only valid for partner scope';
+    }
+    if (data.deviceGroupIds !== undefined) {
+      return 'deviceGroupIds restrictions are not supported yet; restrict the user with siteIds instead';
+    }
+  }
+  return null;
+}
 
 /**
  * Shape rules for a partner membership's organization reach, shared by
@@ -736,6 +773,42 @@ const setTicketPushoverSchema = z.object({
   userKey: z.string().trim().regex(PUSHOVER_USER_KEY_PATTERN, 'Pushover user key must be 30 letters or digits'),
 }).strict();
 
+// Connection health W3 (#8847, spec 2026-10-15 §6): the user's own email
+// subscriptions, today just the daily connection health digest. Subject is always
+// auth.user.id (self-service exemption above); the body is .strict(). Missing
+// opt-out row = subscribed. Shape 6 RLS keeps the request context on the user's
+// own row.
+const updateEmailPreferencesSchema = z.object({
+  connectionHealthDigest: z.boolean(),
+}).strict();
+
+userRoutes.get('/me/email-preferences', async (c) => {
+  const auth = c.get('auth');
+  const optedOut = await isOptedOut(auth.user.id, 'connection_health_digest');
+  return c.json({ connectionHealthDigest: !optedOut });
+});
+
+userRoutes.patch('/me/email-preferences', zValidator('json', updateEmailPreferencesSchema), async (c) => {
+  const auth = c.get('auth');
+  const { connectionHealthDigest } = c.req.valid('json');
+  if (connectionHealthDigest) {
+    await clearEmailOptOut(auth.user.id, 'connection_health_digest');
+  } else {
+    const { userExists } = await setEmailOptOut(auth.user.id, 'connection_health_digest', 'settings');
+    // The request context must see the caller's own users row; if it cannot,
+    // nothing was written and the toggle must not report success.
+    if (!userExists) throw new HTTPException(500, { message: 'Could not save email preferences' });
+  }
+  writeRouteAudit(c, {
+    orgId: auth.orgId ?? null,
+    action: 'user.email_preferences.update',
+    resourceType: 'user',
+    resourceId: auth.user.id,
+    details: { connectionHealthDigest },
+  });
+  return c.json({ connectionHealthDigest });
+});
+
 userRoutes.get('/me/ticket-pushover', async (c) => {
   const auth = c.get('auth');
   const rows = await db
@@ -855,6 +928,9 @@ userRoutes.patch('/me', zValidator('json', updateMeSchema), async (c) => {
         );
       if (validationError) {
         return c.json({ error: validationError }, 400);
+      }
+      if ('characterKeyShortcuts' in prefs && typeof prefs.characterKeyShortcuts !== 'boolean') {
+        return c.json({ error: 'Invalid characterKeyShortcuts value. Must be true or false.' }, 400);
       }
       const mergedPreferences = {
         ...(isPreferenceRecord(self.preferences) ? self.preferences : {}),
@@ -1530,7 +1606,8 @@ userRoutes.post(
     const auth = c.get('auth');
     const scopeContext = getScopeContext(auth);
     const data = c.req.valid('json');
-
+    const partnerGroupIds = await findPartnerOwnedGroupIds(data.deviceGroupIds ?? []);
+    if (partnerGroupIds.length > 0) return c.json(partnerGroupTargetRefusal(partnerGroupIds), 400);
     const partnerOrgAccess = scopeContext.scope === 'partner'
       ? normalizePartnerOrgAccess(data.orgAccess ?? 'none', data.orgIds)
       : null;
@@ -1540,6 +1617,15 @@ userRoutes.post(
 
     if (scopeContext.scope === 'organization' && data.orgAccess) {
       return c.json({ error: 'orgAccess is only valid for partner scope' }, 400);
+    }
+
+    // #10315: a restriction the invite cannot store or enforce must be a 400,
+    // never silently dropped — dropping it creates a user broader than the
+    // caller asked for. Presence (even []) is rejected: an empty list is a
+    // restriction to nothing, which is just as unenforceable.
+    const restrictionError = inviteRestrictionError(scopeContext.scope, data);
+    if (restrictionError) {
+      return c.json({ error: restrictionError }, 400);
     }
 
     const role = await getScopedRole(data.roleId, scopeContext);
@@ -1756,7 +1842,9 @@ userRoutes.post(
           userId: user.id,
           roleId: data.roleId,
           siteIds: delegatedSiteIds,
-          deviceGroupIds: data.deviceGroupIds ?? null
+          // Always unrestricted: deviceGroupIds is rejected up front (#10315)
+          // because no authorization path reads this column yet.
+          deviceGroupIds: null
         })
         .returning();
 
@@ -1810,7 +1898,7 @@ userRoutes.post(
         orgAccess: scopeContext.scope === 'partner' ? data.orgAccess ?? 'none' : undefined,
         orgIds: scopeContext.scope === 'partner' ? data.orgIds ?? [] : undefined,
         siteIds: scopeContext.scope === 'organization' ? result.delegatedSiteIds : undefined,
-        deviceGroupIds: scopeContext.scope === 'organization' ? data.deviceGroupIds ?? [] : undefined,
+        deviceGroupIds: scopeContext.scope === 'organization' ? null : undefined,
         inviteEmailSent: invite.inviteEmailSent
       }
     });

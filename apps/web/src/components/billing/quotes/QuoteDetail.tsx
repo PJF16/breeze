@@ -10,6 +10,7 @@ import { runAction, handleActionError, ActionError } from '../../../lib/runActio
 import { useAuthedImage } from './useQuoteImage';
 import QuoteActions, { QuoteSendOutcomeBanners } from './QuoteActions';
 import AcceptanceEvidenceControl from './AcceptanceEvidenceControl';
+import QuoteGeneratedContracts from './QuoteGeneratedContracts';
 import QuoteOrderBreakdown, { QuoteOrderExcludedNote, orderableLines, unorderableProductLines } from './QuoteOrderBreakdown';
 import { RecurringBillingNote, MarginPanel, MarginToggle, useShowMargin } from '../billingUi';
 import ChangeCurrencyDialog, { type CurrencyChangeMode } from '../ChangeCurrencyDialog';
@@ -28,13 +29,14 @@ import {
   formatQuantity,
   resolveQuoteOrgName,
   lineTaxAmount,
-  lineTitle,
-  lineBlurb,
   pctFromFraction,
   sellerLines,
 } from './quoteTypes';
 import { StatusPill } from '../shared/StatusPill';
 import { LineItemsTable, type LineItemColumn } from '../shared/LineItemsTable';
+import { EntityLink } from '@/components/shared/EntityLink';
+import { DocumentLineDescription } from '@breeze/document-ui';
+import { lineDescriptionProps } from '@breeze/shared/documents';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -273,7 +275,7 @@ export default function QuoteDetail({ detail, onChanged, actionsInHeader }: Prop
               )}
             </div>
             <dl className="space-y-1 text-sm">
-              <div className="flex justify-between"><dt className="text-muted-foreground">{t('quotes.detail.customer')}</dt><dd className="text-right" data-testid="quote-detail-customer"><a href={`/organizations/${encodeURIComponent(quote.orgId)}`} data-testid="org-record-link" className="hover:underline">{orgName}</a></dd></div>
+              <div className="flex justify-between"><dt className="text-muted-foreground">{t('quotes.detail.customer')}</dt><dd className="text-right" data-testid="quote-detail-customer"><EntityLink kind="org" id={quote.orgId} name={orgName} /></dd></div>
               <div className="flex justify-between"><dt className="text-muted-foreground">{t('quotes.detail.issued')}</dt><dd>{formatDate(quote.issueDate)}</dd></div>
               {(!quote.issueDate || formatDate(quote.issueDate) !== formatDate(quote.createdAt)) && (
                 <div className="flex justify-between"><dt className="text-muted-foreground">{t('quotes.detail.created')}</dt><dd>{formatDate(quote.createdAt)}</dd></div>
@@ -358,6 +360,10 @@ export default function QuoteDetail({ detail, onChanged, actionsInHeader }: Prop
               </a>
             </aside>
           )}
+
+          {/* #10361: the draft contract(s) the accept created — the recurring
+              next step, as the invoice link above is the one-time one. */}
+          <QuoteGeneratedContracts contracts={detail.contracts} unavailable={detail.contractsUnavailable} />
 
           {/* Recurring + totals summary — the rail's anchor (shadow + large figure). */}
           <div className="rounded-lg border bg-card p-4 shadow-xs" data-testid="quote-detail-totals">
@@ -559,7 +565,7 @@ function BlockView({ block, lines, currency, taxRate, showTax }: { block: QuoteB
   }
   if (block.blockType === 'contract') {
     // Read-only summary — the Detail tab isn't the customer document, so skip
-    // the PDF preview/iframe (QuoteDocument's DocContractFile) and just show
+    // the PDF preview/iframe (the Preview tab's agreement viewer) and just show
     // what a staff member needs: which agreement this is and its body text.
     const content = (block.content ?? {}) as Partial<ContractBlockContent>;
     const templateName = content.templateName?.trim() || '';
@@ -664,10 +670,13 @@ function LineTable({ lines, currency, label, testId, taxRate, showTax }: { lines
       descriptionHeader={t('quotes.detail.table.item')}
       emptyMessage={t('quotes.detail.table.noLines')}
       renderDescription={(l) => (
-        <>
-          <div className="font-medium text-foreground">{lineTitle(l)}</div>
-          {lineBlurb(l) && <div className="whitespace-pre-line text-xs text-muted-foreground">{lineBlurb(l)}</div>}
-        </>
+        // Shared description cell (#9414 W5): the title keeps its weight, the rest goes back to normal.
+        <div className="font-medium text-foreground [&>*]:font-normal">
+          <DocumentLineDescription
+            {...lineDescriptionProps(l, {})}
+            rowKey={l.id}
+          />
+        </div>
       )}
       columns={columns}
     />

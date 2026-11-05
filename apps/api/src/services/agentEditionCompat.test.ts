@@ -195,6 +195,19 @@ describe('agent-binary update command types are only named at known sites (#4093
     // a dispatcher. Both types are pinned to the `live` class there, which is
     // the class that refuses to queue for an offline device.
     'apps/api/src/services/commandOfflinePolicy.ts',
+    // #8167 W03: `update_agent` here is the normalized EDR VENDOR action key
+    // (@breeze/shared EDR_ENDPOINT_ACTIONS) — a request to the EDR console to
+    // update ITS agent. Neither file builds a Breeze device command; the only
+    // EDR send path is adapter.performAction.
+    'apps/api/src/services/edrProviders/types.ts',
+    'apps/api/src/services/edrProviders/actions.ts',
+    // #10091 (network-isolation W1c): claim-time revalidation only READS queued
+    // update/update_agent rows to refuse a below-floor agent target while an
+    // isolation episode is unresolved. It never builds or dispatches one.
+    'apps/api/src/services/commandClaimEligibility.ts',
+    // #10919: the same claim-time check, moved here. Only inspects queued update rows for the
+    // isolation upgrade floor; never builds, inserts or dispatches a command.
+    'apps/api/src/services/networkIsolation/upgradeFloor.ts',
   ]);
 
   function walk(dir: string, out: string[] = []): string[] {

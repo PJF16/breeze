@@ -1,3 +1,4 @@
+import type { AlertOwnerKind } from '@breeze/shared';
 import nodemailer, { type Transporter } from 'nodemailer';
 import { Resend } from 'resend';
 import { captureException } from './sentry';
@@ -233,6 +234,8 @@ export interface AlertNotificationEmailParams {
   severity: AlertSeverity;
   summary: string;
   deviceName?: string;
+  subjectName?: string;
+  ownerKind?: AlertOwnerKind;
   occurredAt?: Date | string;
   dashboardUrl?: string;
   orgName?: string;
@@ -1189,6 +1192,31 @@ function buildSignupAttemptOnExistingAccountTemplate(
 /** Mirrors INVITE_TOKEN_TTL_SECONDS (routes/auth/schemas.ts): 7 days. */
 const DEFAULT_INVITE_EXPIRES_DAYS = 7;
 
+/**
+ * Caller verification (#6354 W03) link email to the CONTACT. Names the exact
+ * request and offers "This is not me"; never carries a challenge number or the
+ * reverse code (those exist only on the anonymous page). Partner-supplied text
+ * is escaped. Sent on the partner support stream
+ * (`security.caller_verification_link`).
+ */
+export function buildCallerVerificationTemplate(p: {
+  partnerName: string; technicianLabel: string; requestLabel: string; url: string;
+}): EmailTemplate {
+  const subject = 'Review a support request';
+  const request = `${p.technicianLabel} from ${p.partnerName} wants to ${p.requestLabel}.`;
+  const caution = `If you are not sure, hang up and call ${p.partnerName} on the number you already have.`;
+  const body = `<p style="${BODY_PARA}">${escapeHtml(request)}</p>
+    ${renderButton('Review request', p.url)}
+    <p style="${MUTED_PARA}">The page shows the request and lets you choose “This is not me”. This link expires in 10 minutes.</p>
+    <p style="${MUTED_PARA}">${escapeHtml(caution)}</p>`;
+  return {
+    subject,
+    html: renderLayout({ title: subject, preheader: request, heading: subject, body, brandName: p.partnerName }),
+    text: [request, `Review request: ${p.url}`, 'The link expires in 10 minutes.',
+      'Choose “This is not me” if you did not request this.', caution].join('\n\n'),
+  };
+}
+
 export function buildStaffInviteTemplate(params: InviteEmailParams): EmailTemplate {
   const name = params.name?.trim() || 'there';
   const inviter = params.inviterName?.trim() || 'A teammate';
@@ -1298,6 +1326,8 @@ export interface QuoteOutcomeEmailParams {
   invoiceNumber?: string | null;
   /** Deep link to the quote in the web app; omitted when no app base is configured. */
   quoteUrl?: string | null;
+  /** #10361: draft contracts the accept created and nobody has activated yet. */
+  draftContractCount?: number | null;
 }
 
 /**
@@ -1321,10 +1351,21 @@ export function buildQuoteOutcomeTemplate(params: QuoteOutcomeEmailParams): Emai
   const invoiceLine = params.outcome === 'accepted' && params.invoiceNumber
     ? `<p style="${BODY_PARA}">Invoice <strong>${escapeHtml(params.invoiceNumber)}</strong> has been issued and emailed to the customer.</p>`
     : '';
+  // #10361: the recurring half of an accept lands as draft contracts that bill
+  // nothing until someone activates them — say so, or approved revenue waits
+  // unnoticed in the contracts list.
+  const drafts = params.outcome === 'accepted' ? Math.max(0, Math.trunc(params.draftContractCount ?? 0)) : 0;
+  const draftContractText = drafts === 0
+    ? null
+    : drafts === 1
+      ? '1 recurring contract was created as a draft. Review and activate it to start billing.'
+      : `${drafts} recurring contracts were created as drafts. Review and activate them to start billing.`;
+  const draftContractLine = draftContractText ? `<p style="${BODY_PARA}">${escapeHtml(draftContractText)}</p>` : '';
   const body = `
       <p style="${BODY_PARA}">${escapeHtml(who)} has <strong>${verb}</strong> quote <strong>${escapeHtml(params.quoteNumber)}</strong>.</p>
       ${reasonBlock}
       ${invoiceLine}
+      ${draftContractLine}
       ${params.quoteUrl ? renderButton('View quote', params.quoteUrl) : ''}
   `;
   const html = renderLayout({
@@ -1337,6 +1378,7 @@ export function buildQuoteOutcomeTemplate(params: QuoteOutcomeEmailParams): Emai
     `${who} has ${verb} quote ${params.quoteNumber}.`,
     reason ? `Their note: ${reason}` : null,
     params.outcome === 'accepted' && params.invoiceNumber ? `Invoice ${params.invoiceNumber} has been issued and emailed to the customer.` : null,
+    draftContractText,
     params.quoteUrl ? `View quote: ${params.quoteUrl}` : null,
   ]
     .filter(Boolean)
@@ -1345,19 +1387,21 @@ export function buildQuoteOutcomeTemplate(params: QuoteOutcomeEmailParams): Emai
 }
 
 function buildAlertNotificationTemplate(params: AlertNotificationEmailParams): EmailTemplate {
+  const subjectName = params.subjectName || params.deviceName;
+  const subjectLabel = params.ownerKind && params.ownerKind !== 'device' ? 'Subject' : 'Device';
   const severityLabel = params.severity.toUpperCase();
   const subject = `Alert ${severityLabel}: ${params.alertName}`;
   const timestamp = formatTimestamp(params.occurredAt);
   const { bg: pillBg, fg: pillFg } = alertSeverityPalette(params.severity);
   const preheader = [
     severityLabel,
-    params.deviceName ? `on ${params.deviceName}` : null,
+    subjectName ? `on ${subjectName}` : null,
     timestamp ? `at ${timestamp}` : null,
   ]
     .filter(Boolean)
     .join(' ');
   const details = [
-    params.deviceName ? `Device: ${params.deviceName}` : null,
+    subjectName ? `${subjectLabel}: ${subjectName}` : null,
     `Severity: ${severityLabel}`,
     timestamp ? `Detected: ${timestamp}` : null,
   ].filter(Boolean) as string[];
@@ -1387,7 +1431,7 @@ function buildAlertNotificationTemplate(params: AlertNotificationEmailParams): E
   const text = [
     `${params.alertName} (${severityLabel})`,
     params.summary,
-    params.deviceName ? `Device: ${params.deviceName}` : undefined,
+    subjectName ? `${subjectLabel}: ${subjectName}` : undefined,
     timestamp ? `Detected: ${timestamp}` : undefined,
     params.dashboardUrl ? `View details: ${params.dashboardUrl}` : undefined,
   ]

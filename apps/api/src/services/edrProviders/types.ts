@@ -1,7 +1,7 @@
 import type { z } from 'zod';
 import type {
-  EdrActionKey, EdrDetectionStatus, EdrEndpointHealth, EdrEndpointType, EdrIsolationState,
-  EdrOsPlatform, EdrSeverity, EdrVendorKind,
+  EdrActionKey, EdrDetectionStatus, EdrEndpointHealth, EdrEndpointType, EdrInstallerFetchErrorCode,
+  EdrIsolationState, EdrOsPlatform, EdrSeverity, EdrVendorKind,
 } from '@breeze/shared';
 import type { EdrProviderKey } from './registry';
 
@@ -28,6 +28,10 @@ export class EdrProviderRequestError extends Error {
 /** Operation classes with their own narrower vendor budget (`operationBudgets`). */
 export type EdrOperationClass = 'inventory' | 'companies' | 'incidents' | (string & {});
 
+/** Endpoint columns only the per-endpoint detail call knows (see `EdrCapabilities.detailOwnedFields`). */
+export type EdrDetailOwnedField = 'fqdn' | 'ipAddresses' | 'osPlatform' | 'osName' | 'endpointType'
+  | 'online' | 'health' | 'agentVersion' | 'lastSeenAt' | 'serialNumber';
+
 export interface EdrCapabilities {
   tenantModel: 'partner' | 'single';
   perTenantHost: boolean;
@@ -44,6 +48,17 @@ export interface EdrCapabilities {
   maxActionTargets: number;
   firstSyncLookbackDays: number;
   tenantFetchConcurrency: number;
+  /**
+   * Opt-in. Columns only the per-endpoint detail call knows: on conflict the list
+   * upsert keeps the stored value instead of overwriting it with the list's
+   * placeholder. A first insert still takes the list values. Default [] = every
+   * column overwrites (GravityZone).
+   */
+  detailOwnedFields?: readonly EdrDetailOwnedField[];
+  /** Opt-in. Vendor calls per tenant/connection, fed to `planCadence`; default `DEFAULT_ESTIMATED_CALLS`. */
+  estimatedCalls?: { perTenantDetection: number; perTenantInventory: number; perConnectionOverhead: number };
+  /** Open detections re-read per mapped tenant per inventory run. Default 20; only read when `detectionStatusModel === 'reread_open_on_inventory'`. */
+  rereadOpenPerRun?: number;
 }
 
 export interface VendorEdrTenant {
@@ -60,8 +75,13 @@ export interface VendorEdrEndpoint {
   tamperProtection: boolean | null; policyName: string | null; lastSeenAt: Date | null;
   raw: Record<string, unknown>;
 }
+/**
+ * Every field is optional: `undefined` = "not fetched" (the stored value stays),
+ * an explicit `null` / empty value = "fetched as empty" (clears the stored value).
+ */
 export type VendorEdrEndpointDetail = Partial<Pick<VendorEdrEndpoint,
-  'health' | 'online' | 'lastSeenAt' | 'agentVersion' | 'osName' | 'serialNumber'>> & { vendorEndpointId: string };
+  'health' | 'online' | 'lastSeenAt' | 'agentVersion' | 'osName' | 'serialNumber'
+  | 'fqdn' | 'ipAddresses' | 'osPlatform' | 'endpointType'>> & { vendorEndpointId: string };
 
 export interface VendorEdrDetection {
   vendorDetectionId: string; vendorKind: EdrVendorKind; vendorTenantId: string;
@@ -70,7 +90,35 @@ export interface VendorEdrDetection {
   category: string | null; threatName: string | null; filePath: string | null;
   processName: string | null; mitreTechniques: string[]; detectedAt: Date | null;
   resolvedAt: Date | null; lastVendorUpdateAt: Date | null; details: Record<string, unknown>;
+  /**
+   * Adapter-owned vendor locator for later reads/actions on this object (Emsisoft: the incident's
+   * sha1 / host / IP). Written by sync from vendor data only, never from a request. Stored in
+   * `details._breeze`, clipped to 255 chars.
+   */
+  vendorRef?: string | null;
+  /** Rows sharing a groupKey are ONE vendor object (one Emsisoft incident across N devices). Clipped to 128 chars. */
+  groupKey?: string | null;
 }
+/** An open detection row as the status re-read sees it: vendor ids and the trusted locator only. */
+export interface EdrDetectionRef {
+  vendorDetectionId: string;
+  vendorKind: EdrVendorKind;
+  vendorRef: string | null;
+  groupKey: string | null;
+}
+
+/** The vendor's current verdict for one re-read detection row. */
+export interface EdrDetectionStatusUpdate {
+  vendorDetectionId: string;
+  vendorKind: EdrVendorKind;
+  status: EdrDetectionStatus;
+  vendorStatus: string | null;
+  severity: EdrSeverity;
+  vendorSeverity: string | null;
+  resolvedAt: Date | null;
+  lastVendorUpdateAt: Date | null;
+}
+
 export interface EdrDetectionPage {
   detections: VendorEdrDetection[];
   cursor: string | null;
@@ -96,7 +144,75 @@ export interface EdrAdapterContext {
   runCache: Map<string, Promise<unknown>>;
 }
 
+/**
+ * One normalized response action addressed to the vendor (W03). The target
+ * carries VENDOR ids only, resolved by `dispatchEdrAction` from rows the caller
+ * was authorized to read.
+ */
+export type EdrActionRequest =
+  | { action: 'isolate' | 'unisolate' | 'scan' | 'update_agent'; target: { kind: 'endpoint'; vendorEndpointId: string } }
+  | { action: 'kill_process'; target: { kind: 'process'; vendorEndpointId: string; pid: number } }
+  | {
+      action: 'rollback' | 'resolve_detection' | 'mark_false_positive';
+      target: { kind: 'detection'; vendorDetectionId: string; vendorKind: EdrVendorKind };
+    }
+  | { action: 'quarantine_restore' | 'quarantine_delete'; target: { kind: 'quarantine_item'; vendorItemId: string } };
+
+/**
+ * `succeeded` = the vendor accepted (and, for a synchronous call, applied) it;
+ * `submitted` = the vendor queued a task to poll; `failed` = a TERMINAL vendor
+ * verdict, only ever returned by `getActionStatus` (a refused `performAction`
+ * throws `EdrProviderRequestError` instead).
+ */
+export type EdrActionResult =
+  | { status: 'succeeded' }
+  | { status: 'submitted'; vendorActionId: string }
+  | { status: 'failed'; code: string; message: string };
+
+export type EdrActionSupport = { ok: true } | { ok: false; reason: string };
+
+/** Everything `supportsAction` may look at — already-loaded row facts, no I/O. */
+export interface EdrActionTargetFacts {
+  vendorEndpointId: string | null;
+  osPlatform: EdrOsPlatform | null;
+  isolationState: EdrIsolationState | null;
+  online: boolean | null;
+  /** Unexpired licence denials recorded on the tenant. */
+  tenantUnsupportedActions: readonly EdrActionKey[];
+  /** `edr_connections.capabilities_snapshot` (incl. `note:` entries from the last test). */
+  connectionCapabilityNotes: readonly string[];
+}
+
+/** Did a sent-but-unconfirmed request take effect? */
+export type EdrReconcileVerdict = 'applied' | 'not_applied' | 'unknown';
+
+export type EdrInstallerPlatform = 'windows' | 'macos' | 'linux';
+export type EdrInstallerFileType = 'exe' | 'msi' | 'pkg' | 'dmg' | 'deb' | 'zip';
+export type { EdrInstallerFetchErrorCode };
+
+/** `data` is adapter-owned and opaque to the framework; it is sealed on the tenant row. */
+export type EdrInstallerFetchResult =
+  | { ok: true; data: unknown; expiresAt: Date | null }
+  | { ok: false; code: EdrInstallerFetchErrorCode };
+
+/** What dispatch sends the agent. `checksum: null` = the vendor publishes none. */
+export interface EdrInstallerSpec {
+  downloadUrl: string;
+  fileName: string;
+  fileType: EdrInstallerFileType;
+  silentInstallArgs: string;
+  checksum: string | null;
+}
+
+export type EdrInstallerBuildError = { error: 'platform_unsupported' | 'material_invalid' };
+
 export interface EdrCredentialField { name: string; label: string; secret: boolean; required: boolean }
+
+/** An inbound vendor push as the webhook route saw it: raw body text, header values. */
+export interface RawWebhookRequest { headers: Record<string, string | undefined>; body: string }
+/** A push is a HINT: which tenant (and optionally which detection) has news. Opaque vendor ids only. */
+export interface EdrWebhookHint { vendorTenantId?: string; vendorDetectionId?: string }
+export type EdrWebhookVerdict = { ok: true; hints: EdrWebhookHint[] } | { ok: false; error: string };
 
 export interface EdrProviderAdapter {
   readonly key: EdrProviderKey;
@@ -113,11 +229,72 @@ export interface EdrProviderAdapter {
   countEndpoints?(ctx: EdrAdapterContext, tenant: VendorEdrTenantRef): Promise<number>;
   enrichEndpoints?(ctx: EdrAdapterContext, tenant: VendorEdrTenantRef, vendorEndpointIds: string[]): Promise<VendorEdrEndpointDetail[]>;
   listDetections(ctx: EdrAdapterContext, tenant: VendorEdrTenantRef, cursor: string | null, now: Date): Promise<EdrDetectionPage>;
-  // Declared now, implemented from W03 (types only in W01 — no framework code calls them):
-  performAction?(...a: unknown[]): Promise<unknown>;
-  supportsAction?(...a: unknown[]): boolean;
-  getActionStatus?(...a: unknown[]): Promise<unknown>;
+  /**
+   * Present iff `detectionStatusModel === 'reread_open_on_inventory'`. Read-only vendor calls. Returns
+   * updates ONLY for refs the vendor still knows: a ref it cannot find is omitted and never closed.
+   * ALL-OR-NOTHING per tenant like `listEndpoints`: a failure throws.
+   */
+  rereadDetectionStatus?(ctx: EdrAdapterContext, tenant: VendorEdrTenantRef, refs: EdrDetectionRef[]): Promise<EdrDetectionStatusUpdate[]>;
+  /**
+   * W03. Sends ONE action to the vendor. Must not retry a write that may have
+   * reached the vendor: an ambiguous outcome throws `code: 'outcome_unknown'`.
+   * `traceId` is the `edr_actions` row id, sent as the vendor request id for
+   * TRACEABILITY ONLY: GravityZone does not dedupe on it, so it is not an
+   * idempotency key and no caller may rely on it to make a re-send safe.
+   * Called ONLY by `dispatchEdrAction` (edrActions.chokepoint.contract.test.ts).
+   */
+  performAction?(
+    ctx: EdrAdapterContext,
+    tenant: VendorEdrTenantRef,
+    req: EdrActionRequest,
+    traceId: string,
+  ): Promise<Exclude<EdrActionResult, { status: 'failed' }>>;
+  /** W03. Pure: can this action be attempted on this target? Rules are adapter-specific. */
+  supportsAction?(facts: EdrActionTargetFacts, action: EdrActionKey): EdrActionSupport;
+  /** W03. Poll a `submitted` vendor task; `submitted` = still pending. */
+  getActionStatus?(
+    ctx: EdrAdapterContext,
+    tenant: VendorEdrTenantRef,
+    vendorActionId: string,
+  ): Promise<EdrActionResult | { status: 'submitted' }>;
+  /** W03. Crash/ambiguity reconciliation. Read-only vendor calls ONLY — never re-sends. */
+  reconcileAction?(ctx: EdrAdapterContext, tenant: VendorEdrTenantRef, req: EdrActionRequest): Promise<EdrReconcileVerdict>;
+  /**
+   * W03 PR-B. PURE secret check + hint extraction for an inbound vendor push.
+   * Returns ONLY opaque vendor ids (never vendor content); a push can only
+   * schedule a read sync. Called only by `routes/webhooks/edr.ts`.
+   */
+  verifyWebhook?(req: RawWebhookRequest, secret: string): EdrWebhookVerdict;
+  /**
+   * W03 PR-B. Register Breeze's webhook URL + shared secret with the vendor
+   * console. A console has ONE push destination: when it already points
+   * somewhere else (a SIEM, say) this throws `code: 'push_conflict'` unless
+   * `replaceExisting` is set.
+   */
+  registerPush?(
+    ctx: EdrAdapterContext,
+    o: { url: string; secret: string; vendorTenantIds: string[]; replaceExisting?: boolean },
+  ): Promise<void>;
+  /**
+   * W03 PR-B. Turn vendor push off, but only while it still points at `url`
+   * (Breeze's webhook): never disables a destination someone else configured.
+   */
+  unregisterPush?(ctx: EdrAdapterContext, o: { url: string | null }): Promise<{ changed: boolean }>;
+  /** W03 PR-B. Ask the vendor to send one test event to the registered URL. */
+  sendTestPush?(ctx: EdrAdapterContext): Promise<void>;
+  /**
+   * W06. Hosts an installer link may point at. Separate from `hostAllowlist`
+   * (the API hosts): a download CDN is not somewhere Breeze sends the API key.
+   */
+  readonly installerHostAllowlist?: readonly string[];
+  /**
+   * W06. Sync worker vendor-I/O phase ONLY, never at dispatch: dispatch runs inside
+   * the install-remediation transaction (#1105). A vendor verdict about this
+   * tenant is a result; transport and auth failures throw `EdrProviderRequestError`.
+   */
+  fetchInstallerMaterial?(ctx: EdrAdapterContext, tenant: VendorEdrTenantRef): Promise<EdrInstallerFetchResult>;
+  /** W06. Pure and synchronous: no db, no fetch, no ctx. Validates `data` with the adapter's own schema. */
+  buildInstaller?(data: unknown, platform: EdrInstallerPlatform): EdrInstallerSpec | EdrInstallerBuildError;
+  // Declared now, implemented later (types only — no framework code calls them):
   getDetections?(...a: unknown[]): Promise<VendorEdrDetection[]>;
-  verifyWebhook?(...a: unknown[]): unknown;
-  getInstaller?(...a: unknown[]): Promise<unknown>;
 }

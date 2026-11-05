@@ -37,11 +37,11 @@ import {
 import { getTwilioService } from '../../services/twilio';
 import { readMobileDeviceId, carryForwardBinding } from '../../services/mobileDeviceBinding';
 import { authMiddleware, type AuthContext } from '../../middleware/auth';
-import { ENABLE_2FA, mfaVerifySchema, mfaEnableSchema, mfaStepUpSchema, maintenanceStepUpResource, moveOrgStepUpResource, parkedAssignStepUpResource, parkedBulkAssignStepUpResource, rollbackStepUpResource, scriptLaneStepUpResource, partnerScriptCeilingStepUpResource, topologyArmStepUpResource, preAssignmentEnableStepUpResource, unattestedRestoreStepUpResource, autopayChargeNowStepUpResource, partnerPaymentSettingsStepUpResource, autopayRequestRecipientStepUpResource, orgPaymentSettingsStepUpResource } from './schemas';
+import { ENABLE_2FA, mfaVerifySchema, mfaEnableSchema, mfaStepUpSchema, maintenanceStepUpResource, moveOrgStepUpResource, forceRebootStepUpResource, parkedAssignStepUpResource, parkedBulkAssignStepUpResource, rollbackStepUpResource, scriptLaneStepUpResource, partnerScriptCeilingStepUpResource, topologyArmStepUpResource, preAssignmentEnableStepUpResource, unattestedRestoreStepUpResource, autopayChargeNowStepUpResource, partnerPaymentSettingsStepUpResource, autopayRequestRecipientStepUpResource, orgPaymentSettingsStepUpResource, migrationWindowOpenStepUpResource, callerVerificationAdministrativeStepUpResource, wispGrantStepUpResource } from './schemas';
 import { getEffectiveMfaPolicy } from '../../services/mfaPolicy';
 import { TEARDOWN_FAILED } from '../../services/remoteSessionTeardown';
-import { maintenanceResourceDigest, mintStepUpGrant, moveOrgResourceDigest, parkedAssignResourceDigest, parkedBulkAssignResourceDigest, passkeyRemovalResourceDigest, rollbackResourceDigest, scriptLanePolicyResourceDigest, partnerScriptCeilingResourceDigest, topologyArmResourceDigest, preAssignmentEnableResourceDigest, unattestedRestoreResourceDigest, autopayChargeNowResourceDigest, partnerPaymentSettingsResourceDigest, autopayRequestRecipientResourceDigest, orgPaymentSettingsResourceDigest } from '../../services/mfaStepUpGrant';
-import { verifyStepUpPasskeyAssertion } from './passkeys';
+import { consumeStepUpGrant, forceRebootResourceDigest, maintenanceResourceDigest, mintStepUpGrant, moveOrgResourceDigest, parkedAssignResourceDigest, parkedBulkAssignResourceDigest, passkeyRemovalResourceDigest, rollbackResourceDigest, scriptLanePolicyResourceDigest, partnerScriptCeilingResourceDigest, topologyArmResourceDigest, preAssignmentEnableResourceDigest, unattestedRestoreResourceDigest, autopayChargeNowResourceDigest, partnerPaymentSettingsResourceDigest, autopayRequestRecipientResourceDigest, orgPaymentSettingsResourceDigest, migrationWindowOpenResourceDigest, callerVerificationAdministrativeDigest, wispGrantResourceDigest } from '../../services/mfaStepUpGrant';
+import { checkPasskeyRemovalEligibility, verifyStepUpPasskeyAssertion } from './passkeys';
 import {
   getClientIP,
   installAuthorizedUserSessionCookies,
@@ -73,6 +73,7 @@ import {
 import { installAuthBindingReplacement, requestAuthBinding } from './binding';
 
 import { finalizeSsoPendingLink } from './ssoLinkCompletion';
+import { preContextCheck } from '../../middleware/preContextChecks';
 import { captureException } from '../../services/sentry';
 import { enforceIpAllowlist, IP_NOT_ALLOWED_BODY, isBlocked } from '../../services/ipAllowlist';
 
@@ -613,7 +614,7 @@ mfaRoutes.post('/mfa/verify', zValidator('json', mfaVerifySchema), async (c) => 
       });
     }
 
-    auditLogin(c, { orgId: mfaOrgId ?? null, userId: user.id, email: user.email, name: user.name, mfa: true, scope: mfaScope, ip: getClientIP(c) });
+    auditLogin(c, { orgId: mfaOrgId ?? null, partnerId: mfaPartnerId ?? null, userId: user.id, email: user.email, name: user.name, mfa: true, scope: mfaScope, ip: getClientIP(c) });
 
     installSessionCookies();
 
@@ -1251,6 +1252,7 @@ const RESOURCE_BOUND_OPERATIONS = {
   agent_rollback: rollbackStepUpResource,
   device_maintenance: maintenanceStepUpResource,
   device_move_org: moveOrgStepUpResource,
+  device_force_reboot: forceRebootStepUpResource,
   parked_device_assign: parkedAssignStepUpResource,
   parked_device_assign_bulk: parkedBulkAssignStepUpResource,
   pre_assignment_enable: preAssignmentEnableStepUpResource,
@@ -1262,9 +1264,38 @@ const RESOURCE_BOUND_OPERATIONS = {
   partner_payment_settings_update: partnerPaymentSettingsStepUpResource,
   autopay_request_recipient: autopayRequestRecipientStepUpResource,
   org_payment_settings_update: orgPaymentSettingsStepUpResource,
+  migration_window_open: migrationWindowOpenStepUpResource,
+  caller_verification_administrative_disable: callerVerificationAdministrativeStepUpResource,
+  wisp_grant: wispGrantStepUpResource,
 } as const;
 
-mfaRoutes.post('/mfa/step-up', authMiddleware, zValidator('json', mfaStepUpSchema), async (c) => {
+/**
+ * Per-user rate limit for POST /mfa/step-up (I2). Every other MFA-verification
+ * endpoint throttles per user; without this the only bound is the 300/60s-per-IP
+ * global limit, leaving a 6-digit TOTP / SMS code brute-forceable to a step-up
+ * grant across a handful of IPs. Fail closed (503) when Redis is unavailable.
+ *
+ * A pre-context check (#8334 / #1105): authMiddleware evaluates it before
+ * opening the request transaction, so the Redis round-trip does not pin a
+ * pooled connection. Key prefix `mfa:stepup-rl:` is deliberately disjoint from
+ * the grant store's `mfa:stepup:` (mfaStepUpGrant.ts) so the rate-limiter's
+ * sorted-set never shares a namespace with a grant key.
+ */
+const mfaStepUpRateLimit = preContextCheck(async (c) => {
+  if (!ENABLE_2FA) return null; // the handler answers mfaDisabledResponse
+  const auth = c.get('auth');
+  const redis = getRedis();
+  if (!redis) {
+    return c.json({ error: 'Service temporarily unavailable' }, 503);
+  }
+  const stepUpRate = await rateLimiter(redis, `mfa:stepup-rl:${auth.user.id}`, mfaLimiter.limit, mfaLimiter.windowSeconds);
+  if (!stepUpRate.allowed) {
+    return jsonError(c, 429, ERROR_CODES.RATE_LIMITED, 'Too many attempts. Please try again later.');
+  }
+  return null;
+});
+
+mfaRoutes.post('/mfa/step-up', authMiddleware, mfaStepUpRateLimit, zValidator('json', mfaStepUpSchema), async (c) => {
   if (!ENABLE_2FA) {
     return mfaDisabledResponse(c);
   }
@@ -1272,7 +1303,7 @@ mfaRoutes.post('/mfa/step-up', authMiddleware, zValidator('json', mfaStepUpSchem
   const auth = c.get('auth');
   const body = c.req.valid('json');
   const resourceSchema = RESOURCE_BOUND_OPERATIONS[body.operation as keyof typeof RESOURCE_BOUND_OPERATIONS];
-  let boundResource: z.infer<typeof rollbackStepUpResource> | z.infer<typeof maintenanceStepUpResource> | z.infer<typeof moveOrgStepUpResource> | z.infer<typeof parkedAssignStepUpResource> | z.infer<typeof parkedBulkAssignStepUpResource> | z.infer<typeof scriptLaneStepUpResource> | z.infer<typeof partnerScriptCeilingStepUpResource> | z.infer<typeof topologyArmStepUpResource> | z.infer<typeof preAssignmentEnableStepUpResource> | z.infer<typeof unattestedRestoreStepUpResource> | z.infer<typeof autopayChargeNowStepUpResource> | z.infer<typeof partnerPaymentSettingsStepUpResource> | z.infer<typeof autopayRequestRecipientStepUpResource> | z.infer<typeof orgPaymentSettingsStepUpResource> | undefined;
+  let boundResource: z.infer<typeof rollbackStepUpResource> | z.infer<typeof maintenanceStepUpResource> | z.infer<typeof moveOrgStepUpResource> | z.infer<typeof forceRebootStepUpResource> | z.infer<typeof parkedAssignStepUpResource> | z.infer<typeof parkedBulkAssignStepUpResource> | z.infer<typeof scriptLaneStepUpResource> | z.infer<typeof partnerScriptCeilingStepUpResource> | z.infer<typeof topologyArmStepUpResource> | z.infer<typeof preAssignmentEnableStepUpResource> | z.infer<typeof unattestedRestoreStepUpResource> | z.infer<typeof autopayChargeNowStepUpResource> | z.infer<typeof partnerPaymentSettingsStepUpResource> | z.infer<typeof autopayRequestRecipientStepUpResource> | z.infer<typeof orgPaymentSettingsStepUpResource> | z.infer<typeof migrationWindowOpenStepUpResource> | z.infer<typeof callerVerificationAdministrativeStepUpResource> | z.infer<typeof wispGrantStepUpResource> | undefined;
   if (resourceSchema) {
     const parsedResource = resourceSchema.safeParse(body.resource);
     if (!parsedResource.success) {
@@ -1289,21 +1320,8 @@ mfaRoutes.post('/mfa/step-up', authMiddleware, zValidator('json', mfaStepUpSchem
     return c.json({ error: 'Passkey resource binding is only valid for passkey deletion' }, 400);
   }
 
-  // Rate-limit per user (I2). Every other MFA-verification endpoint throttles
-  // per user; without this the only bound is the 300/60s-per-IP global limit,
-  // leaving a 6-digit TOTP / SMS code brute-forceable to a step-up grant across
-  // a handful of IPs. Fail closed (503) when Redis is unavailable.
-  const redis = getRedis();
-  if (!redis) {
-    return c.json({ error: 'Service temporarily unavailable' }, 503);
-  }
-  // Key prefix `mfa:stepup-rl:` is deliberately disjoint from the grant store's
-  // `mfa:stepup:` (mfaStepUpGrant.ts) so the rate-limiter's sorted-set never
-  // shares a namespace with a grant key.
-  const stepUpRate = await rateLimiter(redis, `mfa:stepup-rl:${auth.user.id}`, mfaLimiter.limit, mfaLimiter.windowSeconds);
-  if (!stepUpRate.allowed) {
-    return jsonError(c, 429, ERROR_CODES.RATE_LIMITED, 'Too many attempts. Please try again later.');
-  }
+  // Rate limiting for this route runs in `mfaStepUpRateLimit` (registered ahead of
+  // the validator), evaluated by authMiddleware BEFORE the request transaction opens (#8334).
 
   // A step-up must prove a factor that is allowed NOW, not a stale credential
   // left on the row after a method/policy change. Resolve once, fail closed,
@@ -1315,7 +1333,10 @@ mfaRoutes.post('/mfa/step-up', authMiddleware, zValidator('json', mfaStepUpSchem
     orgId: auth.orgId ?? null,
     partnerId: auth.partnerId ?? null,
   }, { failClosed: true, failClosedMethods: true });
-  if (!policy.allowedMethods[body.method]) {
+  // Recovery is exempt from the allowed-methods policy on purpose: the schema
+  // restricts it to `delete_passkey`, and a user whose passkey is gone needs it
+  // even when policy no longer allows their other methods.
+  if (body.method !== 'recovery' && !policy.allowedMethods[body.method]) {
     writeAuthAudit(c, {
       orgId: auth.orgId ?? undefined,
       action: 'auth.mfa.stepup.failed',
@@ -1328,7 +1349,13 @@ mfaRoutes.post('/mfa/step-up', authMiddleware, zValidator('json', mfaStepUpSchem
     return rejectProof(c, 'Invalid credentials', MFA_PROOF_INVALID, MFA_PROOF_REJECTION_STATUS);
   }
 
+  if (body.operation === 'delete_passkey' && body.passkeyId) {
+    const eligibility = await checkPasskeyRemovalEligibility(c, auth, body.passkeyId);
+    if ('error' in eligibility) return eligibility.error;
+  }
+
   let ok = false;
+  let recoveryCodeToConsume: string | null = null;
   if (body.method === 'totp') {
     const [u] = await db
       .select({ mfaSecret: users.mfaSecret, mfaEnabled: users.mfaEnabled, mfaMethod: users.mfaMethod })
@@ -1366,6 +1393,9 @@ mfaRoutes.post('/mfa/step-up', authMiddleware, zValidator('json', mfaStepUpSchem
     const r = await twilio.checkVerificationCode(u.phoneNumber, body.code);
     if (r.serviceError) return c.json({ error: 'SMS verification temporarily unavailable' }, 502);
     ok = r.valid;
+  } else if (body.method === 'recovery') {
+    recoveryCodeToConsume = body.code;
+    ok = true;
   } else {
     // passkey — client must have already called POST /auth/mfa/step-up/options.
     ok = await verifyStepUpPasskeyAssertion(auth.user.id, body.credential);
@@ -1388,7 +1418,7 @@ mfaRoutes.post('/mfa/step-up', authMiddleware, zValidator('json', mfaStepUpSchem
   if (!epochs || !auth.token?.sid) {
     return c.json({ error: 'Service temporarily unavailable' }, 503);
   }
-  const grantId = await mintStepUpGrant({
+  const grantBinding = {
     userId: auth.user.id,
     operation: body.operation,
     authEpoch: epochs.authEpoch,
@@ -1401,6 +1431,8 @@ mfaRoutes.post('/mfa/step-up', authMiddleware, zValidator('json', mfaStepUpSchem
           ? maintenanceResourceDigest(boundResource as z.infer<typeof maintenanceStepUpResource>)
           : body.operation === 'device_move_org'
             ? moveOrgResourceDigest(boundResource as z.infer<typeof moveOrgStepUpResource>)
+            : body.operation === 'device_force_reboot'
+            ? forceRebootResourceDigest(boundResource as z.infer<typeof forceRebootStepUpResource>)
             : body.operation === 'parked_device_assign'
             ? parkedAssignResourceDigest(boundResource as z.infer<typeof parkedAssignStepUpResource>)
             : body.operation === 'parked_device_assign_bulk'
@@ -1430,12 +1462,40 @@ mfaRoutes.post('/mfa/step-up', authMiddleware, zValidator('json', mfaStepUpSchem
                 ? autopayRequestRecipientResourceDigest(boundResource as z.infer<typeof autopayRequestRecipientStepUpResource>)
               : body.operation === 'org_payment_settings_update'
                 ? orgPaymentSettingsResourceDigest(boundResource as z.infer<typeof orgPaymentSettingsStepUpResource>)
+              : body.operation === 'migration_window_open'
+                ? migrationWindowOpenResourceDigest(boundResource as z.infer<typeof migrationWindowOpenStepUpResource>)
+              : body.operation === 'caller_verification_administrative_disable'
+                ? callerVerificationAdministrativeDigest(boundResource as z.infer<typeof callerVerificationAdministrativeStepUpResource>)
+              : body.operation === 'wisp_grant'
+                // The grantor is always the caller, never a body field.
+                ? wispGrantResourceDigest({ grantorUserId: auth.user.id, ...(boundResource as z.infer<typeof wispGrantStepUpResource>) })
               : body.operation === 'delete_passkey'
                 ? passkeyRemovalResourceDigest(body.passkeyId!)
                 : '',
-  });
+  };
+  const grantId = await mintStepUpGrant(grantBinding);
   if (!grantId) {
     return c.json({ error: 'Service temporarily unavailable' }, 503);
+  }
+
+  if (recoveryCodeToConsume !== null) {
+    const recoveryCode = recoveryCodeToConsume;
+    try {
+      await db.transaction((tx) => consumeRecoveryCode(tx, auth.user.id, recoveryCode));
+    } catch (error) {
+      await consumeStepUpGrant(grantId, grantBinding);
+      if (!(error instanceof RecoveryCodeInvalidError)) throw error;
+      writeAuthAudit(c, {
+        orgId: auth.orgId ?? undefined,
+        action: 'auth.mfa.stepup.failed',
+        result: 'failure',
+        reason: 'invalid_factor',
+        userId: auth.user.id,
+        email: auth.user.email,
+        details: { method: body.method },
+      });
+      return rejectProof(c, 'Invalid credentials', MFA_PROOF_INVALID, MFA_PROOF_REJECTION_STATUS);
+    }
   }
 
   writeAuthAudit(c, {

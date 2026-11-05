@@ -1,8 +1,9 @@
 import { pgTable, uuid, varchar, text, timestamp, boolean, jsonb, pgEnum, integer, real, bigint, date, primaryKey, index, unique, uniqueIndex, foreignKey } from 'drizzle-orm/pg-core';
-import { ipClassEnum, organizations, sites } from './orgs';
+import { sql } from 'drizzle-orm';
+import { ipClassEnum, organizations, partners, sites } from './orgs';
 import { users } from './users';
 import { aiInitiatorKindEnum } from './aiInitiator';
-import type { BatteryStatus, DesktopAccessState, InterfaceBandwidth, TCCPermissions, VpnPresence } from '@breeze/shared';
+import type { IsolationMechanism, BatteryStatus, DesktopAccessState, InterfaceBandwidth, TCCPermissions, VpnPresence } from '@breeze/shared';
 
 export const osTypeEnum = pgEnum('os_type', ['windows', 'macos', 'linux']);
 export const deviceStatusEnum = pgEnum('device_status', ['online', 'offline', 'maintenance', 'decommissioned', 'quarantined', 'updating', 'pending']);
@@ -122,10 +123,9 @@ export const devices = pgTable('devices', {
   // logs ingest route (agents/logs.ts), throttled to a conditional UPDATE so
   // a batch that moved the value < 5 min doesn't cost a write on the hot
   // ingest path. NULL = never shipped a log (or predates this column).
-  // Combined with `status`, this is what lets the server tell "a heartbeating
-  // device that is quiet by design" from "a heartbeating device whose log
-  // shipping is mute" without depending on the (possibly broken) log channel
-  // itself — see isDeviceLogSilent in @breeze/shared.
+  // Not a health signal on its own: agents ship warn+ by default, so a
+  // healthy agent can be log-quiet for hours. Shipping health comes from the
+  // agent's heartbeat instead (#7067).
   lastLogAt: timestamp('last_log_at', { withTimezone: true }),
   enrolledAt: timestamp('enrolled_at').defaultNow().notNull(),
   // Bare-metal recovery W04a: stamped by the heartbeat check-in that completes
@@ -233,6 +233,11 @@ export const devices = pgTable('devices', {
   // build correctly reports back down to 0. Task 5 gates managed-software
   // dispatch on this value.
   outboundNetworkPolicyVersion: integer('outbound_network_policy_version').notNull().default(0),
+  // Non-sticky capability truth: written every heartbeat; omission after a downgrade clears it.
+  networkIsolationVersion: integer('network_isolation_version').notNull().default(0),
+  networkIsolationMechanism: text('network_isolation_mechanism').$type<IsolationMechanism>(),
+  networkIsolationUnsupportedReason: text('network_isolation_unsupported_reason'),
+  networkIsolationReady: boolean('network_isolation_ready').notNull().default(false),
   // #3409 PR4 — agent capability for encrypted secret-env delivery. 0 for every
   // agent build predating PR4b and for any heartbeat omitting the field; only
   // the recognized integer version 1 is written as anything else. Non-sticky
@@ -247,10 +252,40 @@ export const devices = pgTable('devices', {
   peripheralPolicyProtocolVersion: integer('peripheral_policy_protocol_version').notNull().default(0),
   rollbackProtocolVersion: integer('rollback_protocol_version').notNull().default(0),
   pamLifetimeProtocolVersion: integer('pam_lifetime_protocol_version').notNull().default(0),
+  // Independent of PAM availability: unavailable agents can still retry verification.
+  pamReconciliationResetProtocolVersion: integer('pam_reconciliation_reset_protocol_version').notNull().default(0),
+  // #8928: 1 = the agent shows PAM outcome notices and may claim pam_request_notify.
+  pamUserNotifyProtocolVersion: integer('pam_user_notify_protocol_version').notNull().default(0),
   // PAM ownership epochs (#8203): current ownership epoch. Trigger-managed —
   // advanced by exactly +1 on every org_id change; a caller-written change is
   // refused with 42501. Never set it from app code.
   ownershipEpoch: integer('ownership_epoch').notNull().default(1),
+  // PAM ownership epochs W4 (#8206): the ownership epoch whose identity the
+  // agent has loaded, as last reported on a heartbeat (signed identity
+  // assertion v2). Written only by the heartbeat route, monotonically and never
+  // above ownershipEpoch. PAM dispatch requires it to equal ownershipEpoch;
+  // NULL counts as acknowledged only at ownershipEpoch = 1.
+  agentIdentityEpochAck: integer('agent_identity_epoch_ack'),
+  // Reinstall reattach W1a (#8318, spec 2026-10-12-reinstall-reattach-design
+  // §4.1): which agent install owns this row. 1 = the original install (every
+  // device that was never reattached); advanced by exactly one when a reattach
+  // confirm hands the row to a new install, never otherwise
+  // (devices_install_incarnation_guard). device_commands rows are stamped with
+  // it at insert, and claim/result acceptance refuse an earlier incarnation's
+  // rows. incarnation_started_at is NULL exactly while the incarnation is 1
+  // (devices_install_incarnation_chk); last_reattached_at backs the
+  // "Reinstalled on" badge. Written only by services/deviceInstallBoundary.
+  installIncarnation: integer('install_incarnation').notNull().default(1),
+  incarnationStartedAt: timestamp('incarnation_started_at', { withTimezone: true }),
+  lastReattachedAt: timestamp('last_reattached_at', { withTimezone: true }),
+  // Reinstall reattach W1b (#8318 §4.1, §6.2): the agent's declared rebind
+  // capability. 1 = the agent follows the bounded rebind (verifies the signed
+  // `rebind` directive, stages agent-generated credentials, confirms with the
+  // confirm-only token); only such a device can be the SOURCE of a reattach,
+  // and only it is sent the directive. Written by enroll and NON-STICKY on
+  // every main and parked heartbeat. Not reset at the install boundary: the
+  // new install reports its own at enroll.
+  rebindProtocolVersion: integer('rebind_protocol_version').notNull().default(0),
   // Revocation-lease capability. 1 = this agent build renews a per-session
   // revocation lease over the command WebSocket and stops the desktop stream
   // when the lease is revoked or expires past its grace window. 0 (default,
@@ -339,6 +374,22 @@ export const devices = pgTable('devices', {
   // the current episode began.
   helperInstallIssue: varchar('helper_install_issue', { length: 50 }),
   helperInstallIssueSince: timestamp('helper_install_issue_since', { withTimezone: true }),
+  // #8620 — agent-reported watchdog install health (#8618 / #7583). NULL =
+  // not reported. State and error class are closed vocabularies (see
+  // services/watchdogInstallHealth); written by the heartbeat ONLY on a
+  // transition. `since` is the server-clock time of the last state change.
+  watchdogInstallState: varchar('watchdog_install_state', { length: 20 }),
+  watchdogInstallErrorClass: varchar('watchdog_install_error_class', { length: 20 }),
+  watchdogInstallSince: timestamp('watchdog_install_since', { withTimezone: true }),
+  // #8608 — agent-reported log-shipping health (#8406). Classified per beat by
+  // services/logShippingHealth and written ONLY on a state change. NULL state =
+  // unknown (old agent / field absent), never healthy and never failing.
+  // 'failing' episodes are timed on the server receive clock via
+  // logShippingFailureStartedAt; the "sustained" verdict is derived at read time.
+  // lastError is a closed vocabulary (never raw error text), shown only while failing.
+  logShippingState: varchar('log_shipping_state', { length: 16 }),
+  logShippingFailureStartedAt: timestamp('log_shipping_failure_started_at', { withTimezone: true }),
+  logShippingLastError: varchar('log_shipping_last_error', { length: 200 }),
   // Enrollment idempotency (#2764): uninstall intent stamped by the agent's
   // graceful-uninstall notify path (Task 5/6); reaper decommissions once past
   // grace with no re-enrollment heartbeat. possibleReplacementOfDeviceId links
@@ -353,12 +404,19 @@ export const devices = pgTable('devices', {
   // silently extend itself. NULL on a decommissioned row means "removal time
   // unknown" and the purge job treats that as NEVER PURGE (fail closed).
   decommissionedAt: timestamp('decommissioned_at', { withTimezone: true }),
+  // Topology site location W3 (#7887, spec S§11): "Keep at <site>" — a technician confirmed this
+  // assignment, so no wrong-site suggestion is computed. Cleared by the
+  // breeze_devices_site_assignment_confirmation_reset trigger on any site/org change; no expiry.
+  siteAssignmentConfirmedAt: timestamp('site_assignment_confirmed_at', { withTimezone: true }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
   partnerExportUpdatedAt: timestamp('partner_export_updated_at', { precision: 3 }).defaultNow().notNull()
 }, (table) => ({
   idOrgSiteUnique: uniqueIndex('devices_id_org_id_site_id_uniq').on(table.id, table.orgId, table.siteId),
   idOrgUnique: uniqueIndex('devices_id_org_id_uniq').on(table.id, table.orgId),
+  logShippingFailingIdx: index('devices_log_shipping_failing_idx')
+    .on(table.logShippingFailureStartedAt)
+    .where(sql`log_shipping_failure_started_at IS NOT NULL`),
 }));
 
 // Linked device profiles for multi-boot systems (#2138). One row per physical
@@ -398,6 +456,8 @@ export const deviceHardware = pgTable('device_hardware', {
   diskTotalGb: integer('disk_total_gb'),
   gpuModel: varchar('gpu_model', { length: 255 }),
   serialNumber: varchar('serial_number', { length: 100 }),
+  // #9593: SMBIOS system SKU (HP's product number). NULL until an agent reports one.
+  productSku: varchar('product_sku', { length: 100 }),
   manufacturer: varchar('manufacturer', { length: 255 }),
   model: varchar('model', { length: 255 }),
   motherboardManufacturer: varchar('motherboard_manufacturer', { length: 255 }),
@@ -459,10 +519,11 @@ export const deviceNetwork = pgTable('device_network', {
   publicIp: varchar('public_ip', { length: 45 }),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 }, (table) => ({
-  // Every reader of this table filters by device_id (device-detail /network,
+  // Device-detail readers filter by device_id (device-detail /network,
   // cascade delete, the Devices-list LAN IP lookup). See migration
   // 2026-08-07-device-network-device-id-index.sql.
   deviceIdIdx: index('device_network_device_id_idx').on(table.deviceId),
+  orgMacIdx: index('device_network_org_mac_idx').on(table.orgId, sql`lower(${table.macAddress})`),
 }));
 
 export const deviceIpHistory = pgTable('device_ip_history', {
@@ -489,6 +550,7 @@ export const deviceIpHistory = pgTable('device_ip_history', {
 }, (table) => ({
   deviceIdIdx: index('device_ip_history_device_id_idx').on(table.deviceId),
   orgIdIdx: index('device_ip_history_org_id_idx').on(table.orgId),
+  orgMacIdx: index('device_ip_history_org_mac_idx').on(table.orgId, sql`lower(${table.macAddress})`),
   ipAddressIdx: index('device_ip_history_ip_address_idx').on(table.ipAddress),
   firstSeenIdx: index('device_ip_history_first_seen_idx').on(table.firstSeen),
   lastSeenIdx: index('device_ip_history_last_seen_idx').on(table.lastSeen),
@@ -631,13 +693,21 @@ export const deviceConfigState = pgTable('device_config_state', {
 
 export const deviceGroups = pgTable('device_groups', {
   id: uuid('id').primaryKey().defaultRandom(),
-  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  // org_id XOR partner_id (#10521). NULL org_id = a partner-owned group whose
+  // members live in every org of the partner; memberships keep the DEVICE's org.
+  // Use services/deviceGroupOwnership.ts helpers, never `group.orgId` alone.
+  orgId: uuid('org_id').references(() => organizations.id),
+  partnerId: uuid('partner_id').references(() => partners.id),
   siteId: uuid('site_id').references(() => sites.id),
   name: varchar('name', { length: 255 }).notNull(),
   type: deviceGroupTypeEnum('type').notNull().default('static'),
   rules: jsonb('rules'),
   filterConditions: jsonb('filter_conditions'),
   filterFieldsUsed: text('filter_fields_used').array().default([]),
+  filterRevision: integer('filter_revision').notNull().default(1),
+  evaluatedRevision: integer('evaluated_revision').notNull().default(0),
+  evaluatedAt: timestamp('evaluated_at'),
+  evaluationFailedOrgs: integer('evaluation_failed_orgs').notNull().default(0),
   parentId: uuid('parent_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
@@ -645,6 +715,7 @@ export const deviceGroups = pgTable('device_groups', {
   // Composite-FK target for contract_lines(device_group_id, org_id) (#3205 W02).
   // Created in SQL migration 2026-10-06-100100; declared here for db:check-drift.
   idOrgUnique: uniqueIndex('device_groups_id_org_id_uniq').on(table.id, table.orgId),
+  partnerIdIdx: index('device_groups_partner_id_idx').on(table.partnerId).where(sql`partner_id IS NOT NULL`),
 }));
 
 export const deviceGroupMemberships = pgTable('device_group_memberships', {
@@ -656,21 +727,13 @@ export const deviceGroupMemberships = pgTable('device_group_memberships', {
   addedBy: membershipSourceEnum('added_by').notNull().default('manual')
 }, (table) => ({
   pk: primaryKey({ columns: [table.deviceId, table.groupId] }),
-  // #3182 — the row's org_id alone is what RLS gates on, so without these the
-  // group_id and device_id are free to name a DIFFERENT org's group/device.
-  // Together they pin the triangle: group.org_id = membership.org_id =
-  // device.org_id. Created in SQL migration
-  // 2026-10-09-000200-device-group-memberships-composite-tenant-fks.sql, which
-  // also declares them DEFERRABLE INITIALLY IMMEDIATE (drizzle-orm's
-  // foreignKey() builder has no deferrable option, so that detail lives in the
-  // migration only) and adds the detach — to breeze_cascade_device_org_id(),
-  // an AFTER trigger — that drops these rows on a cross-org device move.
-  // Declared here for db:check-drift.
-  groupOrgFk: foreignKey({
-    columns: [table.groupId, table.orgId],
-    foreignColumns: [deviceGroups.id, deviceGroups.orgId],
-    name: 'device_group_memberships_group_org_fk',
-  }),
+  // #3182 / #10521 W1: membership.org_id remains the device's organization.
+  // The device composite FK is DEFERRABLE INITIALLY DEFERRED in
+  // 2026-10-09-000200 (Drizzle has no deferrable option). The deferred owner
+  // trigger in 2027-01-12-200100-device-group-membership-owner-integrity.sql
+  // replaces the group composite FK: an org group must match membership.org_id;
+  // a partner group must match that organization's partner. Both checks wait
+  // until COMMIT so the device-move detach and merge repoints can finish.
   deviceOrgFk: foreignKey({
     columns: [table.deviceId, table.orgId],
     foreignColumns: [devices.id, devices.orgId],
@@ -740,7 +803,13 @@ export const deviceCommands = pgTable('device_commands', {
   // table as system-scoped (both key on the literal column name).
   aiInitiatorKind: aiInitiatorKindEnum('ai_initiator_kind'),
   aiSessionId: uuid('ai_session_id'),
-  aiAgentRunId: uuid('ai_agent_run_id')
+  aiAgentRunId: uuid('ai_agent_run_id'),
+  // Reinstall reattach W1a (#8318 §4.2): the devices.install_incarnation this
+  // row was enqueued for. Stamped by the device_commands_stamp_incarnation
+  // trigger on EVERY insert (a value written here is overwritten) and
+  // immutable after. NULL only on rows from before the trigger, and a NULL
+  // counts as incarnation 1. See services/commandIncarnation.ts.
+  deviceIncarnation: integer('device_incarnation')
 });
 
 export const connectionProtocolEnum = pgEnum('connection_protocol', ['tcp', 'tcp6', 'udp', 'udp6']);
