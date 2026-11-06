@@ -70,6 +70,7 @@ describe('resolveRemoteAccessForDevice no-policy fallback', () => {
     vi.mocked(resolveEffectiveConfig).mockResolvedValueOnce({
       deviceId,
       features: {},
+      softwarePolicies: [],
       inheritanceChain: [],
     });
 
@@ -84,7 +85,7 @@ describe('resolveRemoteAccessForDevice no-policy fallback', () => {
   it('bypasses a stale allowed cache entry for live continuation checks', async () => {
     const deviceId = `test-device-policy-transition-${Date.now()}`;
     vi.mocked(resolveEffectiveConfig)
-      .mockResolvedValueOnce({ deviceId, features: {}, inheritanceChain: [] })
+      .mockResolvedValueOnce({ deviceId, features: {}, softwarePolicies: [], inheritanceChain: [] })
       .mockResolvedValueOnce({
         deviceId,
         features: {
@@ -211,6 +212,7 @@ describe('checkRemoteAccess for a parked device', () => {
     vi.mocked(resolveEffectiveConfig).mockResolvedValue({
       deviceId: 'any',
       features: {},
+      softwarePolicies: [],
       inheritanceChain: [],
     });
   });

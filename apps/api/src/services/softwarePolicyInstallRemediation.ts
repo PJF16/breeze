@@ -34,7 +34,8 @@ export type PolicyInstallSkipReason =
    * rather than dropped: the audit row is the only durable place a technician
    * can see that a requested install was not attempted, and why.
    */
-  | 'not_currently_missing';
+  | 'not_currently_missing'
+  | 'blocked_by_policy';
 
 export type PolicyInstallTarget =
   | { kind: 'install_method'; catalogId: string; installMethodId: string }

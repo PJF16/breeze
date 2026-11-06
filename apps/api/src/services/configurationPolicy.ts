@@ -40,7 +40,7 @@ import {
 } from '../db/schema';
 import { and, eq, desc, or, isNull, isNotNull, sql, inArray, notInArray, asc, getTableColumns, SQL } from 'drizzle-orm';
 import { canManagePartnerWidePolicies, PartnerWideWriteDeniedError } from './partnerWideAccess';
-import { buildRoleOsFilterConditions } from './featureConfigResolver';
+import { buildRoleOsFilterConditions, resolveExplicitSoftwarePolicies } from './featureConfigResolver';
 import {
   InvalidParentPolicyError,
   isCompatibleParent,
@@ -187,6 +187,8 @@ const BREEZE_DEFAULTS_SENTINEL = 'breeze-defaults';
 interface ResolvedFeature {
   featureType: ConfigFeatureType;
   featurePolicyId: string | null;
+  featurePolicyName?: string | null;
+  sourceKind?: 'configuration_policy' | 'software_policy';
   inlineSettings: unknown;
   sourceLevel: ConfigAssignmentLevel | 'default';
   sourceTargetId: string;
@@ -206,6 +208,7 @@ type DbExecutor = typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0
 export interface EffectiveConfiguration {
   deviceId: string;
   features: Record<string, ResolvedFeature>;
+  softwarePolicies: ResolvedFeature[];
   inheritanceChain: Array<{
     level: ConfigAssignmentLevel | 'default';
     targetId: string;
@@ -1848,9 +1851,9 @@ export async function addFeatureLink(
     // withDbAccessContext transaction, and postgres.js re-throws a raised
     // unique violation at commit time even after it's caught by the caller,
     // turning a mapped 409 back into a raw 500 (see createCatalogItem in
-    // catalogService.ts). `config_feature_links_unique` (config_policy_id,
-    // feature_type) is the only non-PK unique constraint on this table, so a
-    // bare onConflictDoNothing only ever suppresses that duplicate-link case.
+    // catalogService.ts). Partial indexes reject duplicate feature types for
+    // exclusive features and duplicate software-policy references for software.
+    // A bare onConflictDoNothing handles both without aborting the transaction.
     // Callers must treat a null return as "already linked".
     const [link] = await tx
       .insert(configPolicyFeatureLinks)
@@ -2700,6 +2703,8 @@ async function resolveEffectiveConfigWithExecutor(
       featureLinkId: configPolicyEffectiveFeatureLinks.id,
       featureType: configPolicyEffectiveFeatureLinks.featureType,
       featurePolicyId: configPolicyEffectiveFeatureLinks.featurePolicyId,
+      featurePolicyName: softwarePolicies.name,
+      softwarePolicyActive: softwarePolicies.isActive,
       inlineSettings: configPolicyEffectiveFeatureLinks.inlineSettings,
       inherited: configPolicyEffectiveFeatureLinks.inherited,
       linkSourcePolicyId: configPolicyEffectiveFeatureLinks.sourcePolicyId,
@@ -2720,9 +2725,15 @@ async function resolveEffectiveConfigWithExecutor(
       configPolicyEffectiveFeatureLinks,
       eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
     )
+    .leftJoin(softwarePolicies, and(
+      eq(configPolicyEffectiveFeatureLinks.featureType, 'software_policy'),
+      eq(configPolicyEffectiveFeatureLinks.featurePolicyId, softwarePolicies.id),
+    ))
     .where(and(
       sql`(${sql.join(targetConditions, sql` OR `)})`,
       notInArray(configPolicyEffectiveFeatureLinks.featureType, [...RETIRED_CONFIG_FEATURE_TYPES]),
+      // Disabled or missing software policies do not apply; other features keep their usual resolution.
+      or(sql`${configPolicyEffectiveFeatureLinks.featureType} <> 'software_policy'`, eq(softwarePolicies.isActive, true)),
       // Apply the optional role/os device-type filter (#1724). A NULL filter
       // matches all; a set filter gates the assignment to matching devices.
       ...buildRoleOsFilterConditions(device),
@@ -2782,6 +2793,7 @@ async function resolveEffectiveConfigWithExecutor(
 
   // 7. First match per feature type wins
   const features: Record<string, ResolvedFeature> = {};
+  const resolvedSoftwarePolicies: ResolvedFeature[] = [];
   const chainMap = new Map<string, {
     level: ConfigAssignmentLevel;
     targetId: string;
@@ -2793,10 +2805,12 @@ async function resolveEffectiveConfigWithExecutor(
 
   for (const row of sorted) {
     const ft = row.featureType as ConfigFeatureType;
-    if (!features[ft]) {
-      features[ft] = {
+    if (ft === 'software_policy' && (row.softwarePolicyActive === false || row.softwarePolicyActive === null)) continue;
+    if (!features[ft] || ft === 'software_policy') {
+      const resolved: ResolvedFeature = {
         featureType: ft,
         featurePolicyId: row.featurePolicyId,
+        featurePolicyName: row.featurePolicyName,
         inlineSettings: row.inlineSettings,
         sourceLevel: row.assignmentLevel as ConfigAssignmentLevel,
         sourceTargetId: row.assignmentTargetId,
@@ -2808,6 +2822,10 @@ async function resolveEffectiveConfigWithExecutor(
           ? inheritedPolicyNames.get(row.linkSourcePolicyId) ?? null
           : null,
       };
+      if (!features[ft]) features[ft] = resolved;
+      if (ft === 'software_policy' && row.featurePolicyId && !resolvedSoftwarePolicies.some((entry) => entry.featurePolicyId === row.featurePolicyId)) {
+        resolvedSoftwarePolicies.push(resolved);
+      }
     }
 
     const chainKey = `${row.assignmentLevel}:${row.assignmentTargetId}:${row.policyId}`;
@@ -2830,6 +2848,21 @@ async function resolveEffectiveConfigWithExecutor(
     ...entry,
     featureTypes: Array.from(entry.featureTypes),
   }));
+
+  const explicitPolicies = await withDevicePartnerPolicyVisibility(executor, org?.partnerId ?? null, (ex) => resolveExplicitSoftwarePolicies({
+    deviceId, orgId: device.orgId, siteId: device.siteId, partnerId: org?.partnerId ?? null, groupIds: rawGroupIds,
+  }, ex));
+  for (const policy of explicitPolicies) {
+    if (resolvedSoftwarePolicies.some((entry) => entry.featurePolicyId === policy.id)) continue;
+    const entry: ResolvedFeature = {
+      featureType: 'software_policy', featurePolicyId: policy.id, featurePolicyName: policy.name, sourceKind: 'software_policy',
+      inlineSettings: null, sourceLevel: 'device', sourceTargetId: deviceId,
+      sourcePolicyId: policy.id, sourcePolicyName: policy.name, sourcePriority: policy.priority,
+      inheritedFromPolicyId: null, inheritedFromPolicyName: null,
+    };
+    resolvedSoftwarePolicies.push(entry);
+    if (!features.software_policy) features.software_policy = entry;
+  }
 
   // Synthesizes the virtual bottom-of-hierarchy "Breeze Defaults" layer for every
   // feature type with no real winner. The BREEZE_DEFAULTS_SENTINEL ids, priority 0,
@@ -2865,7 +2898,7 @@ async function resolveEffectiveConfigWithExecutor(
     }
   }
 
-  return { deviceId, features, inheritanceChain };
+  return { deviceId, features, softwarePolicies: resolvedSoftwarePolicies, inheritanceChain };
 }
 
 export async function resolveEffectiveConfig(

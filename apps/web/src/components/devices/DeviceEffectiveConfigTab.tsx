@@ -66,6 +66,7 @@ type AssignmentLevel =
 type ResolvedFeature = {
   featureType: FeatureType;
   featurePolicyId: string | null;
+  featurePolicyName?: string | null;
   inlineSettings: Record<string, unknown> | null;
   sourceLevel: AssignmentLevel;
   sourceTargetId: string;
@@ -95,6 +96,7 @@ type EffectiveConfiguration = {
   deviceId: string;
   features: Record<string, ResolvedFeature>;
   inheritanceChain: InheritanceEntry[];
+  softwarePolicies?: ResolvedFeature[];
 };
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -372,8 +374,9 @@ export default function DeviceEffectiveConfigTab({
       {/* Enforced feature cards — only features a real assigned policy wins. */}
       {enforcedTypes.length > 0 && (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {enforcedTypes.map((ft) => {
-            const feature = features[ft]!;
+          {enforcedTypes.flatMap((ft) => ft === "software_policy" && data.softwarePolicies?.length
+            ? data.softwarePolicies.map((feature) => ({ ft, feature }))
+            : [{ ft, feature: features[ft]! }]).map(({ ft, feature }) => {
             const { label, Icon } = FEATURE_META[ft];
             const settings = summarizeFeatureSettings(ft, feature, (ringLinked) => ({
               label: t("deviceEffectiveConfigTab.patchApproval.label"),
@@ -383,13 +386,13 @@ export default function DeviceEffectiveConfigTab({
             }));
 
             return (
-              <div key={ft} className="rounded-lg border bg-card p-5 shadow-xs">
+              <div key={`${ft}:${feature.sourcePolicyId}:${feature.featurePolicyId ?? "inline"}`} className="rounded-lg border bg-card p-5 shadow-xs">
                 <div className="flex items-start gap-3">
                   <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
                     <Icon className="h-5 w-5" />
                   </div>
                   <div className="min-w-0 flex-1">
-                    <h4 className="font-semibold">{label}</h4>
+                    <h4 className="font-semibold">{ft === "software_policy" ? feature.featurePolicyName ?? label : label}</h4>
                     <p className="mt-0.5 text-xs text-muted-foreground">
                       {t("deviceEffectiveConfigTab.from")}{" "}
                       <span className="font-medium text-foreground">

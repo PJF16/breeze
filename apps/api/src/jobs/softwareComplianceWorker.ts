@@ -27,6 +27,7 @@ import {
   type SoftwarePolicyRemediationStatus,
 } from '../services/softwarePolicyService';
 import { resolveDeviceIdsForSoftwarePolicy } from '../services/featureConfigResolver';
+import { getSoftwareBlocklistRulesForDevice } from '../services/softwarePolicyConflicts';
 import { readLatestPolicyOwnedInstallByDevice } from '../services/softwarePolicyInstallRemediation';
 import {
   scheduleSoftwareInstallRemediation,
@@ -582,7 +583,7 @@ export async function processCheckPolicy(data: CheckPolicyJobData): Promise<{
     };
   }
 
-  // Resolve devices via config policy hierarchy ("closest wins")
+  // Union matching configuration-policy assignments and explicit software-policy targets.
   const resolvedDeviceIds = await resolveDeviceIdsForSoftwarePolicy(policy.id);
   let deviceIds = resolvedDeviceIds;
   if (Array.isArray(data.deviceIds) && data.deviceIds.length > 0) {
@@ -665,7 +666,10 @@ export async function processCheckPolicy(data: CheckPolicyJobData): Promise<{
     try {
       const existing = existingByDevice.get(deviceId);
       const inventory = inventoryByDevice.get(deviceId) ?? [];
-      const evaluated = evaluateSoftwarePolicyAgainstInventory(policy, inventory);
+      const blockedRules = policy.mode === 'allowlist'
+        ? await getSoftwareBlocklistRulesForDevice(deviceId)
+        : [];
+      const evaluated = evaluateSoftwarePolicyAgainstInventory(policy, inventory, blockedRules);
       const violationsWithStableTimestamps = withStableViolationTimestamps(
         evaluated.violations,
         existing?.violations ?? null

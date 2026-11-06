@@ -933,14 +933,14 @@ export async function resolveComplianceAssignmentForDevice(
 }
 
 /**
- * Resolves the winning software policy ID for a device via config policy hierarchy.
- * Returns the featurePolicyId from the closest config policy assignment, or null.
+ * Software policies are additive across all matching hierarchy assignments.
+ * Explicit software-policy targets are included independently of config links.
  */
-export async function resolveSoftwarePolicyForDevice(
+export async function resolveSoftwarePoliciesForDevice(
   deviceId: string
-): Promise<string | null> {
+): Promise<string[]> {
   const hierarchy = await loadDeviceHierarchy(deviceId);
-  if (!hierarchy) return null;
+  if (!hierarchy) return [];
 
   const targetConditions = buildTargetConditions(hierarchy);
   const roleOsConditions = buildRoleOsFilterConditions(hierarchy);
@@ -954,6 +954,7 @@ export async function resolveSoftwarePolicyForDevice(
   const rows = await db
     .select({
       featurePolicyId: configPolicyEffectiveFeatureLinks.featurePolicyId,
+      softwarePolicyActive: softwarePolicies.isActive,
       assignmentLevel: configPolicyAssignments.level,
       assignmentPriority: configPolicyAssignments.priority,
       assignmentCreatedAt: configPolicyAssignments.createdAt,
@@ -975,6 +976,10 @@ export async function resolveSoftwarePolicyForDevice(
         eq(configPolicyEffectiveFeatureLinks.featureType, 'software_policy')
       )
     )
+    .innerJoin(softwarePolicies, and(
+      eq(configPolicyEffectiveFeatureLinks.featurePolicyId, softwarePolicies.id),
+      eq(softwarePolicies.isActive, true),
+    ))
     .where(and(sql`(${sql.join(targetConditions, sql` OR `)})`, ...roleOsConditions))
     .orderBy(
       configPolicyAssignments.level,
@@ -982,10 +987,43 @@ export async function resolveSoftwarePolicyForDevice(
       configPolicyAssignments.createdAt
     );
 
-  if (rows.length === 0) return null;
+  const direct = await resolveExplicitSoftwarePolicies(hierarchy);
+  return [...new Set([
+    ...sortByHierarchy(rows.filter((row) => row.softwarePolicyActive !== false && row.softwarePolicyActive !== null)).map((row) => row.featurePolicyId).filter((id): id is string => !!id),
+    ...direct.map((policy) => policy.id),
+  ])];
+}
 
-  const sorted = sortByHierarchy(rows);
-  return sorted[0]!.featurePolicyId;
+
+export async function resolveSoftwarePolicyForDevice(deviceId: string): Promise<string | null> {
+  return (await resolveSoftwarePoliciesForDevice(deviceId))[0] ?? null;
+}
+
+/** Direct targets use the same device ownership boundary as hierarchy links. */
+export async function resolveExplicitSoftwarePolicies(
+  hierarchy: { deviceId: string; orgId: string; siteId: string; partnerId: string | null; groupIds: string[] },
+  executor: DbExecutor = db,
+) {
+  const owned = hierarchy.partnerId
+    ? or(eq(softwarePolicies.orgId, hierarchy.orgId), and(isNull(softwarePolicies.orgId), eq(softwarePolicies.partnerId, hierarchy.partnerId)))
+    : eq(softwarePolicies.orgId, hierarchy.orgId);
+  const policies = await executor.select().from(softwarePolicies).where(and(owned, eq(softwarePolicies.isActive, true)));
+  return policies.filter((policy) => softwarePolicyTargetsDevice(policy, hierarchy));
+}
+
+export function softwarePolicyTargetsDevice(
+  policy: { targetType: string | null; targetIds: string[] | null },
+  hierarchy: { deviceId: string; orgId: string; siteId: string; partnerId: string | null; groupIds: string[] },
+): boolean {
+  const ids = policy.targetIds ?? [];
+  switch (policy.targetType) {
+    case 'devices': case 'device': return ids.includes(hierarchy.deviceId);
+    case 'organization': return ids.includes(hierarchy.orgId);
+    case 'site': return ids.includes(hierarchy.siteId);
+    case 'device_group': return hierarchy.groupIds.some((id) => ids.includes(id));
+    case 'partner': return hierarchy.partnerId !== null && ids.includes(hierarchy.partnerId);
+    default: return false;
+  }
 }
 
 /**
@@ -996,8 +1034,7 @@ export async function resolveSoftwarePolicyForDevice(
  * 1. Find all config policies that link to this software policy
  * 2. Get all assignments for those config policies
  * 3. Resolve each assignment to device IDs based on level/targetId
- * 4. For each device, verify this software policy is the "winning" one
- *    (closest wins — if a device has a closer assignment linking to a different policy, exclude it)
+ * 4. Union explicit software-policy targets and verify membership in the additive set.
  */
 /**
  * Resolve the candidate device IDs for one config-policy assignment row, by
@@ -1074,20 +1111,15 @@ export async function resolveDeviceIdsForSoftwarePolicy(
       )
     );
 
-  if (links.length === 0) return [];
-
   const configPolicyIds = links.map((l) => l.configPolicyId);
 
   // 2. Get all assignments for those config policies
-  const assignments = await db
-    .select({
-      level: configPolicyAssignments.level,
-      targetId: configPolicyAssignments.targetId,
-    })
+  const assignments = configPolicyIds.length ? await db
+    .select({ level: configPolicyAssignments.level, targetId: configPolicyAssignments.targetId })
     .from(configPolicyAssignments)
-    .where(inArray(configPolicyAssignments.configPolicyId, configPolicyIds));
-
-  if (assignments.length === 0) return [];
+    .where(inArray(configPolicyAssignments.configPolicyId, configPolicyIds)) : [];
+  const [policy] = await db.select().from(softwarePolicies).where(eq(softwarePolicies.id, softwarePolicyId)).limit(1);
+  if (!policy || !policy.isActive) return [];
 
   // 3. Resolve each assignment to device IDs
   const candidateDeviceIds = new Set<string>();
@@ -1099,11 +1131,15 @@ export async function resolveDeviceIdsForSoftwarePolicy(
     }
   }
 
+  // Explicit targeting is independent of configuration-policy links.
+  for (const targetId of policy.targetIds ?? []) {
+    const level = policy.targetType === 'devices' ? 'device' : policy.targetType;
+    if (level) for (const id of await resolveAssignmentDeviceIds(level, targetId)) candidateDeviceIds.add(id);
+  }
   if (candidateDeviceIds.size === 0) return [];
 
-  // 4. Verify each candidate — the winning software policy must be this one.
-  // For efficiency, batch-check: resolve the winning policy for each candidate device.
-  // A device is included only if its closest config policy points to this software policy.
+  // 4. Re-resolve membership to enforce ownership, assignment role/OS filters,
+  // and execution-safe group targeting. Other software policies cannot evict it.
   const verifiedDeviceIds: string[] = [];
   const candidates = Array.from(candidateDeviceIds);
 
@@ -1113,12 +1149,12 @@ export async function resolveDeviceIdsForSoftwarePolicy(
     const batch = candidates.slice(i, i + BATCH_SIZE);
     const results = await Promise.all(
       batch.map(async (deviceId) => {
-        const winningPolicyId = await resolveSoftwarePolicyForDevice(deviceId);
-        return { deviceId, winningPolicyId };
+        const policyIds = await resolveSoftwarePoliciesForDevice(deviceId);
+        return { deviceId, policyIds };
       })
     );
-    for (const { deviceId, winningPolicyId } of results) {
-      if (winningPolicyId === softwarePolicyId) {
+    for (const { deviceId, policyIds } of results) {
+      if (policyIds.includes(softwarePolicyId)) {
         verifiedDeviceIds.push(deviceId);
       }
     }
