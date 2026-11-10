@@ -5,7 +5,7 @@
  * backup_snapshots, backup_snapshot_files and backup_configs applies in
  * addition to the explicit org filters below.
  */
-import { and, eq, inArray, isNull, max, sql, count } from 'drizzle-orm';
+import { and, eq, inArray, isNull, max, ne, sql, count } from 'drizzle-orm';
 import { assertInTransaction, db } from '../db';
 import {
   backupSnapshotFiles,
@@ -17,8 +17,14 @@ import {
 } from '../db/schema';
 import { backupSnapshotAttestations } from '../db/schema/backupSnapshotAttestations';
 import { resolveBackupProviderConfig } from './backupProviderConfig';
-import { attestationJoinColumns, boundIndexCondition, joinedAttestation } from './backupRestoreIntegrity';
+import {
+  attestationJoinColumns,
+  boundIndexCondition,
+  joinedAttestation,
+  snapshotPredatesDeviceIncarnationSql,
+} from './backupRestoreIntegrity';
 import { evaluateStorageSessionBudget } from './backupStorageSessionBudget';
+import { loadOriginKeyRootRows, type KeyRootPair } from './backupOriginKeyRoots';
 import { isSnapshotWriteInFlight } from './backupSnapshotIdReservations';
 import type { BrokeredReadStore, StorageSessionRow, StorageSnapshotRow } from './backupStorageSessions';
 
@@ -33,10 +39,13 @@ const snapshotColumns = () => ({
   snapshotId: backupSnapshots.snapshotId,
   storageIdentity: backupSnapshots.storageIdentity,
   keyLayout: backupSnapshots.keyLayout,
+  keyPrefix: backupSnapshots.keyPrefix,
   fileIndexStatus: backupSnapshots.fileIndexStatus,
   fileIndexManifestSha256: backupSnapshots.fileIndexManifestSha256,
   fileIndexError: backupSnapshots.fileIndexError,
   integrityStatus: backupSnapshots.integrityStatus,
+  // #8318 §5.4: read in the same statement as the attestation it qualifies.
+  producedBeforeDeviceIncarnation: snapshotPredatesDeviceIncarnationSql(),
   metadata: backupSnapshots.metadata,
   // One row per snapshot at most (unique on snapshot_db_id).
   attestation: attestationJoinColumns(),
@@ -74,6 +83,7 @@ const sessionColumns = () => ({
   deadline: backupStorageSessions.deadline,
   revokedAt: backupStorageSessions.revokedAt,
   callCount: backupStorageSessions.callCount,
+  lastUsedAt: backupStorageSessions.lastUsedAt,
   resolvedObjectCount: backupStorageSessions.resolvedObjectCount,
   rateCallsAvailable: backupStorageSessions.rateCallsAvailable,
   rateObjectsAvailable: backupStorageSessions.rateObjectsAvailable,
@@ -124,10 +134,12 @@ export const drizzleBrokeredReadStore: BrokeredReadStore = {
   },
 
   async countIndexedFiles(snapshotDbId) {
+    // Storage keys only: a content-less row (a directory or symlink entry,
+    // backup_path '', #11235) authorizes no object, so it sizes no budget.
     const [row] = await db
       .select({ n: count() })
       .from(backupSnapshotFiles)
-      .where(eq(backupSnapshotFiles.snapshotDbId, snapshotDbId));
+      .where(and(eq(backupSnapshotFiles.snapshotDbId, snapshotDbId), ne(backupSnapshotFiles.backupPath, '')));
     return Number(row?.n ?? 0);
   },
 
@@ -198,6 +210,8 @@ export const drizzleBrokeredReadStore: BrokeredReadStore = {
       .where(and(
         eq(backupSnapshotFiles.snapshotDbId, snapshotDbId),
         inArray(backupSnapshotFiles.backupPath, keys),
+        // A content-less row (#11235) names no object, whatever key is asked.
+        ne(backupSnapshotFiles.backupPath, ''),
         boundIndexCondition(boundManifestSha256),
       ));
     return new Set(rows.map((r) => r.backupPath));
@@ -205,7 +219,7 @@ export const drizzleBrokeredReadStore: BrokeredReadStore = {
 
   async loadVerifiedOrigins(snapshotDbId, originSnapshotIds) {
     if (originSnapshotIds.length === 0) return [];
-    return db
+    const origins = await db
       .select({
         originSnapshotId: backupSnapshotOrigins.originSnapshotId,
         originOrgId: backupSnapshotOrigins.originOrgId,
@@ -217,6 +231,23 @@ export const drizzleBrokeredReadStore: BrokeredReadStore = {
         eq(backupSnapshotOrigins.snapshotDbId, snapshotDbId),
         inArray(backupSnapshotOrigins.originSnapshotId, originSnapshotIds),
       ));
+    // Each origin's recorded key root (#7081), read per (org, identity) it
+    // was verified under.
+    const groups = new Map<string, { orgId: string; storageIdentity: string; ids: string[] }>();
+    for (const o of origins) {
+      const k = `${o.originOrgId}\u0000${o.originStorageIdentity}`;
+      const g = groups.get(k) ?? { orgId: o.originOrgId, storageIdentity: o.originStorageIdentity, ids: [] };
+      g.ids.push(o.originSnapshotId);
+      groups.set(k, g);
+    }
+    const roots = new Map<string, Map<string, KeyRootPair>>();
+    for (const [k, g] of groups) {
+      roots.set(k, await loadOriginKeyRootRows({ orgId: g.orgId, storageIdentity: g.storageIdentity, originSnapshotIds: g.ids }));
+    }
+    return origins.map((o) => {
+      const originKeyRoot = roots.get(`${o.originOrgId}\u0000${o.originStorageIdentity}`)?.get(o.originSnapshotId);
+      return originKeyRoot ? { ...o, originKeyRoot } : o;
+    });
   },
 
   async consumeBudget(sessionId, request, now) {

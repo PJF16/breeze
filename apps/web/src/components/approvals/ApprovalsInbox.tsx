@@ -18,15 +18,18 @@ import {
   isNoApproverDeviceError,
   isNotSoleApprover,
   isSiteCeiling,
+  isApproverScopeRequired,
   isStepUpRequired,
   type BatchRowResult,
 } from '@/lib/intentApprovals';
 import { loginPathWithNext } from '@/lib/authScope';
 import { navigateTo } from '@/lib/navigation';
+import { usePermissions } from '@/lib/permissions';
 import { useHashState } from '@/lib/useHashState';
 import { ActionError, runAction } from '@/lib/runAction';
 import { formatRelativeTime } from '@/lib/utils';
 import { fetchWithAuth } from '../../stores/auth';
+import { useAiAgentsPolicyDecideGate } from '../../stores/featuresStore';
 import ScriptProposalApprovalCard from '../ai/ScriptProposalApprovalCard';
 import RecentApprovals from './RecentApprovals';
 import { ApproverAssuranceNotice } from './ApproverAssuranceNotice';
@@ -51,6 +54,7 @@ import {
   type SortOrder,
 } from './approvalGrouping';
 import DiagnosticAccessApprovalDetails, { isDiagnosticAccessApproval } from './DiagnosticAccessApprovalDetails';
+import OperatorPlanApprovalCard, { isOperatorPlanApproval, isOperatorPlanReadable } from './OperatorPlanApprovalCard';
 
 const LIVE_REFETCH_DEBOUNCE_MS = 750;
 /** WS is only a nudge; polling is the guarantee. useEventStream gives up
@@ -86,6 +90,8 @@ type DecisionErrorKind =
   // governance ceiling twin of `notSoleApprover`. Terminal for this viewer;
   // never falls back to the generic `decisionFailed` "Try again" copy.
   | 'siteCeiling'
+  // A partner-wide intent needs a partner-level approver. Terminal for this viewer too.
+  | 'approverScopeRequired'
   | 'verificationFailed'
   | 'alreadyDecided'
   | 'expired'
@@ -148,8 +154,10 @@ async function fetchOrgGraduation(orgId: string): Promise<OrgGraduationInfo> {
         const res = await fetchWithAuth(
           `/ai/agents/graduation?orgId=${encodeURIComponent(orgId)}&kind=${encodeURIComponent(kind)}`,
         );
-        // Most orgs run fewer than three kinds — a 404 here just means this
-        // kind has no active agent, not a failure.
+        // Most orgs run fewer than all acting kinds — a 404 here just means
+        // this kind has no active agent, not a failure. (Only reached while
+        // policy-decide is on: the caller skips this whole fan-out while the
+        // flag is dark — #9939.)
         if (!res.ok) return;
         const body = (await res.json()) as Partial<AiAgentGraduationDto> | null;
         if (!body || !Array.isArray(body.rows)) return;
@@ -207,6 +215,7 @@ function classifyDecideError(err: unknown): DecisionErrorKind | null {
   if (isNoApproverDeviceError(err) || isStepUpRequired(err)) return 'noApproverDevice';
   if (isNotSoleApprover(err)) return 'notSoleApprover';
   if (isSiteCeiling(err)) return 'siteCeiling';
+  if (isApproverScopeRequired(err)) return 'approverScopeRequired';
   if (err instanceof CeremonyError) return 'verificationFailed';
   if (err instanceof ActionError && err.status === 401) {
     const token = (err.body as { error?: unknown } | null | undefined)?.error;
@@ -228,6 +237,7 @@ function rowErrorKind(result: BatchRowResult): DecisionErrorKind {
   if (token === 'step_up_required') return 'noApproverDevice';
   if (token === 'not_sole_approver') return 'notSoleApprover';
   if (token === 'site_ceiling') return 'siteCeiling';
+  if (token === 'approver_scope_required') return 'approverScopeRequired';
   if (token === 'assertion_failed' || token === 'reauth_required') {
     return 'verificationFailed';
   }
@@ -262,6 +272,18 @@ function intentIdFromHash(hash: string): string | undefined {
   return m ? m[1]! : undefined;
 }
 
+/** `GET /action-intents/:id/status` body (requester/approver-visible). */
+type IntentStatusView = {
+  id: string;
+  status: 'pending_approval' | 'in_progress' | 'completed' | 'failed' | 'rejected' | 'expired' | 'cancelled';
+  actionLabel: string | null;
+  targetSummary: string | null;
+  approvalScope: string | null;
+  requestingClientLabel: string | null;
+  expiresAt: string | null;
+  createdAt: string | null;
+};
+
 /** How long a hash-linked card stays ring-highlighted after landing — mirrors
  *  `HIGHLIGHT_DURATION_MS` in the portal `DeviceList` `/devices#<id>` pattern
  *  this follows. */
@@ -281,7 +303,14 @@ export default function ApprovalsInbox() {
   // — without it, every 30s poll refresh (which changes the `approvals`
   // array reference) would re-trigger the scroll/highlight or the notice for
   // the rest of the page's life.
-  const hashIntentHandledRef = useRef(false);
+  // Holds the hash id already resolved (not a boolean) so a changed hash is
+  // resolved again, while poll refreshes of the same hash are not.
+  const hashIntentHandledRef = useRef<string | null>(null);
+  const hashIntentLatestRef = useRef<string | null>(null);
+  hashIntentLatestRef.current = hashIntentId;
+  // Requester-visible status for a hashed intent that is not in the loaded
+  // rows (e.g. an MCP-originated intent the requester cannot decide).
+  const [intentStatus, setIntentStatus] = useState<IntentStatusView | null>(null);
   const { t } = useTranslation('approvals');
   const [approvals, setApprovals] = useState<PendingApproval[]>([]);
   const [loading, setLoading] = useState(true);
@@ -328,6 +357,16 @@ export default function ApprovalsInbox() {
   // the "already requested" ref only ever grow.
   const graduationQueueRef = useRef<string[]>([]);
   const graduationWorkerActiveRef = useRef(false);
+  // #9939: the prefetch is only worth making when the affordance can render.
+  // While policy-decide is dark (the default) `alwaysAllowTargetFor` returns
+  // null for every card whatever the graduation read says, and without
+  // `ai_agents:read` the route 403s — either way every request would be wasted
+  // (on the flag-dark sweep stack, one 404 per acting kind per org per load).
+  // `loaded` is checked too, so the read waits for /config instead of racing it.
+  const policyDecideGate = useAiAgentsPolicyDecideGate();
+  const { can } = usePermissions();
+  const graduationReadable =
+    policyDecideGate.loaded && policyDecideGate.enabled && can('ai_agents', 'read');
   const [alwaysAllowTarget, setAlwaysAllowTarget] = useState<{
     approval: PendingApproval;
     opKey: string;
@@ -525,11 +564,33 @@ export default function ApprovalsInbox() {
   // removed, never existed) surfaces a dismissible notice instead of a
   // confusing no-op deep link.
   useEffect(() => {
-    if (loading || hashIntentHandledRef.current || !hashIntentId) return;
-    hashIntentHandledRef.current = true;
+    if (loading || !hashIntentId || hashIntentHandledRef.current === hashIntentId) return;
+    hashIntentHandledRef.current = hashIntentId;
+    setIntentGoneNotice(false);
+    setIntentStatus(null);
     const match = approvals.find((approval) => approval.intentId === hashIntentId);
     if (!match) {
-      setIntentGoneNotice(true);
+      // Not decidable by this user. Ask the API whether they may at least see
+      // the status (requester / fanned-out approver); 404 and any failure
+      // fall back to the gone notice, without a toast.
+      const requestedId = hashIntentId;
+      void (async () => {
+        let view: IntentStatusView | null = null;
+        try {
+          const res = await fetchWithAuth(`/action-intents/${requestedId}/status`);
+          if (res.ok) {
+            const body = (await res.json()) as Partial<IntentStatusView> | null;
+            if (body && typeof body.status === 'string' && typeof body.id === 'string') {
+              view = body as IntentStatusView;
+            }
+          }
+        } catch {
+          view = null;
+        }
+        if (hashIntentLatestRef.current !== requestedId) return;
+        if (view) setIntentStatus(view);
+        else setIntentGoneNotice(true);
+      })();
       return;
     }
     setHighlightedIntentId(hashIntentId);
@@ -581,6 +642,10 @@ export default function ApprovalsInbox() {
   // are enqueued (not fetched inline) so the concurrent fan-out stays capped
   // regardless of how many distinct orgs appear in one render.
   useEffect(() => {
+    // Not marking anything requested here is deliberate: if the gate opens
+    // later (/config lands, permissions load), this effect re-runs and the
+    // orgs already on screen are picked up then.
+    if (!graduationReadable) return;
     const newOrgIds: string[] = [];
     for (const approval of approvals) {
       if (
@@ -595,7 +660,7 @@ export default function ApprovalsInbox() {
     if (newOrgIds.length === 0) return;
     graduationQueueRef.current.push(...newOrgIds);
     drainGraduationQueue();
-  }, [approvals, drainGraduationQueue]);
+  }, [approvals, drainGraduationQueue, graduationReadable]);
 
   // Polling fallback: the WS layer can die permanently and silently
   // (useEventStream stops retrying after 5 ticket failures), and approvals
@@ -609,11 +674,19 @@ export default function ApprovalsInbox() {
 
   // Refetch on WS reconnect: anything that arrived during the outage produced
   // no nudge, so a fresh connection means our snapshot may be stale.
+  //
+  // Only a RE-connect counts (#9939). `connected` starts false and flips true
+  // once the stream first comes up, moments after the mount load above has
+  // already fetched the list — treating that first edge as a reconnect
+  // fetched `/approvals/pending` twice on every page load. The sub-second gap
+  // between the mount read and the first connect is covered by the 30s poll.
   const wasConnectedRef = useRef(connected);
+  const hasConnectedRef = useRef(connected);
   useEffect(() => {
-    if (connected && !wasConnectedRef.current) {
+    if (connected && !wasConnectedRef.current && hasConnectedRef.current) {
       void loadApprovals({ silent: true });
     }
+    if (connected) hasConnectedRef.current = true;
     wasConnectedRef.current = connected;
   }, [connected, loadApprovals]);
 
@@ -737,9 +810,8 @@ export default function ApprovalsInbox() {
       const scope = knownApprovalScope(approval.approvalScope);
       const outcome =
         decision === 'approve'
-          ? opts
-            ? await decideIntentApproval(approval.id, 'approve', undefined, scope, opts)
-            : await decideIntentApproval(approval.id, 'approve', undefined, scope)
+          // silentSuccess: the toast below is this path's one success message.
+          ? await decideIntentApproval(approval.id, 'approve', undefined, scope, { ...opts, silentSuccess: true })
           : await decideIntentApproval(approval.id, 'deny', reason?.trim() || undefined);
       if (outcome === 'needs_device') {
         setDecisionError(approval.id, 'noApproverDevice');
@@ -1023,6 +1095,11 @@ export default function ApprovalsInbox() {
     // once the next poll removes it.
     const expired = isExpired(approval.expiresAt, now);
     const actionsDisabled = busy || expired;
+    // An operator_plan the card cannot render (malformed / zero effects) must
+    // not be approvable: the approver would be signing what they cannot read.
+    const approveDisabled =
+      actionsDisabled ||
+      (isOperatorPlanApproval(approval.actionToolName) && !isOperatorPlanReadable(approval.actionArguments));
     // W03 (#5612): only a run_script row fanned out from a proposal carries
     // this — every other tool keeps the plain risk-summary line.
     const proposalId =
@@ -1122,6 +1199,16 @@ export default function ApprovalsInbox() {
                 {approval.riskSummary}
               </p>
             )}
+            {isOperatorPlanApproval(approval.actionToolName) && (
+              // Rendered INLINE, not behind a toggle like the script proposal:
+              // the script card fetches a body, this one is already in the
+              // arguments, and an approver must not be able to approve a
+              // multi-effect identity plan without the list on screen. Approve
+              // and deny stay on the existing buttons (no second mutation path).
+              <div data-testid={`approval-operator-plan-${approval.id}`}>
+                <OperatorPlanApprovalCard args={approval.actionArguments} />
+              </div>
+            )}
             {proposalId && (
               <div className="mt-3">
                 <button
@@ -1170,8 +1257,24 @@ export default function ApprovalsInbox() {
                   value={denyReason}
                   placeholder={t('denyReasonPlaceholder')}
                   onChange={(event) => setDenyReason(event.target.value)}
+                  aria-describedby={
+                    approval.actionToolName === 'uac_intercept'
+                      ? `approval-deny-reason-hint-${approval.id}`
+                      : undefined
+                  }
                   data-testid={`approval-deny-reason-${approval.id}`}
                 />
+                {approval.actionToolName === 'uac_intercept' && (
+                  // PAM elevation: the web DTO carries no elevationRequestId,
+                  // so the tool name is the discriminant (as on mobile).
+                  <p
+                    id={`approval-deny-reason-hint-${approval.id}`}
+                    className="mt-1 text-xs text-muted-foreground"
+                    data-testid={`approval-deny-reason-hint-${approval.id}`}
+                  >
+                    {t('denyReasonShownToUserHint')}
+                  </p>
+                )}
                 <p
                   className="mt-1 text-right text-xs text-muted-foreground"
                   data-testid={`approval-deny-reason-count-${approval.id}`}
@@ -1235,7 +1338,7 @@ export default function ApprovalsInbox() {
             <button
               type="button"
               onClick={() => void decide(approval, 'approve')}
-              disabled={actionsDisabled}
+              disabled={approveDisabled}
               // emerald-600 + white text is only ~3.8:1 (fails AA); emerald-700
               // clears 4.5:1 in both themes (this button carries no dark:
               // override — it is a solid fill, unaffected by page theme).
@@ -1253,7 +1356,7 @@ export default function ApprovalsInbox() {
               <button
                 type="button"
                 onClick={() => openAlwaysAllow(approval, alwaysAllow.opKey, alwaysAllow.kind)}
-                disabled={actionsDisabled}
+                disabled={approveDisabled}
                 className="inline-flex h-10 items-center gap-2 rounded-lg border border-emerald-600 px-3 text-sm font-medium text-emerald-700 transition-colors hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50 dark:text-emerald-300 dark:hover:bg-emerald-950/30"
                 data-testid={`approval-always-allow-${approval.id}`}
               >
@@ -1319,10 +1422,42 @@ export default function ApprovalsInbox() {
         </div>
       )}
 
+      {intentStatus && (
+        // Read-only status for a hashed intent that is not in the pending rows
+        // (the requester's view of an MCP-originated approval).
+        <section
+          className="space-y-1 rounded-xl border bg-card px-4 py-3 text-sm"
+          data-testid="approval-intent-status-card"
+        >
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="font-medium">{t('intentStatus.title')}</h2>
+            <span className="rounded-full border px-2 py-0.5 text-xs font-medium">
+              {t(/* i18n-dynamic */ `intentStatus.status.${intentStatus.status}`)}
+            </span>
+          </div>
+          {intentStatus.actionLabel && <p>{intentStatus.actionLabel}</p>}
+          {intentStatus.targetSummary && (
+            <p className="text-muted-foreground">{intentStatus.targetSummary}</p>
+          )}
+          {intentStatus.requestingClientLabel && (
+            <p className="text-muted-foreground">{intentStatus.requestingClientLabel}</p>
+          )}
+          {intentStatus.expiresAt && (
+            <p className="text-muted-foreground">
+              {new Date(intentStatus.expiresAt).toLocaleString()}
+            </p>
+          )}
+          {intentStatus.status === 'pending_approval' && (
+            <p className="text-muted-foreground">{t('intentStatus.waitingForApprovers')}</p>
+          )}
+        </section>
+      )}
+
       {hashProposalId && (
         // The deep-linked proposal, read-only: decisions still happen on the
         // pending row below (or in chat); this surface exists for the
-        // post-decision states — verification progress and Save to library.
+        // post-decision states — verification progress and Save to library —
+        // and says plainly when the proposal has not run at all (#10399).
         <section className="rounded-xl border bg-card p-4" data-testid="approval-proposal-detail">
           <ScriptProposalApprovalCard proposalId={hashProposalId} readOnly />
         </section>

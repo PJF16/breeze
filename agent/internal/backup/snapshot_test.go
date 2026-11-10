@@ -519,7 +519,7 @@ func TestSnapshotProgressCallback(t *testing.T) {
 	restore := setProgressThrottleForTest(0) // emit every file in tests
 	defer restore()
 	_, err := createSnapshotWithProgress(context.Background(), p, files,
-		func(fd, ft int, bd, bt int64, snapshotID string) { got = append(got, bd) }, nil, nil, nil)
+		func(p RunProgress) { got = append(got, p.BytesDone) }, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,8 +550,8 @@ func TestSnapshotProgressCarriesSnapshotIDFromFirstEmission(t *testing.T) {
 	}
 	var got []emission
 	snapshot, err := createSnapshotWithProgress(context.Background(), p, files,
-		func(fd, ft int, bd, bt int64, snapshotID string) {
-			got = append(got, emission{filesDone: fd, bytesDone: bd, snapshotID: snapshotID})
+		func(p RunProgress) {
+			got = append(got, emission{filesDone: p.FilesDone, bytesDone: p.BytesDone, snapshotID: p.SnapshotID})
 		}, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1179,11 +1179,12 @@ func TestCreateSnapshotWithProgress_ResumeAfterInterruption(t *testing.T) {
 	}
 }
 
-// #3006: on a RESUMED run the forced snapshot-registration emission must
-// report the pre-seeded resume counters, not zeros. Emitting before the resume
-// seed would make progress appear to go backwards to 0 and then jump — exactly
-// what the counters are not allowed to do (a server-side reaper reads them as
-// liveness), and sticky if the resumed run dies right after registering.
+// #3006: on a RESUMED run the done counters jump straight to the pre-seeded
+// resume totals — the forced snapshot-registration emission (the first one
+// reporting done work) carries them, never a partial or zero value after the
+// seed. Since #11014 the resume pass emits verified-only progress (done
+// counters still 0) before it; every emission carries the snapshot ID, and no
+// counter ever goes backwards.
 func TestSnapshotRegistrationEmissionReportsResumedCounters(t *testing.T) {
 	restore := setProgressThrottleForTest(0)
 	defer restore()
@@ -1219,8 +1220,8 @@ func TestSnapshotRegistrationEmissionReportsResumedCounters(t *testing.T) {
 	}
 	var got []emission
 	snapshot, err := createSnapshotWithProgress(context.Background(), provider, files,
-		func(fd, ft int, bd, bt int64, snapshotID string) {
-			got = append(got, emission{filesDone: fd, bytesDone: bd, snapshotID: snapshotID})
+		func(p RunProgress) {
+			got = append(got, emission{filesDone: p.FilesDone, bytesDone: p.BytesDone, snapshotID: p.SnapshotID})
 		}, journal, nil, nil)
 	if err != nil {
 		t.Fatalf("createSnapshotWithProgress failed: %v", err)
@@ -1231,9 +1232,20 @@ func TestSnapshotRegistrationEmissionReportsResumedCounters(t *testing.T) {
 	if got[0].snapshotID != snapshot.ID {
 		t.Fatalf("first emission must carry the snapshot ID %q, got %q", snapshot.ID, got[0].snapshotID)
 	}
-	if got[0].filesDone != 1 || got[0].bytesDone != resumedSize {
-		t.Fatalf("registration emission must report the resumed counters (1 file, %d bytes), got filesDone=%d bytesDone=%d",
-			resumedSize, got[0].filesDone, got[0].bytesDone)
+	// #11014: the resume pass now reports its checks (VerifiedFiles) as it
+	// goes, so emissions with zero done counters can precede the seed. The
+	// done counters must still jump straight to the resumed totals — the
+	// first emission that reports any done work reports all of it.
+	var seeded *emission
+	for i := range got {
+		if got[i].filesDone > 0 {
+			seeded = &got[i]
+			break
+		}
+	}
+	if seeded == nil || seeded.filesDone != 1 || seeded.bytesDone != resumedSize {
+		t.Fatalf("first emission with done work must report the resumed counters (1 file, %d bytes), got %+v",
+			resumedSize, seeded)
 	}
 	// And nothing ever regresses.
 	for i := 1; i < len(got); i++ {
@@ -1721,9 +1733,9 @@ func TestSnapshotProgressKeepalive_EmitsDuringInFlightUpload(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		_, err := createSnapshotWithProgress(context.Background(), provider, files,
-			func(fd, ft int, bd, bt int64, snapshotID string) {
+			func(p RunProgress) {
 				select {
-				case progressed <- emission{fd, ft, bd, bt}:
+				case progressed <- emission{p.FilesDone, p.FilesTotal, p.BytesDone, p.BytesTotal}:
 				default:
 				}
 			}, nil, nil, nil)
@@ -2225,51 +2237,126 @@ func setUploadLeaseIntervalForTest(d time.Duration) (restore func()) {
 	return func() { uploadLeaseInterval = old }
 }
 
-// slowFirstUploadProvider wraps mockProvider and sleeps for `delay` on the
-// FIRST call to Upload/UploadContext only (the real file, not the
-// upload.lease refreshes or the final manifest), so a test can force the
-// upload loop to sit still long enough for the lease-refresh ticker to fire
-// at least once without depending on real wall-clock file I/O.
-type slowFirstUploadProvider struct {
+// useManualLeaseTicksForTest swaps newUploadLeaseTicker for a clock the test
+// drives: refreshes happen only when the test sends on the returned channel.
+// It returns that channel and a func reporting the interval the run asked
+// for. It swaps a package var, so a test that calls it must not run in
+// parallel with other tests in this package.
+func useManualLeaseTicksForTest(t *testing.T) (ticks chan time.Time, requested func() time.Duration) {
+	t.Helper()
+	ticks = make(chan time.Time)
+	var mu sync.Mutex
+	var asked time.Duration
+	orig := newUploadLeaseTicker
+	newUploadLeaseTicker = func(d time.Duration) (<-chan time.Time, func()) {
+		mu.Lock()
+		asked = d
+		mu.Unlock()
+		return ticks, func() {}
+	}
+	t.Cleanup(func() { newUploadLeaseTicker = orig })
+	return ticks, func() time.Duration {
+		mu.Lock()
+		defer mu.Unlock()
+		return asked
+	}
+}
+
+// leaseTickDuringUploadProvider wraps mockProvider. On the FIRST upload that
+// is not an upload.lease refresh (the data file, in a one-file run) it sends one lease tick and waits until the refresh that tick
+// triggers has reached the backing store, then finishes the data upload. The
+// refresh therefore lands inside the upload however the scheduler interleaves
+// the goroutines: a 50 ms sleep raced against a 10 ms ticker here failed
+// under -race on a loaded runner (#8828).
+type leaseTickDuringUploadProvider struct {
 	*mockProvider
-	delay    time.Duration
-	slowOnce sync.Once
+	t             *testing.T
+	ticks         chan<- time.Time
+	leaseUploaded chan struct{}
+	leaseOnce     sync.Once
+	dataOnce      sync.Once
+	// tickedPath is the data upload the tick was delivered inside; written
+	// once inside dataOnce, read after createSnapshotWithProgress returns.
+	tickedPath string
 }
 
-func (p *slowFirstUploadProvider) Upload(localPath, remotePath string) error {
-	p.slowOnce.Do(func() { time.Sleep(p.delay) })
+func newLeaseTickDuringUploadProvider(t *testing.T, backing *mockProvider, ticks chan<- time.Time) *leaseTickDuringUploadProvider {
+	return &leaseTickDuringUploadProvider{mockProvider: backing, t: t, ticks: ticks, leaseUploaded: make(chan struct{})}
+}
+
+func (p *leaseTickDuringUploadProvider) upload(localPath, remotePath string) error {
+	if strings.HasSuffix(remotePath, "/upload.lease") {
+		err := p.mockProvider.Upload(localPath, remotePath)
+		p.leaseOnce.Do(func() { close(p.leaseUploaded) })
+		return err
+	}
+	p.dataOnce.Do(func() {
+		p.tickedPath = remotePath
+		// t.Errorf, not t.Fatalf: this can run off the test goroutine.
+		select {
+		case p.ticks <- time.Now():
+		case <-time.After(10 * time.Second):
+			p.t.Errorf("lease-refresh goroutine never took a tick while %s was uploading", remotePath)
+			return
+		}
+		select {
+		case <-p.leaseUploaded:
+		case <-time.After(10 * time.Second):
+			p.t.Errorf("a lease tick during the upload of %s produced no upload.lease refresh", remotePath)
+		}
+	})
 	return p.mockProvider.Upload(localPath, remotePath)
 }
 
-func (p *slowFirstUploadProvider) UploadContext(ctx context.Context, localPath, remotePath string) error {
-	p.slowOnce.Do(func() { time.Sleep(p.delay) })
-	return p.mockProvider.Upload(localPath, remotePath)
+func (p *leaseTickDuringUploadProvider) Upload(localPath, remotePath string) error {
+	return p.upload(localPath, remotePath)
+}
+
+func (p *leaseTickDuringUploadProvider) UploadContext(_ context.Context, localPath, remotePath string) error {
+	return p.upload(localPath, remotePath)
 }
 
 func TestCreateSnapshot_UploadLease_RefreshedDuringUploadThenDeletedAfterPublish(t *testing.T) {
-	restore := setUploadLeaseIntervalForTest(10 * time.Millisecond)
-	defer restore()
+	ticks, requestedInterval := useManualLeaseTicksForTest(t)
 
 	tmpDir := t.TempDir()
 	file1 := createTempFile(t, tmpDir, "file1.txt", "content")
 	backing := newMockProvider()
-	provider := &slowFirstUploadProvider{mockProvider: backing, delay: 50 * time.Millisecond}
+	provider := newLeaseTickDuringUploadProvider(t, backing, ticks)
 
 	files := []backupFile{{sourcePath: file1, snapshotPath: "path_0/file1.txt", size: 7, modTime: time.Now()}}
 	snap, err := createSnapshotWithProgress(context.Background(), provider, files, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	if got := requestedInterval(); got != uploadLeaseInterval {
+		t.Fatalf("lease ticker interval = %v, want uploadLeaseInterval (%v)", got, uploadLeaseInterval)
+	}
 
 	leaseKey := "snapshots/" + snap.ID + "/upload.lease"
-	sawLeaseUpload := false
-	for _, call := range backing.uploadCalls {
-		if call.remotePath == leaseKey {
-			sawLeaseUpload = true
+	dataKey := provider.tickedPath
+	if dataKey == "" {
+		t.Fatal("no data-file upload happened, so no lease tick was delivered")
+	}
+	leaseIdx, dataIdx := -1, -1
+	for i, call := range backing.uploadCalls {
+		switch call.remotePath {
+		case leaseKey:
+			if leaseIdx < 0 {
+				leaseIdx = i
+			}
+		case dataKey:
+			dataIdx = i
 		}
 	}
-	if !sawLeaseUpload {
-		t.Error("expected at least one upload.lease refresh during a slow upload")
+	if leaseIdx < 0 {
+		t.Error("expected at least one upload.lease refresh during the data upload")
+	}
+	if dataIdx < 0 {
+		t.Fatalf("expected the data file to be uploaded to %s, got %+v", dataKey, backing.uploadCalls)
+	}
+	if leaseIdx > dataIdx {
+		t.Errorf("upload.lease refresh (call %d) landed after the data upload finished (call %d), want during it", leaseIdx, dataIdx)
 	}
 	if _, stillThere := backing.files[leaseKey]; stillThere {
 		t.Error("expected upload.lease to be deleted after a successful publish")
@@ -2373,8 +2460,8 @@ func TestAbortSourceGone_StopsLeaseRefreshBeforeCleanup_NoOrphanLeaseAfterAbort(
 	// even once before stopLeaseRefresh stops it — that's a CORRECT outcome
 	// of the fix, not a broken heartbeat. The heartbeat firing at all is
 	// separately proven by TestCreateSnapshot_UploadLease_RefreshedDuring
-	// UploadThenDeletedAfterPublish (which uses a slow provider precisely
-	// so the ticker gets a chance to tick). leaseUploads() is logged here
+	// UploadThenDeletedAfterPublish (which delivers a manual lease tick
+	// mid-upload, #8828). leaseUploads() is logged here
 	// purely as a diagnostic (0 or 1 is both a legitimate outcome, so it is
 	// not asserted on) rather than left as dead instrumentation.
 	t.Logf("lease-key uploads observed during this run: %d", provider.leaseUploads())

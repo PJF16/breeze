@@ -6,15 +6,16 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/breeze-rmm/agent/internal/collectors"
 	"github.com/breeze-rmm/agent/internal/config"
+	"github.com/breeze-rmm/agent/internal/procspawn"
 )
 
 const ipStateFileName = "ip_state.json"
@@ -228,7 +229,7 @@ func leaseFileContains(path, ifaceName, ipAddress string) bool {
 func commandOutput(timeout time.Duration, name string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+	return procspawn.CommandContext(ctx, name, args...).CombinedOutput()
 }
 
 func macOSDHCPLeaseEvidence(ifaceName, ipAddress string) bool {
@@ -245,23 +246,75 @@ func macOSDHCPLeaseEvidence(ifaceName, ipAddress string) bool {
 	return strings.Contains(content, "lease_time")
 }
 
+// readDHCPEnabledAliases returns DHCPv4 state keyed by lower-cased, trimmed
+// interface alias. On Windows it reads adapter flags in-process
+// (GetAdaptersAddresses); it is a var so tests can stub it.
+var readDHCPEnabledAliases = readDHCPEnabledAliasesIPHelper
+
+// readDHCPEnabledAliasesPowerShell is the pre-#7765 path, kept only as the
+// fallback when the in-process read fails: one powershell Get-NetIPInterface
+// per call. A var so tests can assert it is not spawned.
+var readDHCPEnabledAliasesPowerShell = powershellDHCPEnabledAliases
+
+// dhcpInProcessFailureLogged keeps a persistently failing in-process read
+// from logging a warning on every heartbeat for every adapter IP. A
+// successful read re-arms it, so a later, separate failure warns again.
+var dhcpInProcessFailureLogged atomic.Bool
+
 func windowsDHCPLeaseEvidence(ifaceName, ipAddress string) bool {
+	aliases, err := readDHCPEnabledAliases()
+	if err == nil {
+		dhcpInProcessFailureLogged.Store(false)
+	} else {
+		var fallbackErr error
+		aliases, fallbackErr = readDHCPEnabledAliasesPowerShell()
+		logDHCPInProcessFailure(err, fallbackErr)
+		if fallbackErr != nil {
+			return false
+		}
+	}
+	return aliases[strings.ToLower(strings.TrimSpace(ifaceName))]
+}
+
+// logDHCPInProcessFailure warns once per failure streak, then logs at debug.
+// It names the fallback's outcome too, so "both sources failed" (DHCP then
+// falls to the interface-name heuristic) is distinguishable from a recovery.
+func logDHCPInProcessFailure(inProcessErr, fallbackErr error) {
+	msg := "in-process DHCP state read failed; used PowerShell Get-NetIPInterface fallback"
+	args := []any{"error", inProcessErr.Error()}
+	if fallbackErr != nil {
+		msg = "in-process DHCP state read and PowerShell Get-NetIPInterface fallback both failed; using interface-name heuristic"
+		args = append(args, "fallbackError", fallbackErr.Error())
+	}
+	if dhcpInProcessFailureLogged.CompareAndSwap(false, true) {
+		log.Warn(msg, args...)
+	} else {
+		log.Debug(msg, args...)
+	}
+}
+
+func powershellDHCPEnabledAliases() (map[string]bool, error) {
 	// Use PowerShell Get-NetIPInterface which returns .NET enum values
 	// ("Enabled"/"Disabled") that are always English regardless of OS locale.
 	// This avoids parsing ipconfig /all which is fully localized.
 	out, err := commandOutput(2*time.Second, "powershell", "-NoProfile", "-NonInteractive", "-Command",
 		`Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.Dhcp -eq 'Enabled' } | Select-Object -ExpandProperty InterfaceAlias`)
-	if err != nil || len(out) == 0 {
-		return false
+	if err != nil {
+		return nil, err
 	}
+	return parseDHCPEnabledAliases(out), nil
+}
 
-	target := strings.ToLower(strings.TrimSpace(ifaceName))
+// parseDHCPEnabledAliases turns one-alias-per-line output (DHCP-enabled
+// aliases only) into the alias map readDHCPEnabledAliases returns.
+func parseDHCPEnabledAliases(out []byte) map[string]bool {
+	aliases := map[string]bool{}
 	for _, line := range strings.Split(string(out), "\n") {
-		if strings.ToLower(strings.TrimSpace(line)) == target {
-			return true
+		if name := strings.ToLower(strings.TrimSpace(line)); name != "" {
+			aliases[name] = true
 		}
 	}
-	return false
+	return aliases
 }
 
 // isLinkLocal checks if an IP is link-local.

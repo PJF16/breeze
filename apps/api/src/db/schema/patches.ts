@@ -173,6 +173,10 @@ export const patchPolicies = pgTable('patch_policies', {
   // Per-app block/pin rules (#8184), validated by ringAppRulesSchema.
   // CHECK patch_policies_app_rules_array_chk (array) lives in the migration.
   appRules: jsonb('app_rules').notNull().default([]),
+  // Windows feature-release policy (block | allow | pin), validated by
+  // ringFeatureUpdatesSchema. CHECK patch_policies_feature_updates_object_chk
+  // (object) lives in the migration. Default block = pre-control behaviour.
+  featureUpdates: jsonb('feature_updates').notNull().default({ mode: 'block' }),
   createdBy: uuid('created_by').references(() => users.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
@@ -228,7 +232,25 @@ export const devicePatches = pgTable('device_patches', {
   // COALESCE(patches.severity/.category, this row's reported_* value) — see
   // services/patchSeverityOverlay.ts.
   reportedSeverity: patchSeverityEnum('reported_severity'),
+  // Where reported_severity came from, as the agent reported it (#9387):
+  // 'vendor' (the vendor's own rating, e.g. Windows Update's MSRC severity) or
+  // 'derived' (inferred agent-side from the update's classification/title
+  // because the vendor published none). NULL when the agent sent no
+  // provenance (older agents, non-Windows providers) or the severity is
+  // unknown. Always written together with reported_severity so the pair can
+  // never disagree. Constrained by device_patches_reported_severity_source_chk.
+  reportedSeveritySource: varchar('reported_severity_source', { length: 16 }),
   reportedCategory: text('reported_category'),
+  // What this device says the update is (#11073): driver, firmware, quality,
+  // feature, definition or other. Per device on purpose: it decides what Breeze
+  // patch jobs leave to a vendor lane, so it can never live on the shared row.
+  // NULL (older agents, other providers) is never left to a lane. Constrained by
+  // device_patches_reported_update_type_chk.
+  reportedUpdateType: varchar('reported_update_type', { length: 16 }),
+  // The vendor lane whose own update this is (#11073): dell, surface, hp or lenovo.
+  // A lane only delivers its vendor's updates, so NULL (an Intel driver on a Surface,
+  // say) is never left to one. Constrained by device_patches_reported_update_owner_chk.
+  reportedUpdateOwner: varchar('reported_update_owner', { length: 16 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 }, (table) => ({

@@ -5,6 +5,7 @@ vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn((fn) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withDbTransaction: (fn: () => Promise<unknown>) => fn(),
   db: {
     select: vi.fn(),
     insert: vi.fn(),
@@ -379,6 +380,8 @@ describe('monitoring routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.data.map((r: any) => r.name)).toEqual(['nginx']);
+      // #8257: the watch-set cache read is bound to the DEVICE's org (not the caller's).
+      expect(resolveMonitoringConfigForDisplay).toHaveBeenCalledWith(DEVICE_ID, ORG_ID);
     });
 
     it('returns unfiltered results when the active watch set is unknown (#8287)', async () => {

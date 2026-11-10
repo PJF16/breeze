@@ -170,6 +170,32 @@ export const ORG_CASCADE_FK_UNSAFE: ReadonlyArray<OrgCascadeFkRef> = Object.free
       + 'parent+child family. (#5123)',
   },
   {
+    childTable: 'org_evidence_holds',
+    constraint: 'org_evidence_holds_merge_event_id_fkey',
+    parentTable: 'org_merge_events',
+    reason: 'child-not-deleted',
+    allColumnsNullable: false,
+    note:
+      'Reviewed, NOT a live failure: org_evidence_holds has no org_id so the cascade walk never '
+      + 'touches it, but survivor erasure deletes each hold row in the hold-release step of '
+      + 'cascadeDeleteOrgInternal (services/tenantCascade.ts) before any org_merge_events or '
+      + 'organizations row goes. ON DELETE RESTRICT is deliberate: a hold must never vanish as a '
+      + 'side effect of a parent delete. (#8207)',
+  },
+  {
+    childTable: 'org_evidence_holds',
+    constraint: 'org_evidence_holds_survivor_org_id_fkey',
+    parentTable: 'organizations',
+    reason: 'child-not-deleted',
+    allColumnsNullable: false,
+    note:
+      'Reviewed, NOT a live failure: survivor erasure erases each held shell and then deletes its '
+      + 'org_evidence_holds row in the hold-release step of cascadeDeleteOrgInternal '
+      + '(services/tenantCascade.ts) before the survivor\'s organizations row is deleted. ON DELETE '
+      + 'RESTRICT is deliberate: a hold must never vanish as a side effect of a parent delete, and '
+      + 'it makes a skipped release fail loudly instead of stranding a shell. (#8207)',
+  },
+  {
     childTable: 'partner_export_device_material_state',
     constraint: 'partner_export_device_material_state_org_id_fkey',
     parentTable: 'organizations',
@@ -326,10 +352,12 @@ export const ORG_CASCADE_FK_UNSAFE: ReadonlyArray<OrgCascadeFkRef> = Object.free
  *
  * Pinned one-by-one rather than waved through per table, because the pre-clear
  * is hand-written SQL with its own WHERE join: `psa_ticket_mappings` needs
- * three separate arms to cover its three FKs, and a FOURTH FK on that table
- * would be silently uncovered if table membership alone satisfied the
- * contract. Listing every FK means a new one reds this test and sends the
- * author to read `clearSql`.
+ * separate arms to cover its FKs, and a new FK on that table would be
+ * silently uncovered if table membership alone satisfied the contract.
+ * Listing every FK means a new one reds this test and sends the author to read
+ * `clearSql`. (Its alert FK left this list when the #10499 W2-A migration
+ * `2027-01-17-210000-psa-alert-ticketing.sql` made it ON DELETE CASCADE; the
+ * pre-clear's alert arm stays as belt-and-braces.)
  *
  * What membership here does and does not assert: the test verifies the table
  * has a pre-clear and that the pre-clear runs before this parent's DELETE. It
@@ -340,7 +368,6 @@ export const ORG_CASCADE_FK_UNSAFE: ReadonlyArray<OrgCascadeFkRef> = Object.free
  * Sorted by (parentTable, childTable, constraint), same as above.
  */
 export const ORG_CASCADE_FK_PRE_CLEARED: ReadonlyArray<OrgCascadeFkRef> = Object.freeze([
-  { childTable: 'psa_ticket_mappings', constraint: 'psa_ticket_mappings_alert_id_alerts_id_fk', parentTable: 'alerts', reason: 'pre-cleared', allColumnsNullable: true },
   {
     childTable: 'deployment_results',
     constraint: 'deployment_results_device_id_devices_id_fk',

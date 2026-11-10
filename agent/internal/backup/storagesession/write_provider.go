@@ -114,6 +114,7 @@ var (
 	_ providers.DigestUploader       = (*WriteProvider)(nil)
 	_ providers.SnapshotIDIssuer     = (*WriteProvider)(nil)
 	_ providers.StoredObjectDigester = (*WriteProvider)(nil)
+	_ providers.SessionWindow        = (*WriteProvider)(nil)
 	_ providers.JournalIdentity      = (*WriteProvider)(nil)
 	_ providers.JournalScoper        = (*WriteProvider)(nil)
 	_ providers.WriterFence          = (*WriteProvider)(nil)
@@ -556,7 +557,10 @@ func (r *hashingReader) digest() providers.UploadDigest {
 // urlExpiredError.
 func (p *WriteProvider) idleContext(parent context.Context, urlExpiresAt time.Time) (context.Context, func(), func(error) error, func()) {
 	ctx, cancel := context.WithCancelCause(parent)
-	timer := time.AfterFunc(p.idleTimeout, func() { cancel(errStorageStalled) })
+	// The idle watchdog goes through the same seam as the read path's
+	// (idleAfterFunc, #7380/#8500); the URL-expiry timer below stays on real
+	// time.
+	timer := idleAfterFunc(p.idleTimeout, func() { cancel(errStorageStalled) })
 	touch := func() { timer.Reset(p.idleTimeout) }
 	var expiry *time.Timer
 	if !urlExpiresAt.IsZero() {

@@ -203,6 +203,7 @@
       "scanQueued": "Erkennungsscan für „{{name}}“ in der Warteschlange",
       "profileCreated": "Erkennungsprofil „{{name}}“ erstellt",
       "profileUpdated": "Erkennungsprofil „{{name}}“ aktualisiert",
+      "profileDeleted": "Erkennungsprofil „{{name}}“ gelöscht",
       "profileMoved": "Profil nach {{site}} verschoben.",
       "assetsMoved_one": "{{count}} Netzwerkgerät verschoben",
       "assetsMoved_other": "{{count}} Netzwerkgeräte verschoben",
@@ -322,7 +323,8 @@
       "automatic": "Bevorzugt wird ein Online-Agent an diesem Standort mit einer Adresse in einem der Subnetze.",
       "pinned": "Scans laufen nur über diesen Agenten. Ist er offline, schlägt der Scan fehl, statt einen anderen Agenten zu verwenden.",
       "loadError": "Die Agenten dieses Standorts konnten nicht geladen werden. Die automatische Auswahl ist weiterhin verfügbar."
-    }
+    },
+    "subnetTopologyNote": "Die Subnetze hier identifizieren auch die Netzwerke dieses Standorts auf der Topologiekarte."
   },
   "discoveryProfileList": {
     "actions": {
@@ -341,6 +343,8 @@
       "subnets": "Subnetze"
     },
     "configuredCount": "{{count}} Profile konfiguriert",
+    "configuredCount_one": "{{count}} Profil konfiguriert",
+    "configuredCount_other": "{{count}} Profile konfiguriert",
     "empty": "Noch keine Discovery-Profile. Erstellen Sie Ihr erstes Profil, um mit dem Scannen zu beginnen.",
     "lastRun": "Letzter Lauf {{time}}",
     "loading": "Erkennungsprofile werden geladen...",
@@ -436,7 +440,10 @@
       "interval": "Das Scanintervall muss zwischen 1 und 168 Stunden liegen.",
       "selectSite": "Wählen Sie vor dem Speichern eine Standort aus."
     },
-    "configuredCount": "{{count}} Baselines konfiguriert"
+    "configuredCount": "{{count}} Baselines konfiguriert",
+    "configuredCount_one": "{{count}} Baseline konfiguriert",
+    "configuredCount_other": "{{count}} Baselines konfiguriert",
+    "subnetTopologyNote": "Die Subnetze hier identifizieren auch die Netzwerke dieses Standorts auf der Topologiekarte."
   },
   "networkChangeDetailModal": {
     "acknowledgeTitle": "Ereignis bestätigen",

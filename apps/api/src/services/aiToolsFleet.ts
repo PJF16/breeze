@@ -6,10 +6,13 @@
  * Each tool wraps existing DB schema and service logic with org-scoped isolation.
  */
 
+import { ERROR_CODES } from '@breeze/shared';
+import { findPartnerGroupRefs } from './groupFilterRefs';
+import { findPartnerOwnedGroupIds, partnerGroupTargetRefusal, PARTNER_GROUP_AI_READ_ONLY_BODY } from './deviceGroupOwnership';
 import { pageEnvelope, pageParamSchema, readPageArgs } from './aiToolPagination';
 import { reportRunOwnerColumns } from './reportRunOwner';
 import type Anthropic from '@anthropic-ai/sdk';
-import { db } from '../db';
+import { db, hasDbAccessContext, withDbTransaction } from '../db';
 import { pgErrorCode, pgErrorConstraint } from '../utils/pgErrors';
 import {
   automationPolicies,
@@ -29,7 +32,6 @@ import {
   patchJobs,
   patchJobResults,
   patchRollbacks,
-  patchComplianceSnapshots,
 } from '../db/schema/patches';
 import {
   deviceGroups,
@@ -46,10 +48,6 @@ import {
   notificationChannels,
 } from '../db/schema/alerts';
 import {
-  configurationPolicies,
-  configPolicyFeatureLinks,
-} from '../db/schema/configurationPolicies';
-import {
   listEffectiveServiceMonitors,
   SERVICE_MONITOR_LIST_DEVICE_CAP,
 } from './monitors/listServiceMonitors';
@@ -60,11 +58,6 @@ import {
   EFFECTIVE_PATCH_SEVERITY_SQL,
 } from './patchSeverityOverlay';
 import {
-  addFeatureLink,
-  updateFeatureLink,
-  policyAccessCondition,
-} from './configurationPolicy';
-import {
   reports,
   reportRuns,
 } from '../db/schema/reports';
@@ -74,7 +67,7 @@ import { seriesManagedRefusal } from './reportSeries/types';
 import { eq, and, desc, sql, inArray, gte, lte, isNull, isNotNull, or, SQL } from 'drizzle-orm';
 import { alertSiteScopeByDeviceIds, alertSiteScopeCondition } from '../routes/alerts/helpers';
 import type { AuthContext } from '../middleware/auth';
-import { isAiAgentPrincipal } from '../middleware/auth';
+import { isAutomationPrincipal } from '../middleware/principalKind';
 
 async function scheduleAiGroupPeripheralReconciliation(deviceIds: readonly string[]): Promise<void> {
   await Promise.all([...new Set(deviceIds)].map((deviceId) =>
@@ -86,7 +79,8 @@ async function scheduleAiGroupPeripheralReconciliation(deviceIds: readonly strin
 import type { AiTool } from './aiTools';
 import type { ToolExecutionContext } from './toolExecutionContext';
 import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from './siteCeilingAccess';
-import { getUserPermissions, type UserPermissions } from './permissions';
+import { type UserPermissions } from './permissions';
+import { aiCallerPermissions } from './aiToolCallerPermissions';
 import {
   missingReportTypePermission,
   reportAudienceCondition,
@@ -96,13 +90,16 @@ import {
   reportTypeRequiresPermissions,
 } from './reportTypePermissions';
 import { reportTypeDef } from './reportRegistry';
+import { GENERATE_REPORT_TYPES, isBusinessReportType, type GenerateReportType } from './aiReportTypes';
 import { canManagePartnerWidePolicies, PARTNER_WIDE_WRITE_DENIED_MESSAGE } from './partnerWideAccess';
 import { filterWindowsToSiteScope, scopeWindowForRead } from './maintenanceSiteScope';
+import { listPolicyMaintenanceWindows } from './policyMaintenanceWindows';
 import {
   deviceSiteDenied,
   deviceIdSiteDenied,
   deviceScopeCondition,
   filterToDeviceScope,
+  orgIdIn,
   resolveSiteAllowedDeviceIds,
   SITE_SCOPE_EMPTY_NOTE,
 } from './aiToolsSiteScope';
@@ -113,6 +110,11 @@ import {
 import { scanProjectedAutomationRuns } from './automationReadProjection';
 import { assertReportExecutionPreflight } from './reportGenerationService';
 import { deleteDeviceGroup, DeviceGroupDeleteError } from './deviceGroupDelete';
+import { validateManualMembershipDevices } from './groupMembership';
+import { aiQueueCommandForExecution } from './aiDispatch';
+import { CommandTypes } from './commandTypes';
+import { captureException } from './sentry';
+import { splitByOrg, type SplitByOrg } from './aiToolSplitByOrg';
 import {
   decodeSiteScope,
   intersectSiteScopes,
@@ -134,8 +136,9 @@ import {
 } from './siteScope';
 import { upsertPatchApproval, resolvePartnerIdForOrg, declineAllRingApprovals } from '../routes/patches/helpers';
 import { sanitizeThrownToolError } from './aiToolErrors';
-import { resolveWritableToolOrgId } from './aiToolWriteOrg';
+import { resolveReadableToolOrgScope, resolveWritableToolOrgId, type ToolReadOrgScope } from './aiToolWriteOrg';
 import { listFleetFindings } from './fleetFindings/query';
+import { techFacingDeviceConditions } from './deviceStats';
 import {
   AI_TRIAGE_SYSTEM_MANAGED_ERROR_CODE,
   MANAGED_AUTOMATION_ERROR_CODE,
@@ -144,6 +147,7 @@ import {
   managedAutomationOwnerIsLive,
 } from './aiAgents/managedAutomation';
 import { MANAGED_BY_MONITOR_ERROR } from './monitors/managedRowGuard';
+import { conversionSummariesFor } from './flows/conversion/ledger';
 import type {
   FleetFindingKind,
   FleetFindingSeverity,
@@ -184,7 +188,7 @@ function approverReleaseMismatch(auth: AuthContext, context: ToolExecutionContex
  * avoid the write, never catch it.
  */
 function isAgentPrincipalCaller(auth: AuthContext): boolean {
-  return isAiAgentPrincipal(auth);
+  return isAutomationPrincipal(auth);
 }
 
 /**
@@ -217,6 +221,63 @@ function getOrgId(auth: AuthContext): string | null {
   return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
 }
 
+/** The tool input's explicit `orgId`, if it names one. */
+function inputOrgIdOf(input: Record<string, unknown>): string | undefined {
+  return typeof input.orgId === 'string' && input.orgId ? input.orgId : undefined;
+}
+
+/**
+ * The `scope` a fleet read reports (#10396): the one org it read, or that it
+ * covered every org the caller reaches — so the model never presents one
+ * org's figures as the fleet, or the fleet's as one org's.
+ */
+function readScopeSummary(scope: Extract<ToolReadOrgScope, { ok: true }>): Record<string, unknown> {
+  return scope.allAccessibleOrgs
+    ? { allAccessibleOrgs: true, orgCount: scope.orgIds.length }
+    : { orgId: scope.orgIds[0] };
+}
+
+/** #9222: refusal for a business report type run under a site-restricted
+ *  authority. Tickets, time entries, invoices and the AI ledger carry no site
+ *  axis, so the HTTP routes would answer with an unmeasured placeholder; a chat
+ *  tool refuses instead of fabricating a figure. */
+const BUSINESS_REPORT_SITE_RESTRICTED_MESSAGE =
+  'Business report types are not available to site-restricted callers: tickets, time entries, invoices and AI usage have no site dimension.';
+
+/** #9222: the HTTP create/update routes require reports:export plus a fresh-MFA
+ *  session to set `config.emailRecipients` (a business report would mail MSP
+ *  financials off-platform on a timer). The AI tool cannot prove fresh MFA, so
+ *  it refuses recipients on a business type outright; set them in the web UI. */
+const BUSINESS_REPORT_RECIPIENTS_MESSAGE =
+  'Email recipients on a business report must be set in the web UI (requires the export permission and an MFA-verified session).';
+
+function configSetsEmailRecipients(config: unknown): boolean {
+  if (!config || typeof config !== 'object') return false;
+  const r = (config as Record<string, unknown>).emailRecipients;
+  return Array.isArray(r) ? r.length > 0 : Boolean(r);
+}
+
+/**
+ * #9222. The HTTP routes' type gates for the business report types, for the AI
+ * tool: msp_staff audience (ruling F1: an org-scope caller never runs one) and
+ * the per-type read permissions (ruling P8), from the caller's LIVE permission
+ * set. Legacy types pay nothing (no permission lookup). Returns the refusal
+ * body, or null when the caller may proceed to the site-scope check.
+ */
+async function businessReportTypeRefusal(
+  type: unknown,
+  auth: AuthContext,
+): Promise<{ error: string } | null> {
+  if (!isBusinessReportType(type)) return null;
+  if (reportTypeHiddenFromCaller(type, auth)) return { error: 'Insufficient permissions' };
+  if (reportTypeRequiresPermissions(type)) {
+    if (missingReportTypePermission(type, await aiCallerPermissions(auth))) {
+      return { error: 'Insufficient permissions' };
+    }
+  }
+  return null;
+}
+
 /**
  * #7827: device-scoped actions must take the org from the device row itself.
  * `getOrgId` falls back to `accessibleOrgIds[0]`, which for a partner-scope
@@ -240,6 +301,44 @@ async function resolveDeviceOrg(
 
 function orgWhere(auth: AuthContext, orgIdCol: ReturnType<typeof sql.raw> | any): SQL | undefined {
   return auth.orgCondition(orgIdCol) ?? undefined;
+}
+
+/**
+ * #10431: a patch install job has one `org_id`, so a device list spanning orgs
+ * can never be installed in one call. Asked only once install is about to
+ * refuse: when every target device is reachable (org condition + site/device
+ * axis, the scan branch's read) and they span more than one org, the answer is
+ * the per-org split instead of the generic refusal. Null otherwise — the list
+ * fits one org, a device is out of reach (the refusal stands and no org is
+ * disclosed), or the lookup failed (the refusal is still correct).
+ */
+async function patchInstallSplitByOrg(auth: AuthContext, deviceIds: string[]): Promise<SplitByOrg | null> {
+  const ids = [...new Set(deviceIds)];
+  let rows: Array<{ id: string; siteId: string | null; orgId: string }>;
+  try {
+    // Own savepoint, catch outside it, so a failed read cannot poison the call's transaction.
+    rows = await withDbTransaction(() => db.select({ id: devices.id, siteId: devices.siteId, orgId: devices.orgId })
+      .from(devices)
+      .where(and(inArray(devices.id, ids), orgWhere(auth, devices.orgId))));
+  } catch (err) {
+    console.warn('[manage_patches] could not resolve device orgs for split_by_org', err);
+    captureException(err instanceof Error ? err : new Error(String(err)), undefined, { service: 'manage_patches' });
+    return null;
+  }
+  const orgOf = new Map(rows.filter((d) => !deviceSiteDenied(auth, d.siteId, d.id)).map((d) => [d.id, d.orgId]));
+  // Insertion-ordered by the caller's list: the first device's org is listed first.
+  const byOrg = new Map<string, string[]>();
+  for (const id of ids) {
+    const orgId = orgOf.get(id);
+    if (orgId === undefined) return null;
+    const group = byOrg.get(orgId);
+    if (group) group.push(id); else byOrg.set(orgId, [id]);
+  }
+  if (byOrg.size < 2) return null;
+  return splitByOrg(byOrg, {
+    tool: 'manage_patches',
+    hint: 'A patch install job belongs to one organization. Call manage_patches install once per group, with that group\'s orgId.',
+  });
 }
 
 const aiReportDefinitionMetadataProjection = {
@@ -310,16 +409,6 @@ export function requireOrgOwnedReportRow<T extends { orgId: string | null; partn
     return null;
   }
   return row as T & { orgId: string };
-}
-
-/** The AI caller's LIVE permission set — what `requirePermission` would
- *  resolve for the same token on an HTTP route. */
-function aiCallerPermissions(auth: AuthContext): Promise<UserPermissions | null> {
-  return getUserPermissions(auth.user.id, {
-    partnerId: auth.partnerId || undefined,
-    orgId: auth.orgId || undefined,
-    scope: auth.scope,
-  });
 }
 
 /**
@@ -495,6 +584,13 @@ function notificationChannelWhere(auth: AuthContext): SQL | undefined {
   return oc;
 }
 
+// #10409 — returned with every manage_maintenance_windows list/active_now so
+// the model reads a policy window as a definition, not a per-device verdict.
+const MAINTENANCE_WINDOWS_NOTE =
+  'policyWindows/activePolicyWindows come from configuration policies (where windows are configured); '
+  + 'windows/activeWindows are legacy standalone windows. Per device the closest policy assignment wins '
+  + '(device > group > site > organization > partner), so use get_effective_configuration to see which window governs a device.';
+
 // Dual-axis access for maintenance_windows (#2131): same shape as
 // alertRuleWhere — org-owned windows the caller can reach OR partner-wide
 // ones (org_id NULL) owned by the caller's own partner.
@@ -574,7 +670,7 @@ function siteScopePerms(auth: AuthContext): UserPermissions | undefined {
 // Canonical alert site-scope condition (mirrors routes/alerts/alerts.ts:188-210).
 // Returns null for unrestricted callers (no narrowing / no device leftJoin
 // needed). For a restricted caller the query MUST leftJoin devices on
-// alerts.deviceId; zero-site callers then see only device-less (org-wide) alerts.
+// alerts.deviceId; zero-site callers see no alerts.
 function alertSiteCondition(auth: AuthContext): SQL | null {
   const parts: SQL[] = [];
   // Site axis on the alert's OWNING site: a topology policy alert follows its
@@ -582,8 +678,7 @@ function alertSiteCondition(auth: AuthContext): SQL | null {
   const siteScope = alertSiteScopeCondition(auth.allowedSiteIds);
   if (siteScope) parts.push(siteScope);
   // Exact-device axis (#6096) — ANDed on top, and independent of the site axis
-  // (a device-LESS analysis run carries only this one). It also overrides the
-  // `isNull(deviceId)` escape hatch above: a device-less org-wide alert is not
+  // (a device-LESS analysis run carries only this one). An org-level alert is not
   // attributable to the run's device, and `deviceId IN (…)` is false for NULL,
   // so those alerts drop out for a device-bound caller by construction.
   const deviceScope = deviceScopeCondition(auth, alerts.deviceId);
@@ -646,7 +741,8 @@ async function alertRuleTargetDenied(
 function safeHandler(toolName: string, fn: FleetHandler): FleetHandler {
   return async (input, auth, context) => {
     try {
-      return await fn(input, auth, context);
+      // In a savepoint, or the error JSON below is lost to the commit (#11203).
+      return await (hasDbAccessContext() ? withDbTransaction(() => fn(input, auth, context)) : fn(input, auth, context));
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Internal error';
       const code = pgErrorCode(err);
@@ -1112,8 +1208,6 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           deferUntil: { type: 'string', description: 'ISO date to defer until (for defer)' },
           notes: { type: 'string', description: 'Approval/decline notes' },
           configPolicyId: { type: 'string', description: 'Configuration policy UUID to attach patch settings to (for setup_auto_approval). If omitted, creates a new policy.' },
-          autoApprove: { type: 'boolean', description: 'Enable auto-approval of patches (for setup_auto_approval)' },
-          autoApproveSeverities: { type: 'array', items: { type: 'string', enum: ['critical', 'important', 'moderate', 'low'] }, description: 'Which severities to auto-approve (for setup_auto_approval)' },
           scheduleFrequency: { type: 'string', enum: ['daily', 'weekly', 'monthly'], description: 'Patch scan frequency (for setup_auto_approval, default: weekly)' },
           scheduleTime: { type: 'string', description: 'Time to run scans in HH:MM format (for setup_auto_approval, default: 02:00)' },
           rebootPolicy: { type: 'string', enum: ['if_required', 'always', 'never'], description: 'Reboot policy after patching (for setup_auto_approval, default: if_required)' },
@@ -1121,7 +1215,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           ...pageParamSchema(25, 100),
           orgId: {
             type: 'string',
-            description: 'Organization UUID that owns the target devices (install only). Required unless you can access exactly one organization.',
+            description: 'Org UUID. install: owns the target devices (required if you can access several orgs). list/compliance: narrows to it (default: every org you can access).',
           },
         },
         required: ['action'],
@@ -1159,7 +1253,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
       if (action === 'setup_auto_approval') {
         return JSON.stringify({
-          error: 'Action "setup_auto_approval" is disabled. Patch policies must be managed through configuration policies. Use manage_policy_feature_link with featureType "patch" to configure auto-approval rules on a policy.',
+          error: 'Action "setup_auto_approval" is disabled. Auto-approval and per-app block/pin rules are configured on an Update Ring with manage_update_rings. Link the ring to a configuration policy with manage_policy_feature_link (featureType "patch", featurePolicyId = the ring id).',
         });
       }
 
@@ -1168,16 +1262,27 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         // scope to the caller's tenant via device_patches so the list reflects
         // patches actually present on this org's fleet — never the raw catalog,
         // which would be identical for every device/tenant (issue #2112).
-        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
-
         const deviceId = typeof input.deviceId === 'string' ? input.deviceId : undefined;
-        // #7827: a device-scoped list takes the org from the device row, not
-        // `accessibleOrgIds[0]` (arbitrary for partner-scope callers).
-        let listOrgId: string = orgId;
+        // #7827: a device-scoped list takes the org from the device row.
+        // #10396: an org-wide list covers the explicit `orgId`, else every org
+        // the caller reaches. Never `accessibleOrgIds[0]`: for a partner login
+        // that is one arbitrary customer org presented as the whole fleet.
+        let listOrgIds: string[];
+        let listScope: Record<string, unknown>;
         if (deviceId) {
           const listDevice = await resolveDeviceOrg(auth, deviceId);
           if (!listDevice) return JSON.stringify({ error: 'Device not found or access denied' });
-          listOrgId = listDevice.orgId;
+          const namedOrgId = inputOrgIdOf(input);
+          if (namedOrgId && namedOrgId !== listDevice.orgId) {
+            return JSON.stringify({ error: `Device ${deviceId} does not belong to organization ${namedOrgId}` });
+          }
+          listOrgIds = [listDevice.orgId];
+          listScope = { deviceId };
+        } else {
+          const readScope = resolveReadableToolOrgScope(auth, inputOrgIdOf(input));
+          if (!readScope.ok) return JSON.stringify({ error: readScope.error });
+          listOrgIds = readScope.orgIds;
+          listScope = readScopeSummary(readScope);
         }
         const page = readPageArgs('manage_patches', input, { defaultLimit: 25, maxLimit: 100 });
         if (!page.ok) return JSON.stringify({ error: page.error, code: page.code });
@@ -1192,9 +1297,9 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         // mis-bucket most of a Windows-heavy fleet's patch volume, and would
         // disagree with what patchEligibility.ts's auto-approval check sees
         // for the same patch. Every query below is already pinned to
-        // `devicePatches.orgId = listOrgId` (and, for the device-scoped branch,
-        // also `devicePatches.deviceId = deviceId`), so this never crosses a
-        // tenant boundary.
+        // `devicePatches.orgId IN listOrgIds` — the caller's own reach — (and,
+        // for the device-scoped branch, also `devicePatches.deviceId =
+        // deviceId`), so this never reaches past the caller's tenants.
         const catalogConds: SQL[] = [];
         if (typeof input.source === 'string') catalogConds.push(eq(patches.source, input.source as any));
         if (typeof input.severity === 'string') catalogConds.push(sql`${EFFECTIVE_PATCH_SEVERITY_SQL} = ${input.severity}`);
@@ -1202,7 +1307,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         // Both axes, independent of each other: a site-restricted human sees
         // their sites' patch inventory, a device-bound or device-LESS agent run
         // only its own devices'. `null` = unrestricted (no narrowing, no query).
-        const patchListAllowed = await resolveSiteAllowedDeviceIds(listOrgId, auth);
+        const patchListAllowed = await resolveSiteAllowedDeviceIds(listOrgIds, auth);
         if (patchListAllowed && patchListAllowed.length === 0) {
           return JSON.stringify({ ...pageEnvelope({ key: 'patches', items: [], limit, offset, fingerprint }), note: SITE_SCOPE_EMPTY_NOTE });
         }
@@ -1225,22 +1330,21 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           const rows = await db.select({ ...patchCols, status: devicePatches.status })
             .from(devicePatches)
             .innerJoin(patches, eq(devicePatches.patchId, patches.id))
-            .where(and(eq(devicePatches.orgId, listOrgId), eq(devicePatches.deviceId, deviceId), ...patchListScope, ...catalogConds))
+            .where(and(orgIdIn(devicePatches.orgId, listOrgIds), eq(devicePatches.deviceId, deviceId), ...patchListScope, ...catalogConds))
             .orderBy(desc(patches.createdAt), desc(patches.id))
             .limit(limit + 1)
             .offset(offset);
-          return JSON.stringify({ ...pageEnvelope({ key: 'patches', items: rows, limit, offset, fingerprint }), scope: { deviceId } });
+          return JSON.stringify({ ...pageEnvelope({ key: 'patches', items: rows, limit, offset, fingerprint }), scope: listScope });
         }
 
-        // Org-wide: one row per catalog entry present on any of the org's
-        // devices. A plain per-row severity/category column can't be shown
-        // here — several of the org's devices can report different values for
-        // the same shared patch row — so this collapses via GROUP BY (instead
-        // of the previous selectDistinct) and shows the most severe effective
-        // value seen across the org's own devices reporting this patch (worst
-        // case wins, never under-reports risk). Aggregated within this org's
-        // own device_patches rows only (`devicePatches.orgId = listOrgId`),
-        // never across orgs.
+        // Org-wide: one row per catalog entry present on any in-scope device.
+        // A plain per-row severity/category column can't be shown here —
+        // several devices can report different values for the same shared
+        // patch row — so this collapses via GROUP BY (instead of the previous
+        // selectDistinct) and shows the most severe effective value seen
+        // across the in-scope devices reporting this patch (worst case wins,
+        // never under-reports risk). Aggregated over the caller's own orgs'
+        // device_patches rows only (`devicePatches.orgId IN listOrgIds`).
         const rows = await db.select({
           id: patches.id,
           source: patches.source,
@@ -1254,27 +1358,35 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         })
           .from(patches)
           .innerJoin(devicePatches, eq(devicePatches.patchId, patches.id))
-          .where(and(eq(devicePatches.orgId, listOrgId), ...patchListScope, ...catalogConds))
+          .where(and(orgIdIn(devicePatches.orgId, listOrgIds), ...patchListScope, ...catalogConds))
           .groupBy(patches.id, patches.source, patches.externalId, patches.title, patches.releaseDate, patches.requiresReboot, patches.createdAt)
           .orderBy(desc(patches.createdAt), desc(patches.id))
           .limit(limit + 1)
           .offset(offset);
 
-        return JSON.stringify({ ...pageEnvelope({ key: 'patches', items: rows, limit, offset, fingerprint }), scope: { orgId: listOrgId } });
+        return JSON.stringify({ ...pageEnvelope({ key: 'patches', items: rows, limit, offset, fingerprint }), scope: listScope });
       }
 
       if (action === 'compliance') {
-        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        // #10396: the explicit `orgId`, else every org the caller reaches —
+        // never `accessibleOrgIds[0]` (one arbitrary org shown as the fleet).
+        const readScope = resolveReadableToolOrgScope(auth, inputOrgIdOf(input));
+        if (!readScope.ok) return JSON.stringify({ error: readScope.error });
+        const complianceOrgIds = readScope.orgIds;
+        const complianceScope = readScopeSummary(readScope);
 
-        // Approvals are partner-scoped: derive partner from org for the approval stats query.
-        const compliancePartnerId = auth.partnerId ?? await resolvePartnerIdForOrg(orgId);
+        // Approvals are partner-scoped: derive partner from org for the approval
+        // stats query. A multi-org reach is a partner caller's, so it carries
+        // `auth.partnerId`; only a single org can be resolved to its partner.
+        const compliancePartnerId = auth.partnerId
+          ?? (complianceOrgIds.length === 1 ? await resolvePartnerIdForOrg(complianceOrgIds[0]!) : null);
         if (!compliancePartnerId) return JSON.stringify({ error: 'Could not resolve partner for organization' });
 
         // `patch_approvals` has no org column — a bare partner-id count tells an
         // org-scoped caller how many approvals exist across every SIBLING org
-        // under the partner. Narrow to patches actually present on this org's
-        // fleet (an EXISTS over device_patches, so the count stays one query and
-        // the site/device narrowing below keeps its own call order).
+        // under the partner. Narrow to patches actually present on the in-scope
+        // orgs' fleets (an EXISTS over device_patches, so the count stays one
+        // query and the site/device narrowing below keeps its own call order).
         const approvalStats = await db.select({
           total: sql<number>`count(*)`,
           pending: sql<number>`count(*) filter (where ${patchApprovals.status} = 'pending')`,
@@ -1284,67 +1396,141 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         }).from(patchApprovals)
           .where(and(
             eq(patchApprovals.partnerId, compliancePartnerId),
-            sql`EXISTS (SELECT 1 FROM device_patches dp WHERE dp.patch_id = ${patchApprovals.patchId} AND dp.org_id = ${orgId})`,
+            sql`EXISTS (SELECT 1 FROM ${devicePatches} WHERE ${devicePatches.patchId} = ${patchApprovals.patchId} AND ${orgIdIn(devicePatches.orgId, complianceOrgIds)})`,
           ));
 
+        // Computed live from device_patches for every caller. The precomputed
+        // `patch_compliance_snapshots` table this used to read for unrestricted
+        // callers has no writer, so that path always answered "No compliance
+        // data available yet" (#10396).
+        //
         // Site AND exact-device axes (app-layer only; RLS does NOT enforce
-        // either): the precomputed snapshot aggregates EVERY device in the org,
-        // so no narrowed caller may receive it. Recompute from device_patches
-        // over the caller's in-scope devices instead (mirrors
-        // routes/patches/compliance.ts:82-97, which zeroes the response for a
-        // zero-site caller). `resolveSiteAllowedDeviceIds` intersects both axes
-        // and only returns null when NEITHER is set, so a device-LESS analysis
-        // run lands here too (#6096 C2) instead of falling through to the
-        // org-wide snapshot below.
-        if (auth.allowedSiteIds || auth.allowedDeviceIds) {
-          const allowed = await resolveSiteAllowedDeviceIds(orgId, auth);
-          if (!allowed || allowed.length === 0) {
-            return JSON.stringify({
-              snapshot: { totalDevices: 0, compliantDevices: 0, nonCompliantDevices: 0, pendingPatches: 0, installedPatches: 0, failedPatches: 0, missingPatches: 0, siteScoped: true },
-              approvals: approvalStats[0],
-            });
-          }
-          const [patchStats] = await db.select({
-            pending: sql<number>`count(*) filter (where ${devicePatches.status} = 'pending')`,
-            installed: sql<number>`count(*) filter (where ${devicePatches.status} = 'installed')`,
-            failed: sql<number>`count(*) filter (where ${devicePatches.status} = 'failed')`,
-            missing: sql<number>`count(*) filter (where ${devicePatches.status} = 'missing')`,
-            devicesNeedingPatches: sql<number>`count(distinct ${devicePatches.deviceId}) filter (where ${devicePatches.status} in ('pending','missing','failed'))`,
-          }).from(devicePatches)
-            .where(and(eq(devicePatches.orgId, orgId), inArray(devicePatches.deviceId, allowed)));
-
-          const totalDevices = allowed.length;
-          const nonCompliant = Number(patchStats?.devicesNeedingPatches ?? 0);
+        // either): a narrowed caller is counted over its in-scope devices only
+        // (mirrors routes/patches/compliance.ts, which zeroes the response for
+        // a zero-site caller). `resolveSiteAllowedDeviceIds` intersects both
+        // axes and returns null only when NEITHER is set, so a device-LESS
+        // analysis run is narrowed too (#6096 C2).
+        const allowed = await resolveSiteAllowedDeviceIds(complianceOrgIds, auth);
+        const siteScoped = allowed !== null;
+        if (allowed && allowed.length === 0) {
           return JSON.stringify({
-            snapshot: {
-              totalDevices,
-              compliantDevices: totalDevices - nonCompliant,
-              nonCompliantDevices: nonCompliant,
-              pendingPatches: Number(patchStats?.pending ?? 0),
-              installedPatches: Number(patchStats?.installed ?? 0),
-              failedPatches: Number(patchStats?.failed ?? 0),
-              missingPatches: Number(patchStats?.missing ?? 0),
-              siteScoped: true,
-            },
+            snapshot: { totalDevices: 0, compliantDevices: 0, nonCompliantDevices: 0, pendingPatches: 0, installedPatches: 0, failedPatches: 0, missingPatches: 0, siteScoped: true },
             approvals: approvalStats[0],
+            scope: complianceScope,
           });
         }
+        // The counted population is the tech-facing one GET /patches/compliance
+        // and the device KPIs use (#9611): decommissioned, ephemeral Quick
+        // Support and parked devices are excluded from the total AND from the
+        // patch counts, so the figures match the Patches page.
+        const populationConds: SQL[] = [
+          orgIdIn(devices.orgId, complianceOrgIds),
+          ...techFacingDeviceConditions(),
+          ...(allowed ? [inArray(devices.id, allowed)] : []),
+        ];
+        const [patchStats] = await db.select({
+          pending: sql<number>`count(*) filter (where ${devicePatches.status} = 'pending')`,
+          installed: sql<number>`count(*) filter (where ${devicePatches.status} = 'installed')`,
+          failed: sql<number>`count(*) filter (where ${devicePatches.status} = 'failed')`,
+          missing: sql<number>`count(*) filter (where ${devicePatches.status} = 'missing')`,
+          devicesNeedingPatches: sql<number>`count(distinct ${devicePatches.deviceId}) filter (where ${devicePatches.status} in ('pending','missing','failed'))`,
+        }).from(devicePatches)
+          .innerJoin(devices, eq(devices.id, devicePatches.deviceId))
+          .where(and(orgIdIn(devicePatches.orgId, complianceOrgIds), ...populationConds));
 
-        // Unrestricted caller: fast precomputed snapshot path.
-        const latest = await db.select()
-          .from(patchComplianceSnapshots)
-          .where(eq(patchComplianceSnapshots.orgId, orgId))
-          .orderBy(desc(patchComplianceSnapshots.createdAt))
-          .limit(1);
-
-        if (latest.length === 0) return JSON.stringify({ message: 'No compliance data available yet' });
-
-        return JSON.stringify({ snapshot: latest[0], approvals: approvalStats[0] });
+        const [deviceTotals] = await db.select({ deviceCount: sql<number>`count(*)` })
+          .from(devices)
+          .where(and(...populationConds));
+        const totalDevices = Number(deviceTotals?.deviceCount ?? 0);
+        const nonCompliant = Number(patchStats?.devicesNeedingPatches ?? 0);
+        return JSON.stringify({
+          snapshot: {
+            totalDevices,
+            compliantDevices: Math.max(0, totalDevices - nonCompliant),
+            nonCompliantDevices: nonCompliant,
+            pendingPatches: Number(patchStats?.pending ?? 0),
+            installedPatches: Number(patchStats?.installed ?? 0),
+            failedPatches: Number(patchStats?.failed ?? 0),
+            missingPatches: Number(patchStats?.missing ?? 0),
+            ...(siteScoped ? { siteScoped: true } : {}),
+          },
+          approvals: approvalStats[0],
+          scope: complianceScope,
+        });
       }
 
       if (action === 'scan') {
+        // #10383: this branch used to validate deviceIds and return
+        // `success: true` without dispatching anything — the technician
+        // approved a Tier-2 card for a no-op. It now queues the same
+        // `patch_scan` command as POST /patches/scan (routes/patches/
+        // operations.ts), one per device, and reports each outcome honestly.
         if (!Array.isArray(input.deviceIds) || input.deviceIds.length === 0) return JSON.stringify({ error: 'deviceIds is required' });
-        return JSON.stringify({ success: true, message: `Patch scan requested for ${(input.deviceIds as string[]).length} device(s)`, deviceIds: input.deviceIds });
+        const scanDeviceIds = [...new Set(input.deviceIds as string[])];
+
+        // Every device must be in the caller's org AND site/device scope
+        // (#7827: each device's own org is authoritative). All-or-nothing,
+        // before any dispatch: the approval card named exactly this set, so a
+        // partial scan would act on something other than what was approved.
+        const scanDevices = await db.select({ id: devices.id, siteId: devices.siteId, orgId: devices.orgId })
+          .from(devices)
+          .where(and(inArray(devices.id, scanDeviceIds), orgWhere(auth, devices.orgId)));
+        const accessibleScanDevices = new Map(
+          scanDevices
+            .filter((d) => !deviceSiteDenied(auth, d.siteId, d.id))
+            .map((d) => [d.id, d] as const),
+        );
+        const deniedScanIds = scanDeviceIds.filter((id) => !accessibleScanDevices.has(id));
+        if (deniedScanIds.length > 0) {
+          return JSON.stringify({
+            error: `${deniedScanIds.length} device(s) not found or access denied — no scan was queued`,
+            deviceIds: deniedScanIds,
+          });
+        }
+
+        const queued: Array<{ deviceId: string; commandId: string; delivery: string }> = [];
+        const failed: Array<{ deviceId: string; error: string }> = [];
+        // Sequential, and deliberately NOT wrapped per device in try/catch:
+        // the handler runs inside one per-call transaction, so a thrown DB
+        // error aborts it and rolls back every row queued earlier in this
+        // loop. Catching it would report those rolled-back commands as
+        // queued. A throw fails the whole call through safeHandler instead;
+        // per-device refusals come back as `error` results, not throws.
+        for (const deviceId of scanDeviceIds) {
+          const device = accessibleScanDevices.get(deviceId)!;
+          const result = await aiQueueCommandForExecution(
+            auth,
+            'manage_patches',
+            deviceId,
+            CommandTypes.PATCH_SCAN,
+            {},
+            { userId: auth.user?.id, expectedOrgId: device.orgId },
+          );
+          // A `cancelled` result carries both a command row and an error:
+          // the row exists but will never run, so it is a failure.
+          if (result.error || !result.command) {
+            failed.push({ deviceId, error: result.error ?? 'Patch scan was not queued' });
+            continue;
+          }
+          queued.push({ deviceId, commandId: result.command.id, delivery: result.delivery ?? result.command.status });
+        }
+
+        if (queued.length === 0) {
+          return JSON.stringify({
+            success: false,
+            error: `No patch scan was queued — all ${failed.length} device(s) refused it (see failed[]).`,
+            queued,
+            failed,
+          });
+        }
+        return JSON.stringify({
+          success: failed.length === 0,
+          message: `Patch scan queued for ${queued.length} of ${scanDeviceIds.length} device(s)`
+            + (failed.length > 0 ? `; ${failed.length} refused it (see failed[])` : '')
+            + '. An online device runs it now; an offline one runs it when it next checks in. The scan updates the device\'s patch inventory when it finishes (usually a few minutes) — check with manage_patches action "list" and that deviceId.',
+          queued,
+          failed,
+        });
       }
 
       if (action === 'approve' || action === 'decline') {
@@ -1468,7 +1654,10 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         }
         if (!Array.isArray(input.patchIds) || !Array.isArray(input.deviceIds)) return JSON.stringify({ error: 'patchIds and deviceIds are required' });
         const resolvedInstallOrg = resolveWritableToolOrgId(auth, typeof input.orgId === 'string' && input.orgId ? input.orgId : undefined);
-        if (!resolvedInstallOrg.orgId) return JSON.stringify({ error: resolvedInstallOrg.error ?? 'Organization context required' });
+        if (!resolvedInstallOrg.orgId) {
+          const split = await patchInstallSplitByOrg(auth, input.deviceIds as string[]);
+          return JSON.stringify(split ?? { error: resolvedInstallOrg.error ?? 'Organization context required' });
+        }
         const installOrgId = resolvedInstallOrg.orgId;
 
         // Validate devices belong to this org AND the caller's site scope. Site
@@ -1485,7 +1674,8 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         );
         const unauthorizedIds = (input.deviceIds as string[]).filter((id) => !ownedIds.has(id));
         if (unauthorizedIds.length > 0) {
-          return JSON.stringify({ error: `Access denied: ${unauthorizedIds.length} device(s) not in your organization or site scope` });
+          const split = await patchInstallSplitByOrg(auth, input.deviceIds as string[]);
+          return JSON.stringify(split ?? { error: `Access denied: ${unauthorizedIds.length} device(s) not in your organization or site scope` });
         }
 
         const [job] = await db.insert(patchJobs).values({
@@ -1617,116 +1807,6 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         });
       }
 
-      if (action === 'setup_auto_approval') {
-        // NOTE: this whole action is currently unreachable (see the disabled
-        // early-return above) — defense-in-depth, kept correct so the block is
-        // not a trap if the gate is ever lifted (same convention as the
-        // canManagePartnerWidePolicies check a few lines below). This path
-        // inserts an org configuration_policies row + feature link, which is
-        // exactly the org-wide governance object this contract protects.
-        if (!canMutateOrgWideGovernance(auth)) {
-          return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
-        }
-        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
-
-        const patchSettings = {
-          sources: Array.isArray(input.sources) ? input.sources as string[] : ['os'],
-          autoApprove: typeof input.autoApprove === 'boolean' ? input.autoApprove : true,
-          autoApproveSeverities: Array.isArray(input.autoApproveSeverities) ? input.autoApproveSeverities as string[] : ['critical', 'important'],
-          scheduleFrequency: typeof input.scheduleFrequency === 'string' ? input.scheduleFrequency : 'weekly',
-          scheduleTime: typeof input.scheduleTime === 'string' ? input.scheduleTime : '02:00',
-          rebootPolicy: typeof input.rebootPolicy === 'string' ? input.rebootPolicy : 'if_required',
-        };
-
-        const configPolicyId = input.configPolicyId as string | undefined;
-
-        if (configPolicyId) {
-          // Check if policy exists and user has access.
-          //
-          // NOTE: this whole action is currently unreachable — `setup_auto_approval`
-          // early-returns as disabled above (patch policies are managed through
-          // configuration policies). The two fixes below are defense-in-depth,
-          // kept correct so the block is not a trap if the gate is ever lifted
-          // — configuration policies own these writes.
-          //
-          // `policyAccessCondition`, not a bare org-equality (#3493): a
-          // partner-wide policy stores `org_id NULL`, so the org form would tell
-          // the partner-scoped tech who AUTHORED the policy it "was not found".
-          const policyConditions: SQL[] = [eq(configurationPolicies.id, configPolicyId)];
-          const oc = policyAccessCondition(auth);
-          if (oc) policyConditions.push(oc);
-          const [policy] = await db.select().from(configurationPolicies).where(and(...policyConditions)).limit(1);
-          if (!policy) return JSON.stringify({ error: 'Configuration policy not found or access denied' });
-
-          // Making a partner-wide policy REACHABLE is not the same as making it
-          // writable. Everything below mutates the policy's patch feature link,
-          // which lands on every org the policy covers — so it takes the same
-          // capability the HTTP feature-link route requires
-          // (routes/configurationPolicies/featureLinks.ts).
-          if (policy.orgId === null && !canManagePartnerWidePolicies(auth)) {
-            return JSON.stringify({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE });
-          }
-
-          // Check if patch feature link already exists
-          const existingLinks = await db.select()
-            .from(configPolicyFeatureLinks)
-            .where(and(
-              eq(configPolicyFeatureLinks.configPolicyId, configPolicyId),
-              eq(configPolicyFeatureLinks.featureType, 'patch'),
-            )).limit(1);
-
-          if (existingLinks.length > 0) {
-            // Update existing feature link
-            const updated = await updateFeatureLink(existingLinks[0]!.id, { inlineSettings: patchSettings }, configPolicyId);
-            if (!updated) return JSON.stringify({ error: 'Failed to update patch settings — the feature link may have been deleted. Try again.' });
-            return JSON.stringify({
-              success: true,
-              message: `Patch auto-approval settings updated on policy "${policy.name}"`,
-              configPolicyId,
-              featureLinkId: existingLinks[0]!.id,
-              settings: patchSettings,
-            });
-          }
-
-          // Add new patch feature link. addFeatureLink returns null (instead of
-          // throwing) on a duplicate; existingLinks was just checked above so
-          // this is effectively unreachable outside a race, but guard anyway.
-          const link = await addFeatureLink(configPolicyId, 'patch', null, patchSettings);
-          if (!link) return JSON.stringify({ error: 'Patch feature link already exists on this policy' });
-          return JSON.stringify({
-            success: true,
-            message: `Patch auto-approval configured on policy "${policy.name}"`,
-            configPolicyId,
-            featureLinkId: link.id,
-            settings: patchSettings,
-          });
-        }
-
-        // No configPolicyId — create a new config policy with patch settings
-        const [newPolicy] = await db.insert(configurationPolicies).values({
-          orgId,
-          name: `Patch Auto-Approval Policy`,
-          description: `Auto-approve ${patchSettings.autoApproveSeverities.join(', ')} patches on a ${patchSettings.scheduleFrequency} schedule`,
-          status: 'active',
-          createdBy: auth.user.id,
-        }).returning();
-
-        if (!newPolicy) return JSON.stringify({ error: 'Failed to create configuration policy' });
-
-        // newPolicy.id is freshly generated above, so a duplicate feature-link
-        // conflict is not realistically reachable; guard for type-safety only.
-        const link = await addFeatureLink(newPolicy.id, 'patch', null, patchSettings);
-        if (!link) return JSON.stringify({ error: 'Failed to configure patch auto-approval on the new policy' });
-        return JSON.stringify({
-          success: true,
-          message: `Created new policy "${newPolicy.name}" with patch auto-approval`,
-          configPolicyId: newPolicy.id,
-          featureLinkId: link.id,
-          settings: patchSettings,
-          hint: 'Use apply_configuration_policy to assign this policy to an organization, site, or device group.',
-        });
-      }
-
       return JSON.stringify({ error: `Unknown action: ${action}` });
     }),
   });
@@ -1765,6 +1845,16 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
     handler: safeHandler('manage_groups', async (input, auth) => {
       const action = input.action as string;
       const orgId = getOrgId(auth);
+      const canReadPartnerGroups = auth.scope === 'partner' && !!auth.partnerId && auth.partnerOrgAccess !== 'none';
+      const groupReadCondition = auth.scope === 'system' ? undefined : or(
+        and(isNotNull(deviceGroups.orgId), orgWhere(auth, deviceGroups.orgId)),
+        canReadPartnerGroups && auth.partnerId
+          ? and(isNull(deviceGroups.orgId), eq(deviceGroups.partnerId, auth.partnerId))
+          : undefined,
+      );
+      const groupReadable = (group: { orgId: string | null; partnerId: string | null }): boolean =>
+        group.orgId !== null || auth.scope === 'system'
+        || (canReadPartnerGroups && group.partnerId === auth.partnerId);
 
       // Device groups are SITE-shaped, so read paths gate on the group's site.
       // update and delete are not read paths: delete removes every member's
@@ -1786,7 +1876,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
       if (action === 'list') {
         const conditions: SQL[] = [];
-        const oc = orgWhere(auth, deviceGroups.orgId);
+        const oc = groupReadCondition;
         if (oc) conditions.push(oc);
         if (typeof input.type === 'string') conditions.push(eq(deviceGroups.type, input.type as 'static' | 'dynamic'));
         if (typeof input.siteId === 'string') conditions.push(eq(deviceGroups.siteId, input.siteId as string));
@@ -1804,6 +1894,8 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         const limit = Math.min(Math.max(1, Number(input.limit) || 25), 200);
         const rows = await db.select({
           id: deviceGroups.id,
+          orgId: deviceGroups.orgId,
+          partnerId: deviceGroups.partnerId,
           name: deviceGroups.name,
           type: deviceGroups.type,
           siteId: deviceGroups.siteId,
@@ -1819,17 +1911,18 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
       if (action === 'get') {
         if (!input.groupId) return JSON.stringify({ error: 'groupId is required' });
         const conditions: SQL[] = [eq(deviceGroups.id, input.groupId as string)];
-        const oc = orgWhere(auth, deviceGroups.orgId);
+        const oc = groupReadCondition;
         if (oc) conditions.push(oc);
 
         const [group] = await db.select().from(deviceGroups).where(and(...conditions)).limit(1);
-        if (!group) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (!group || !groupReadable(group)) return JSON.stringify({ error: 'Group not found or access denied' });
         // Site axis (app-layer only; RLS does NOT enforce it).
         if (deviceSiteDenied(auth, group.siteId)) return JSON.stringify({ error: 'Group not found or access denied' });
 
         const limit = Math.min(Math.max(1, Number(input.limit) || 50), 200);
         const members = await db.select({
           deviceId: deviceGroupMemberships.deviceId,
+          orgId: deviceGroupMemberships.orgId,
           hostname: devices.hostname,
           status: devices.status,
           osType: devices.osType,
@@ -1837,7 +1930,10 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           addedAt: deviceGroupMemberships.addedAt,
         }).from(deviceGroupMemberships)
           .leftJoin(devices, eq(deviceGroupMemberships.deviceId, devices.id))
-          .where(eq(deviceGroupMemberships.groupId, group.id))
+          .where(and(eq(deviceGroupMemberships.groupId, group.id),
+            group.orgId === null && auth.scope !== 'system'
+              ? inArray(deviceGroupMemberships.orgId, auth.accessibleOrgIds ?? []) : undefined,
+          ))
           .limit(limit);
 
         // Exact-device axis (#6096): the GROUP may be in the caller's site, but
@@ -1866,7 +1962,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
               orgId,
               limit: Number(input.limit) || 25,
               allowedSiteIds: auth.allowedSiteIds,
-              allowedDeviceIds: auth.allowedDeviceIds,
+              allowedDeviceIds: auth.allowedDeviceIds, excludeDecommissioned: true, // #9933: same population as membership
             },
           );
           return JSON.stringify({ preview: result });
@@ -1884,24 +1980,28 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
       if (action === 'membership_log') {
         if (!input.groupId) return JSON.stringify({ error: 'groupId is required' });
         const conditions: SQL[] = [eq(deviceGroups.id, input.groupId as string)];
-        const oc = orgWhere(auth, deviceGroups.orgId);
+        const oc = groupReadCondition;
         if (oc) conditions.push(oc);
 
         const [group] = await db.select().from(deviceGroups).where(and(...conditions)).limit(1);
-        if (!group) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (!group || !groupReadable(group)) return JSON.stringify({ error: 'Group not found or access denied' });
         // Site axis (app-layer only; RLS does NOT enforce it).
         if (deviceSiteDenied(auth, group.siteId)) return JSON.stringify({ error: 'Group not found or access denied' });
 
         const limit = Math.min(Math.max(1, Number(input.limit) || 50), 200);
         const rows = await db.select({
           deviceId: groupMembershipLog.deviceId,
+          orgId: groupMembershipLog.orgId,
           hostname: devices.hostname,
           action: groupMembershipLog.action,
           reason: groupMembershipLog.reason,
           createdAt: groupMembershipLog.createdAt,
         }).from(groupMembershipLog)
           .leftJoin(devices, eq(groupMembershipLog.deviceId, devices.id))
-          .where(eq(groupMembershipLog.groupId, group.id))
+          .where(and(eq(groupMembershipLog.groupId, group.id),
+            group.orgId === null && auth.scope !== 'system'
+              ? inArray(groupMembershipLog.orgId, auth.accessibleOrgIds ?? []) : undefined,
+          ))
           .orderBy(desc(groupMembershipLog.createdAt))
           .limit(limit);
 
@@ -1922,6 +2022,10 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         if (deviceSiteDenied(auth, (input.siteId as string) ?? null)) {
           return JSON.stringify({ error: 'Access denied: cannot create a group in a site outside your access' });
         }
+        if ((await findPartnerGroupRefs(input.filterConditions)).length > 0) {
+          return JSON.stringify({ error: 'Organization groups cannot reference partner-wide device groups',
+            code: ERROR_CODES.PARTNER_GROUP_FILTER_UNSUPPORTED });
+        }
         const [group] = await db.insert(deviceGroups).values({
           orgId: groupOrgId,
           name: input.name as string,
@@ -1936,11 +2040,12 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
       if (action === 'update') {
         if (!input.groupId) return JSON.stringify({ error: 'groupId is required' });
         const conditions: SQL[] = [eq(deviceGroups.id, input.groupId as string)];
-        const oc = orgWhere(auth, deviceGroups.orgId);
+        const oc = groupReadCondition;
         if (oc) conditions.push(oc);
 
         const [existing] = await db.select().from(deviceGroups).where(and(...conditions)).limit(1);
-        if (!existing) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (!existing || !groupReadable(existing)) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (existing.orgId === null) return JSON.stringify(PARTNER_GROUP_AI_READ_ONLY_BODY);
         // Site axis (app-layer only; RLS does NOT enforce it).
         if (deviceSiteDenied(auth, existing.siteId)) return JSON.stringify({ error: 'Group not found or access denied' });
         // Exact-device axis, beside the site check and never inside it (#6096 I2).
@@ -1952,6 +2057,10 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({ error: DEVICE_SCOPE_FLEET_DENIED_MESSAGE });
         }
 
+        if ((await findPartnerGroupRefs(input.filterConditions)).length > 0) {
+          return JSON.stringify({ error: 'Organization groups cannot reference partner-wide device groups',
+            code: ERROR_CODES.PARTNER_GROUP_FILTER_UNSUPPORTED });
+        }
         const updates: Record<string, unknown> = { updatedAt: new Date() };
         if (typeof input.name === 'string') updates.name = input.name;
         if (input.filterConditions) updates.filterConditions = input.filterConditions;
@@ -1963,11 +2072,12 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
       if (action === 'delete') {
         if (!input.groupId) return JSON.stringify({ error: 'groupId is required' });
         const conditions: SQL[] = [eq(deviceGroups.id, input.groupId as string)];
-        const oc = orgWhere(auth, deviceGroups.orgId);
+        const oc = groupReadCondition;
         if (oc) conditions.push(oc);
 
         const [existing] = await db.select().from(deviceGroups).where(and(...conditions)).limit(1);
-        if (!existing) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (!existing || !groupReadable(existing)) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (existing.orgId === null) return JSON.stringify(PARTNER_GROUP_AI_READ_ONLY_BODY);
         // Site axis (app-layer only; RLS does NOT enforce it).
         if (deviceSiteDenied(auth, existing.siteId)) return JSON.stringify({ error: 'Group not found or access denied' });
         // Exact-device axis (#6096 I2): the delete unmembers every device in the
@@ -1978,7 +2088,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
         let result: Awaited<ReturnType<typeof deleteDeviceGroup>>;
         try {
-          result = await deleteDeviceGroup(existing.id, existing.orgId);
+          result = await deleteDeviceGroup(existing.id, { orgId: existing.orgId });
         } catch (err) {
           if (err instanceof DeviceGroupDeleteError) return JSON.stringify({ error: err.message, code: err.code });
           throw err;
@@ -1987,80 +2097,84 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         return JSON.stringify({ success: true, message: `Group "${existing.name}" deleted` });
       }
 
-      if (action === 'add_devices') {
+      if (action === 'add_devices' || action === 'remove_devices') {
         if (!input.groupId) return JSON.stringify({ error: 'groupId is required' });
-        if (!Array.isArray(input.deviceIds)) return JSON.stringify({ error: 'deviceIds is required' });
+        if (!Array.isArray(input.deviceIds) || input.deviceIds.length === 0) return JSON.stringify({ error: 'deviceIds is required' });
+        // The schema caps deviceIds at 100; refuse rather than truncate if a
+        // caller reaches the handler without it.
+        if (input.deviceIds.length > 100) return JSON.stringify({ error: 'At most 100 deviceIds per call' });
         const conditions: SQL[] = [eq(deviceGroups.id, input.groupId as string)];
-        const oc = orgWhere(auth, deviceGroups.orgId);
+        const oc = groupReadCondition;
         if (oc) conditions.push(oc);
 
         const [group] = await db.select().from(deviceGroups).where(and(...conditions)).limit(1);
-        if (!group) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (!group || !groupReadable(group)) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (group.orgId === null) return JSON.stringify(PARTNER_GROUP_AI_READ_ONLY_BODY);
+        const groupOrgId = group.orgId;
 
-        const deviceIdList = (input.deviceIds as string[]).slice(0, 100);
-        // Only add devices that belong to the group's org AND are in the caller's
-        // site scope. Site is an app-layer axis (RLS does NOT enforce it), so
-        // restrict the membership write to in-scope, owned devices.
-        const candidateRows = await db.select({ id: devices.id, siteId: devices.siteId })
-          .from(devices)
-          .where(and(eq(devices.orgId, group.orgId), inArray(devices.id, deviceIdList)));
-        const insertableIds = candidateRows
-          .filter((d) => !deviceSiteDenied(auth, d.siteId, d.id))
-          .map((d) => d.id);
-        if (insertableIds.length === 0) {
-          return JSON.stringify({ success: true, added: 0, message: 'No in-scope devices to add' });
+        // #10149 (QW9) scope guards. Every one REFUSES the whole call and
+        // writes nothing: a membership write that quietly drops some ids would
+        // tell the approver (this action is supervised) one thing and do
+        // another. Same rules, same order, as REST POST /:id/devices and
+        // DELETE /:id/devices/:deviceId (routes/groups.ts).
+        //
+        // 1. The caller must be able to see the group's site. An org-wide
+        //    group (siteId null) fails closed for a site-restricted caller,
+        //    as REST groupSiteAllowed does. Checked before the dynamic-group
+        //    refusal so an out-of-site caller learns nothing about the group.
+        if (deviceSiteDenied(auth, group.siteId)) return JSON.stringify({ error: 'Group not found or access denied' });
+        // 2. Dynamic membership is rule-driven; a manual row would be rewritten
+        //    or orphaned by the next evaluation.
+        if (group.type === 'dynamic') {
+          return JSON.stringify({ error: `Cannot manually ${action === 'add_devices' ? 'add devices to' : 'remove devices from'} a dynamic group` });
         }
-        const results = await db.insert(deviceGroupMemberships)
-          .values(insertableIds.map((deviceId) => ({
-            groupId: group.id,
-            deviceId,
-            orgId: group.orgId,
-            addedBy: 'manual' as const,
-          })))
-          .onConflictDoNothing()
-          .returning({ deviceId: deviceGroupMemberships.deviceId });
-
-        await scheduleAiGroupPeripheralReconciliation(results.map(({ deviceId }) => deviceId));
-
-        const skipped = deviceIdList.length - insertableIds.length;
-        return JSON.stringify({ success: true, added: results.length, ...(skipped > 0 ? { skipped } : {}), message: `${results.length} device(s) added to group "${group.name}"${skipped > 0 ? ` (${skipped} skipped — outside org/site scope)` : ''}` });
-      }
-
-      if (action === 'remove_devices') {
-        if (!input.groupId) return JSON.stringify({ error: 'groupId is required' });
-        if (!Array.isArray(input.deviceIds)) return JSON.stringify({ error: 'deviceIds is required' });
-        const conditions: SQL[] = [eq(deviceGroups.id, input.groupId as string)];
-        const oc = orgWhere(auth, deviceGroups.orgId);
-        if (oc) conditions.push(oc);
-
-        const [group] = await db.select().from(deviceGroups).where(and(...conditions)).limit(1);
-        if (!group) return JSON.stringify({ error: 'Group not found or access denied' });
-
-        const requestedIds = (input.deviceIds as string[]).slice(0, 100);
-        // Only remove devices in the caller's site scope. Site is an app-layer
-        // axis (RLS does NOT enforce it) — mirror add_devices so a site-restricted
-        // caller can't mutate group membership for out-of-site devices.
-        const candidateRows = await db.select({ id: devices.id, siteId: devices.siteId })
+        const requestedIds = [...new Set(input.deviceIds as string[])];
+        // 3. Every device exists, belongs to the GROUP's org (cross-org ids and
+        //    ids RLS hides both land in invalidDevices), and sits in a
+        //    site-bound group's own site. The one shared tenancy guard (#3159).
+        const validation = await validateManualMembershipDevices({ deviceIds: requestedIds, orgId: groupOrgId, siteId: group.siteId });
+        if (!validation.ok) {
+          return JSON.stringify({ error: validation.error, ...(validation.invalidDevices ? { invalidDevices: validation.invalidDevices } : {}) });
+        }
+        // 4. Every device is inside the CALLER's own site / exact-device scope.
+        //    Site is an app-layer axis (RLS does NOT enforce it).
+        const deviceRows = await db.select({ id: devices.id, siteId: devices.siteId })
           .from(devices)
-          .where(and(eq(devices.orgId, group.orgId), inArray(devices.id, requestedIds)));
-        const removableIds = candidateRows
-          .filter((d) => !deviceSiteDenied(auth, d.siteId, d.id))
-          .map((d) => d.id);
-        const skipped = requestedIds.length - removableIds.length;
-        if (removableIds.length === 0) {
-          return JSON.stringify({ success: true, removed: 0, ...(skipped > 0 ? { skipped } : {}), message: 'No in-scope devices to remove' });
+          .where(and(eq(devices.orgId, groupOrgId), inArray(devices.id, requestedIds)));
+        const siteById = new Map(deviceRows.map((d) => [d.id, d.siteId]));
+        const deniedDevices = requestedIds.filter((id) => !siteById.has(id) || deviceSiteDenied(auth, siteById.get(id) ?? null, id));
+        if (deniedDevices.length > 0) {
+          return JSON.stringify({ error: 'Access denied: some devices are outside your access', deniedDevices });
+        }
+
+        if (action === 'add_devices') {
+          const results = await db.insert(deviceGroupMemberships)
+            .values(requestedIds.map((deviceId) => ({
+              groupId: group.id,
+              deviceId,
+              orgId: groupOrgId,
+              addedBy: 'manual' as const,
+            })))
+            .onConflictDoNothing()
+            .returning({ deviceId: deviceGroupMemberships.deviceId });
+
+          await scheduleAiGroupPeripheralReconciliation(results.map(({ deviceId }) => deviceId));
+
+          const alreadyMembers = requestedIds.length - results.length;
+          return JSON.stringify({ success: true, added: results.length, ...(alreadyMembers > 0 ? { alreadyMembers } : {}), message: `${results.length} device(s) added to group "${group.name}"${alreadyMembers > 0 ? ` (${alreadyMembers} already a member)` : ''}` });
         }
 
         const removedMemberships = await db.delete(deviceGroupMemberships)
           .where(and(
             eq(deviceGroupMemberships.groupId, group.id),
-            inArray(deviceGroupMemberships.deviceId, removableIds),
+            inArray(deviceGroupMemberships.deviceId, requestedIds),
           ))
           .returning({ deviceId: deviceGroupMemberships.deviceId });
 
         await scheduleAiGroupPeripheralReconciliation(removedMemberships.map(({ deviceId }) => deviceId));
 
-        return JSON.stringify({ success: true, removed: removedMemberships.length, ...(skipped > 0 ? { skipped } : {}), message: `Device(s) removed from group "${group.name}"${skipped > 0 ? ` (${skipped} skipped — outside org/site scope)` : ''}` });
+        const notMembers = requestedIds.length - removedMemberships.length;
+        return JSON.stringify({ success: true, removed: removedMemberships.length, ...(notMembers > 0 ? { notMembers } : {}), message: `${removedMemberships.length} device(s) removed from group "${group.name}"${notMembers > 0 ? ` (${notMembers} not a member)` : ''}` });
       }
 
       return JSON.stringify({ error: `Unknown action: ${action}` });
@@ -2081,7 +2195,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceIds'],
     definition: {
       name: 'manage_maintenance_windows',
-      description: 'Read maintenance windows and occurrences. Actions: list, get, active_now, create (disabled), update (disabled), delete (disabled). For writes, use manage_policy_feature_link with featureType "maintenance".',
+      description: 'Read maintenance windows. list/active_now: configuration-policy windows (schedule, next occurrence, assignment levels) + legacy standalone ones; get: one legacy window. create/update/delete disabled: use manage_policy_feature_link featureType "maintenance". Per device: get_effective_configuration.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -2109,6 +2223,11 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
     handler: safeHandler('manage_maintenance_windows', async (input, auth) => {
       const action = input.action as string;
       const orgId = getOrgId(auth);
+
+      if (action === 'create' || action === 'update') {
+        const partnerGroupIds = await findPartnerOwnedGroupIds((input.groupIds as string[] | undefined) ?? []);
+        if (partnerGroupIds.length > 0) return JSON.stringify(partnerGroupTargetRefusal(partnerGroupIds));
+      }
 
       // NOTE (#3654): the create/update/delete blocks further down are dead —
       // this guard and the `action` enum both exclude them. If they are ever
@@ -2158,7 +2277,18 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         const visibleRows = (await filterWindowsToSiteScope(rows, { allowedSiteIds: auth.allowedSiteIds })).slice(0, limit);
         const windows = visibleRows.map(({ orgId: _orgId, siteIds: _siteIds, groupIds: _groupIds, deviceIds: _deviceIds, ...rest }) => rest);
 
-        return JSON.stringify({ windows, showing: windows.length });
+        // #10409: windows are authored on configuration policies now; the
+        // legacy table above is empty for most fleets. Same caller visibility
+        // (policyAccessCondition) and site-axis intersection as the rows above.
+        const policy = await listPolicyMaintenanceWindows(auth, { limit });
+
+        return JSON.stringify({
+          policyWindows: policy.windows,
+          ...(policy.truncated ? { policyWindowsTruncated: true } : {}),
+          windows,
+          showing: policy.windows.length + windows.length,
+          note: MAINTENANCE_WINDOWS_NOTE,
+        });
       }
 
       if (action === 'get') {
@@ -2255,7 +2385,16 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           ({ orgId: _orgId, siteIds: _siteIds, groupIds: _groupIds, deviceIds: _deviceIds, ...rest }) => rest,
         );
 
-        return JSON.stringify({ activeWindows, count: activeWindows.length });
+        // #10409: configuration-policy windows open right now.
+        const policy = await listPolicyMaintenanceWindows(auth, { limit: 100, now, activeOnly: true });
+
+        return JSON.stringify({
+          activePolicyWindows: policy.windows,
+          ...(policy.truncated ? { policyWindowsTruncated: true } : {}),
+          activeWindows,
+          count: policy.windows.length + activeWindows.length,
+          note: MAINTENANCE_WINDOWS_NOTE,
+        });
       }
 
       if (action === 'create') {
@@ -2470,6 +2609,9 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
             .limit(limit);
         }
 
+        // W06 (#5221, Decision 9): each row carries its conversion ({ id, state, flowId } | null).
+        const conversions = await conversionSummariesFor(visible.map((a: { id: string }) => a.id));
+        visible = visible.map((a: { id: string }) => ({ ...a, conversion: conversions.get(a.id) ?? null }));
         return JSON.stringify({ automations: visible, showing: visible.length });
       }
 
@@ -2485,11 +2627,12 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         const getDenied = await automationSiteDenied(auto);
         if (getDenied) return JSON.stringify({ error: getDenied });
 
+        const conversion = (await conversionSummariesFor([auto.id])).get(auto.id) ?? null;
         if (isScopeNarrowedCaller(auth)) {
           const { lastRunAt: _lastRunAt, runCount: _runCount, ...restricted } = auto;
-          return JSON.stringify({ automation: restricted });
+          return JSON.stringify({ automation: { ...restricted, conversion } });
         }
-        return JSON.stringify({ automation: auto });
+        return JSON.stringify({ automation: { ...auto, conversion } });
       }
 
       if (action === 'history') {
@@ -2517,7 +2660,8 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
             limit,
           })).rows;
 
-        return JSON.stringify({ automationId: auto.id, runs: page, showing: page.length });
+        const conversion = (await conversionSummariesFor([auto.id])).get(auto.id) ?? null;
+        return JSON.stringify({ automationId: auto.id, conversion, runs: page, showing: page.length });
       }
 
       if (action === 'create') {
@@ -2613,6 +2757,10 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
         const [existing] = await db.select().from(automations).where(and(...conditions)).limit(1);
         if (!existing) return JSON.stringify({ error: 'Automation not found or access denied' });
+        // W06 (#5221, Decision 9): a switched Job is frozen; its flow runs it now.
+        if (existing.convertedToFlowId) {
+          return JSON.stringify({ error: 'automation_converted', flowId: existing.convertedToFlowId });
+        }
         if (isManagedAutomation(existing)) {
           return JSON.stringify({ error: MANAGED_AUTOMATION_ERROR_CODE, agentId: existing.managedByAgentId });
         }
@@ -2633,9 +2781,15 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         if (toggleDenied) return JSON.stringify({ error: toggleDenied });
 
         const enabled = action === 'enable';
-        await db.update(automations)
+        // Re-checked after any lock wait: a switch that committed since the read above wins (#10685).
+        const toggled = await db.update(automations)
           .set({ enabled, updatedAt: new Date() })
-          .where(eq(automations.id, existing.id));
+          .where(and(eq(automations.id, existing.id), isNull(automations.convertedToFlowId)))
+          .returning({ id: automations.id });
+        if (toggled.length === 0) {
+          const [now] = await db.select({ flowId: automations.convertedToFlowId }).from(automations).where(eq(automations.id, existing.id)).limit(1);
+          return JSON.stringify(now?.flowId ? { error: 'automation_converted', flowId: now.flowId } : { error: 'Automation not found or access denied' });
+        }
 
         return JSON.stringify({ success: true, message: `Automation "${existing.name}" ${enabled ? 'enabled' : 'disabled'}` });
       }
@@ -2648,6 +2802,10 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
         const [auto] = await db.select().from(automations).where(and(...conditions)).limit(1);
         if (!auto) return JSON.stringify({ error: 'Automation not found or access denied' });
+        // W06 (#5221, Decision 9): see the enable/disable branch above.
+        if (auto.convertedToFlowId) {
+          return JSON.stringify({ error: 'automation_converted', flowId: auto.convertedToFlowId });
+        }
         if (isManagedAutomation(auto)) {
           return JSON.stringify({ error: MANAGED_AUTOMATION_ERROR_CODE, agentId: auto.managedByAgentId });
         }
@@ -2842,7 +3000,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         if (oc) conditions.push(oc);
         if (typeof input.severity === 'string') conditions.push(eq(alerts.severity, input.severity as any));
         // Site axis: narrow the summary to alerts on in-scope devices (canonical
-        // predicate — device leftJoin + isNull escape hatch for org-wide alerts).
+        // predicate — device leftJoin, topology ownership, and no org-level escape).
         const summarySite = alertSiteCondition(auth);
         if (summarySite) conditions.push(summarySite);
 
@@ -2888,7 +3046,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           action: { type: 'string', enum: ['list', 'generate', 'data', 'create', 'update', 'delete', 'history', 'download'], description: 'The action to perform' },
           reportId: { type: 'string', description: 'Report UUID (for generate/update/delete/history)' },
           reportRunId: { type: 'string', description: 'Report run UUID (required for download)' },
-          reportType: { type: 'string', enum: ['device_inventory', 'software_inventory', 'alert_summary', 'compliance', 'performance', 'executive_summary'], description: 'Report type (for generate/data/create)' },
+          reportType: { type: 'string', enum: [...GENERATE_REPORT_TYPES], description: 'Report type (for generate/data/create). Business types are MSP-staff only and refused for site-restricted callers.' },
           name: { type: 'string', description: 'Report name (for create/update)' },
           config: { type: 'object', description: 'Report configuration (filters, options)' },
           schedule: { type: 'string', enum: ['one_time', 'daily', 'weekly', 'monthly'], description: 'Schedule (for create/update)' },
@@ -3004,6 +3162,11 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         if (auth.allowedDeviceIds) return JSON.stringify({ error: DEVICE_SCOPE_REPORT_DENIED_MESSAGE });
         if (!input.reportId && !input.reportType) return JSON.stringify({ error: 'reportId or reportType is required' });
         if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        // #9222: ad-hoc business type — audience + permission gate before any authority lookup.
+        if (!input.reportId) {
+          const refusal = await businessReportTypeRefusal(input.reportType, auth);
+          if (refusal) return JSON.stringify(refusal);
+        }
 
         let reportDef;
         let executionAuthority: ReportExecutionAuthority | null = null;
@@ -3069,6 +3232,15 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           }
         }
 
+        // #9222: a business type has no site axis — refuse a site-restricted run
+        // (stored definition or ad hoc) rather than mint an unmeasured placeholder.
+        if (
+          isBusinessReportType(reportDef?.type ?? input.reportType)
+          && executionAuthority.scope.kind === 'restricted'
+        ) {
+          return JSON.stringify({ error: BUSINESS_REPORT_SITE_RESTRICTED_MESSAGE });
+        }
+
         const reportConfig = (reportDef?.config ?? input.config ?? {}) as Record<string, unknown>;
         try {
           assertReportExecutionPreflight(orgId, reportConfig, executionAuthority);
@@ -3105,9 +3277,14 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
       if (action === 'data') {
         if (!input.reportType) return JSON.stringify({ error: 'reportType is required' });
         if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        const dataRefusal = await businessReportTypeRefusal(input.reportType, auth);
+        if (dataRefusal) return JSON.stringify(dataRefusal);
         const executionAuthority = await aiLiveReportAuthority(auth, orgId, 'read');
         if (!executionAuthority) {
           return JSON.stringify({ error: 'Access to report scope denied' });
+        }
+        if (isBusinessReportType(input.reportType) && executionAuthority.scope.kind === 'restricted') {
+          return JSON.stringify({ error: BUSINESS_REPORT_SITE_RESTRICTED_MESSAGE });
         }
 
         const limit = Math.min(Math.max(1, Number(input.limit) || 50), 100);
@@ -3222,6 +3399,11 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         const resolvedReportOrg = resolveWritableToolOrgId(auth, typeof input.orgId === 'string' && input.orgId ? input.orgId : undefined);
         if (!resolvedReportOrg.orgId) return JSON.stringify({ error: resolvedReportOrg.error ?? 'Organization context required' });
         const reportOrgId = resolvedReportOrg.orgId;
+        const createRefusal = await businessReportTypeRefusal(input.reportType, auth);
+        if (createRefusal) return JSON.stringify(createRefusal);
+        if (isBusinessReportType(input.reportType) && configSetsEmailRecipients(input.config)) {
+          return JSON.stringify({ error: BUSINESS_REPORT_RECIPIENTS_MESSAGE });
+        }
         const authority = await aiLiveReportAuthority(auth, reportOrgId, 'write');
         if (
           !authority
@@ -3229,10 +3411,13 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         ) {
           return JSON.stringify({ error: 'Access to report scope denied' });
         }
+        if (isBusinessReportType(input.reportType) && authority.scope.kind === 'restricted') {
+          return JSON.stringify({ error: BUSINESS_REPORT_SITE_RESTRICTED_MESSAGE });
+        }
         const [report] = await db.insert(reports).values({
           orgId: reportOrgId,
           name: input.name as string,
-          type: input.reportType as 'device_inventory' | 'software_inventory' | 'alert_summary' | 'compliance' | 'performance' | 'executive_summary',
+          type: input.reportType as GenerateReportType,
           config: (input.config as Record<string, unknown>) ?? {},
           schedule: (input.schedule as 'one_time' | 'daily' | 'weekly' | 'monthly') ?? 'one_time',
           format: (input.format as 'csv' | 'pdf' | 'excel') ?? 'csv',
@@ -3255,6 +3440,9 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         // Multi-org report series W02: a child's shared fields belong to its
         // series (spec §3.3 "Child writers").
         if (existing.seriesId) return JSON.stringify(seriesManagedRefusal(existing.seriesId));
+        if (isBusinessReportType(existing.type) && configSetsEmailRecipients(input.config)) {
+          return JSON.stringify({ error: BUSINESS_REPORT_RECIPIENTS_MESSAGE });
+        }
 
         const updates: Record<string, unknown> = { updatedAt: new Date() };
         if (typeof input.name === 'string') updates.name = input.name;

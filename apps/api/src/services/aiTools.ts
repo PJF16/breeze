@@ -13,6 +13,7 @@ import { eq, and, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import { dbAccessContextFromAuth } from '../middleware/auth';
 import { validateToolInput } from './aiToolSchemas';
+import { applyDevicePathPolicy } from './aiDevicePathPolicy';
 import { setToolPaginationHintResolver } from './aiToolOutput';
 import type { CaptureScope } from './artifacts/toolResultCapture';
 import { captureContextFrom, captureLargeToolResult } from './artifacts/toolResultCapture';
@@ -56,11 +57,14 @@ import { registerDRTools } from './aiToolsDR';
 
 // New domain modules
 import { registerDeviceTools } from './aiToolsDevice';
+import { registerRestorePointTools } from './aiToolsRestorePoints';
 import { registerNetworkTools } from './aiToolsNetwork';
 import { registerTopologyTools } from './aiToolsTopology';
 import { registerSentinelOneTools } from './aiToolsSentinelOne';
 import { registerHuntressTools } from './aiToolsHuntress';
+import { registerEdrTools } from './aiToolsEdr';
 import { registerSecurityTools } from './aiToolsSecurity';
+import { registerIocHuntTools } from './aiToolsIocHunt';
 import { registerDnsTools } from './aiToolsDns';
 import { registerPeripheralTools } from './aiToolsPeripherals';
 import { registerBrowserTools } from './aiToolsBrowser';
@@ -86,8 +90,71 @@ import { registerAgentMgmtTools } from './aiToolsAgentMgmt';
 // AI-agent GOVERNANCE (P2-5, #4192) — distinct from aiToolsAgentMgmt above,
 // which manages the Go endpoint agent. See that module's header.
 import { registerAiAgentGovernanceTools } from './aiToolsAiAgentGovernance';
+import { registerAiOperatorTools } from './aiToolsAiOperator';
 import { registerUITools } from './aiToolsUI';
 import { registerTicketingTools } from './aiToolsTicketing';
+import { registerAlertCorrelationTools } from './aiToolsAlertCorrelations';
+import { registerAnomalyTools } from './aiToolsAnomalies';
+import { registerReliabilityTriageTools } from './aiToolsReliabilityTriage';
+import { registerTopologyGraphTools } from './aiToolsTopologyGraph';
+import { registerTopologyDiagnosticTools } from './aiToolsTopologyDiagnostics';
+import { registerTopologyManualTools } from './aiToolsTopologyManual';
+import { registerTopologyMonitoringTools } from './aiToolsTopologyMonitoring';
+import { registerTopologyTemplateTools } from './aiToolsTopologyTemplates';
+import { registerTopologyApplyTools } from './aiToolsTopologyApply';
+import { registerSnmpTemplateTools } from './aiToolsSnmpTemplates';
+import { registerSnmpMetricsTools } from './aiToolsSnmpMetrics';
+import { registerNetworkProbeTools } from './aiToolsNetworkProbe';
+import { registerKnownGuestTools } from './aiToolsKnownGuests';
+import { registerUnifiTools } from './aiToolsUnifi';
+import { registerAiActivityTools } from './aiToolsAiActivity';
+import { registerOperatorTaskReadTools } from './aiToolsOperatorTasksRead';
+import { registerFleetDesignReadTools } from './aiToolsFleetDesignsRead';
+import { registerSecurityComplianceTools } from './aiToolsSecurityCompliance';
+import { registerSecurityRecommendationTools } from './aiToolsSecurityRecommendations';
+import { registerAccessReviewTools } from './aiToolsAccessReviews';
+import { registerAuditBaselineTools } from './aiToolsAuditBaselines';
+import { registerSecurityPolicyTools } from './aiToolsSecurityPolicies';
+import { registerRecoveryKeyTools } from './aiToolsRecoveryKeys';
+import { registerPamRuleTools } from './aiToolsPamRules';
+import { registerSoftwareCatalogTools } from './aiToolsSoftwareCatalog';
+import { registerPackageSearchTools } from './aiToolsPackageSearch';
+import { registerSoftwareDeploymentTools } from './aiToolsSoftwareDeployments';
+import { registerDeviceSoftwareTools } from './aiToolsDeviceSoftware';
+import { registerSoftwareInventoryTools } from './aiToolsSoftwareInventory';
+import { registerFleetFindingTools } from './aiToolsFleetFindings';
+import { registerCustomFieldTools } from './aiToolsCustomFields';
+import { registerDeviceInventoryTools } from './aiToolsDeviceInventory';
+import { registerDeviceLinkTools } from './aiToolsDeviceLinks';
+import { registerManualAssetTools } from './aiToolsManualAssets';
+import { registerDeviceEventLogTools } from './aiToolsDeviceEventLog';
+import { registerTenantVariableTools } from './aiToolsTenantVariables';
+import { registerSupportSessionTools } from './aiToolsSupportSessions';
+import { registerPax8Tools } from './aiToolsPax8';
+import { registerPax8OrderTools } from './aiToolsPax8Orders';
+import { registerBackupVerificationTools } from './aiToolsBackupVerification';
+import { registerBackupRecoveryReadTools } from './aiToolsBackupRecoveryReads';
+import { registerC2CConfigTools } from './aiToolsC2CConfigs';
+import { registerOrgAdminReadTools } from './aiToolsOrgAdminReads';
+import { registerIdentityReadTools } from './aiToolsIdentityReads';
+import { registerOrgPortalSettingsTool } from './aiToolsOrgPortalSettings';
+import { registerReportRecipientsTool } from './aiToolsReportRecipients';
+import { registerAiAgentLaunchTools } from './aiToolsAiAgentLaunch';
+import { registerAiAgentScheduleTool } from './aiToolsAiAgentSchedules';
+import { registerFleetDesignTool } from './aiToolsFleetDesigns';
+import { registerBillingProfileTools } from './aiToolsBillingProfiles';
+import { registerBillingSettingsTools } from './aiToolsBillingSettings';
+import { registerContractTemplateTools } from './aiToolsContractTemplates';
+import { registerDeviceBillingTools } from './aiToolsDeviceBilling';
+import { registerAccountingSyncTools } from './aiToolsAccountingSync';
+import { registerTicketConfigTools } from './aiToolsTicketConfig';
+import { registerTicketChecklistTemplateTools } from './aiToolsTicketChecklistTemplates';
+import { registerTicketInboxTools } from './aiToolsTicketInbox';
+import { registerTicketAttachmentTools } from './aiToolsTicketAttachments';
+import { registerTicketFormTools } from './aiToolsTicketForms';
+import { registerTicketResponseTemplateTools } from './aiToolsTicketResponseTemplates';
+import { registerTimeSuggestionTools } from './aiToolsTimeSuggestions';
+import { registerMessagingTools } from './aiToolsMessaging';
 import { registerCatalogTools } from './aiToolsCatalog';
 import { registerBillingTools } from './aiToolsBilling';
 import { registerContractTools } from './aiToolsContracts';
@@ -98,6 +165,16 @@ import { registerPamTools } from './aiToolsPam';
 import { registerDiagnosticAccessTools } from './aiToolsDiagnosticAccess';
 import { registerExportTools } from './aiToolsExport';
 import { registerArtifactTools } from './aiToolsArtifacts';
+import { registerTrustPageTools } from './aiToolsTrustPage';
+import { registerPartnerSettingsInheritanceTools } from './aiToolsPartnerSettingsInheritance';
+import { registerFlowTools } from './aiToolsFlows';
+import { registerBusinessCalendarTools } from './aiToolsBusinessCalendars';
+import { registerTicketRoutingTools } from './aiToolsTicketRouting';
+import { registerWispMemoryTools } from './wisp/memoryTools';
+import { registerWispConcernTools } from './wisp/concernTools';
+import { registerWispLinkTools } from './wisp/linkTools';
+import { registerWispCheckInTools } from './wisp/checkInTools';
+import { registerWispTools } from './aiToolsWisp';
 // M365 helpdesk tools are session-aware (handler signature includes a sessionId)
 // so they are NOT registered in the `aiTools` execution registry — they run via
 // makeSessionAwareHandler in the SDK server. Their tiers still must be visible to
@@ -105,11 +182,15 @@ import { registerArtifactTools } from './aiToolsArtifacts';
 import { m365ToolSearchHints, m365ToolTiers, registerM365Tools } from './aiToolsM365';
 import { googleToolSearchHints, googleToolTiers } from './aiToolsGoogle';
 import { authorizeTopologyAiToolCall, isTopologyAiToolName, topologyAiAliasScope, type TopologyToolBinding } from './topology/aiToolGate';
+import { applyHelperDeviceScope } from './helperToolFilter';
 // ============================================
 // Shared Types
 // ============================================
 
 export type AiToolTier = 1 | 2 | 3 | 4;
+
+/** What `AiTool.validateBeforeFiling` returns: the call may be filed, or the handler's own refusal. */
+export type PreFilingVerdict = { ok: true } | { ok: false; error: string };
 
 export interface AiTool {
   definition: Anthropic.Tool;
@@ -146,6 +227,22 @@ export interface AiTool {
     auth: AuthContext,
     context?: ToolExecutionContext,
   ) => Promise<string>;
+  /**
+   * #11432: the refusal this tool's handler would return for `input` under
+   * `auth`, judged BEFORE an approval card or action intent is filed, so a
+   * person is never asked to approve a call that can only fail (an approved
+   * create that then ended "orgId is required"). The chat pre-tool gate
+   * (`createGatedSessionPreToolUse`, after RBAC and the rate limit) calls it
+   * under the auth the handler will run with: the session's tool auth, cut to
+   * the Wisp ceiling under a grant.
+   *
+   * Pure and synchronous: input and auth only, no I/O. Return `{ ok: true }`
+   * for anything it cannot judge from those alone (a row named by id, an input
+   * the schema refuses) and leave that to the handler. The handler keeps its
+   * own check as the backstop, so share one helper between them rather than
+   * restating the rule.
+   */
+  validateBeforeFiling?: (input: Record<string, unknown>, auth: AuthContext) => PreFilingVerdict;
   /**
    * Names of the tool's input properties that carry a device id (each a string
    * or string[]). When set, the central dispatch gates every supplied id
@@ -233,9 +330,12 @@ export async function verifyDeviceAccess(
   return { device };
 }
 
-/** Decision returned by {@link enforceDeviceArgs}: allow, or deny with a reason.
- *  The caller (`executeTool`) owns serialization to the wire format. */
-export type DeviceGateResult = { ok: true } | { ok: false; error: string };
+/** Decision returned by {@link enforceDeviceArgs}: allow (with the device rows
+ *  it verified, in `deviceArgs` order then array order), or deny with a reason. The caller
+ *  (`executeTool`) owns serialization to the wire format. */
+export type DeviceGateResult =
+  | { ok: true; devices: Array<typeof devices.$inferSelect> }
+  | { ok: false; error: string };
 
 /**
  * Central declarative device-access gate. For each input property a tool names
@@ -257,8 +357,9 @@ export async function enforceDeviceArgs(
   input: Record<string, unknown>,
   auth: AuthContext
 ): Promise<DeviceGateResult> {
-  if (!tool.deviceArgs || tool.deviceArgs.length === 0) return { ok: true };
+  if (!tool.deviceArgs || tool.deviceArgs.length === 0) return { ok: true, devices: [] };
   const denied: DeviceGateResult = { ok: false, error: 'Device not found or access denied' };
+  const verified: Array<typeof devices.$inferSelect> = [];
   for (const argName of tool.deviceArgs) {
     const raw = input[argName];
     if (raw == null) continue; // optional arg not supplied — nothing to gate
@@ -269,9 +370,10 @@ export async function enforceDeviceArgs(
       if (typeof id !== 'string' || id.length === 0) return denied;
       const access = await verifyDeviceAccess(id, auth);
       if ('error' in access) return { ok: false, error: access.error };
+      verified.push(access.device);
     }
   }
-  return { ok: true };
+  return { ok: true, devices: verified };
 }
 
 /**
@@ -326,11 +428,14 @@ registerIntegrationTools(aiTools);
 registerMonitoringTools(aiTools);
 registerMonitorTools(aiTools);
 registerDeviceTools(aiTools);
+registerRestorePointTools(aiTools);
 registerNetworkTools(aiTools);
 registerTopologyTools(aiTools);
 registerSentinelOneTools(aiTools);
 registerHuntressTools(aiTools);
+registerEdrTools(aiTools);
 registerSecurityTools(aiTools);
+registerIocHuntTools(aiTools);
 registerDnsTools(aiTools);
 registerPeripheralTools(aiTools);
 registerBrowserTools(aiTools);
@@ -342,6 +447,87 @@ registerPlaybookTools(aiTools);
 registerAlertTools(aiTools);
 registerDeliveryTools(aiTools);
 registerTicketingTools(aiTools);
+// Full-control W06 (#6776): PSA configuration + ticket operations.
+registerTicketConfigTools(aiTools);
+registerTicketChecklistTemplateTools(aiTools);
+registerTicketInboxTools(aiTools);
+registerTicketAttachmentTools(aiTools);
+registerTicketFormTools(aiTools);
+registerTicketResponseTemplateTools(aiTools);
+registerTimeSuggestionTools(aiTools);
+// Full-control W07 (#6777): alert correlation + signal triage.
+registerAlertCorrelationTools(aiTools);
+registerAnomalyTools(aiTools);
+registerReliabilityTriageTools(aiTools);
+// Full-control W08 (#6778): network topology tools.
+registerTopologyGraphTools(aiTools);
+registerTopologyDiagnosticTools(aiTools);
+registerTopologyManualTools(aiTools);
+registerTopologyMonitoringTools(aiTools);
+registerTopologyTemplateTools(aiTools);
+registerTopologyApplyTools(aiTools);
+// Full-control W09 (#6779): SNMP templates + metrics, asset probe, known guests, UniFi.
+registerSnmpTemplateTools(aiTools);
+registerSnmpMetricsTools(aiTools);
+registerNetworkProbeTools(aiTools);
+registerKnownGuestTools(aiTools);
+registerUnifiTools(aiTools);
+// Full-control W10 (#6780): AI-agent read tools.
+registerAiActivityTools(aiTools);
+registerOperatorTaskReadTools(aiTools);
+registerFleetDesignReadTools(aiTools);
+// Full-control W11 (#6781): security policy tools.
+registerSecurityComplianceTools(aiTools);
+registerSecurityRecommendationTools(aiTools);
+registerAccessReviewTools(aiTools);
+registerAuditBaselineTools(aiTools);
+registerSecurityPolicyTools(aiTools);
+registerRecoveryKeyTools(aiTools);
+registerPamRuleTools(aiTools);
+// Full-control W12 (#6782): software, fleet-finding and custom-field tools.
+registerSoftwareCatalogTools(aiTools);
+registerPackageSearchTools(aiTools);
+registerSoftwareDeploymentTools(aiTools);
+registerDeviceSoftwareTools(aiTools);
+registerSoftwareInventoryTools(aiTools);
+registerFleetFindingTools(aiTools);
+registerCustomFieldTools(aiTools);
+// Full-control W13 (#6783, PR A): device inventory reads and per-device records.
+registerDeviceInventoryTools(aiTools);
+registerDeviceLinkTools(aiTools);
+registerManualAssetTools(aiTools);
+// Full-control W13 (#6783, PR B): live event-log browse, tenant variables, Quick Support sessions.
+registerDeviceEventLogTools(aiTools);
+registerTenantVariableTools(aiTools);
+registerSupportSessionTools(aiTools);
+// Full-control W14 (#6784, PR A): billing lifecycle — rate cards, billing settings, agreement templates, signed
+// agreements, device billing (the contract / invoice read selectors live in aiToolsContracts / aiToolsBilling).
+registerBillingProfileTools(aiTools);
+registerPax8Tools(aiTools);
+registerPax8OrderTools(aiTools);
+// Full-control W17 (#6788): backup verification, VSS, recovery reads and C2C configs.
+registerBackupVerificationTools(aiTools);
+registerBackupRecoveryReadTools(aiTools);
+registerC2CConfigTools(aiTools);
+// Full-control W18 PR A (#6789): org admin reads (summary, readiness, audit retention, portal users) and the
+// read-only identity directory (Breeze logins, roles). No identity write is a tool (W18-1).
+registerOrgAdminReadTools(aiTools);
+registerIdentityReadTools(aiTools);
+// Full-control W18 PR B (#6789): the two supervised org-admin writers (portal settings with a four-eyes sensitive
+// action, report recipients).
+registerOrgPortalSettingsTool(aiTools);
+registerReportRecipientsTool(aiTools);
+// Full-control W16 PR A (#6786): the two supervised launch tools (patch-plan run, service-recovery operator task).
+registerAiAgentLaunchTools(aiTools);
+// Full-control W16 PR B (#6786): the schedule and Fleet Design multiplexers, each with four-eyes actions.
+registerAiAgentScheduleTool(aiTools);
+registerFleetDesignTool(aiTools);
+registerBillingSettingsTools(aiTools);
+registerContractTemplateTools(aiTools);
+registerDeviceBillingTools(aiTools);
+// Full-control W14 PR B (#6784): QuickBooks / Xero sync (generate_invoice lives on manage_contracts).
+registerAccountingSyncTools(aiTools);
+registerMessagingTools(aiTools);
 registerCatalogTools(aiTools);
 registerBillingTools(aiTools);
 registerContractTools(aiTools);
@@ -361,6 +547,7 @@ registerDocsTools(aiTools);
 registerRemoteTools(aiTools);
 registerAgentMgmtTools(aiTools);
 registerAiAgentGovernanceTools(aiTools);
+registerAiOperatorTools(aiTools);
 registerUITools(aiTools);
 registerPamTools(aiTools);
 registerDiagnosticAccessTools(aiTools);
@@ -370,6 +557,24 @@ registerWorkspaceTools(aiTools);
 registerM365Tools(aiTools);
 registerExportTools(aiTools);
 registerArtifactTools(aiTools);
+registerTrustPageTools(aiTools);
+// #9763: partner settings inheritance read (twin of the two inheritance routes).
+registerPartnerSettingsInheritanceTools(aiTools);
+// Tool Catalog W03 (#5218): flow authoring tools, behind FLOWS_ENABLED.
+registerFlowTools(aiTools);
+registerBusinessCalendarTools(aiTools);
+registerTicketRoutingTools(aiTools);
+// Wisp W03 memory tools: inert until W04/W05 attach auth.wispGrant.
+registerWispMemoryTools(aiTools);
+// Wisp W05a concern/watch tools: same posture — inert without auth.wispGrant.
+registerWispConcernTools(aiTools);
+// Wisp W08 thread links: same posture — inert without auth.wispGrant.
+registerWispLinkTools(aiTools);
+// Wisp check-in timers (#10991 W03): same posture — inert without auth.wispGrant.
+registerWispCheckInTools(aiTools);
+// Wisp W07 specialists: launch_specialist (inert without auth.wispGrant) and
+// the human-only approval carrier wisp_specialist_request.
+registerWispTools(aiTools);
 
 // A-W05 (D12): the compactor's truncation guidance follows the tool's real
 // paging shape. Covers extension-contributed tools too — they live in the
@@ -503,7 +708,7 @@ export function getToolAlwaysLoad(toolName: string): boolean {
  * headless `executeTool` path — i.e. it only runs via the inline chat path's
  * makeSessionAwareHandler, which threads a live SSE session id to reach the
  * per-tenant M365/Google OAuth connection. Covers the M365 mutation helpdesk
- * tools (m365_disable_user, m365_reset_password) and ALL Google tools (there is
+ * tools (m365_disable_user, m365_reset_password and the M1 identity write tools) and ALL Google tools (there is
  * no registerGoogleTools into the core map). The durable release worker uses
  * this to fail such intents with `session_required` instead of `Unknown tool`.
  * Phase 2 (headless dispatch) would make these executable and flip this to false.
@@ -516,59 +721,9 @@ export function requiresLiveSession(
   return !executableHeadless && getToolTier(toolName, registry) !== undefined;
 }
 
-/**
- * Helper device-scoping (security finding A, Phase 0).
- * Maps each tool the Breeze Helper may run to the input field naming its
- * target device. A tool absent from this map is org-wide and is DENIED under
- * a Helper context. Every tool in helperToolFilter's whitelists must have an
- * entry here (pinned by helperToolFilter.test.ts); mutating tools (tier>=2)
- * are additionally PAM-governed at the preToolUse gate (Phase 1).
- */
-export const HELPER_TOOL_SCOPING: Record<string, 'deviceId' | 'deviceIds'> = {
-  // Read-only (Phase 0 `basic` set).
-  get_device_details: 'deviceId',
-  get_device_hardware_health: 'deviceId',
-  get_device_time_status: 'deviceId',
-  list_time_sync_issues: 'deviceId',
-  analyze_metrics: 'deviceId',
-  analyze_disk_usage: 'deviceId',
-  get_cis_device_report: 'deviceId',
-  get_security_posture: 'deviceId',
-  take_screenshot: 'deviceId',
-  analyze_screen: 'deviceId',
-  search_logs: 'deviceIds',
-  // Device-pinned safe actions (`standard`, Phase 1 governed).
-  get_active_users: 'deviceId',
-  get_user_experience_metrics: 'deviceId',
-  manage_alerts: 'deviceId',
-  manage_services: 'deviceId',
-  disk_cleanup: 'deviceId',
-  file_operations: 'deviceId',
-  // Device-pinned destructive tools (`extended`, Phase 1 governed).
-  computer_control: 'deviceId',
-  execute_command: 'deviceId',
-  security_scan: 'deviceId',
-  s1_isolate_device: 'deviceId',
-  network_discovery: 'deviceId',
-  apply_cis_remediation: 'deviceId',
-};
-
-/**
- * Force a Helper tool call onto the Helper's own device, or deny it.
- * Pure — the caller (executeTool) applies the result.
- */
-export function applyHelperDeviceScope(
-  toolName: string,
-  input: Record<string, unknown>,
-  helperDeviceId: string
-): { input: Record<string, unknown> } | { error: string } {
-  const field = HELPER_TOOL_SCOPING[toolName];
-  if (!field) {
-    return { error: `Tool '${toolName}' is not available in the Helper context` };
-  }
-  const value = field === 'deviceIds' ? [helperDeviceId] : helperDeviceId;
-  return { input: { ...input, [field]: value } };
-}
+// HELPER_TOOL_SCOPING + applyHelperDeviceScope live in helperToolFilter.ts
+// (#9854: the chat pre-tool-use gate needs them without loading this module).
+export { HELPER_TOOL_SCOPING, applyHelperDeviceScope } from './helperToolFilter';
 
 /**
  * Everything `executeTool` accepts beyond the three arguments every caller
@@ -677,8 +832,26 @@ export async function executeTool(
   // Structural device-tenant gate: any id named in `tool.deviceArgs` is
   // org+site-checked before the handler runs, so a tool can't reach a device
   // outside the caller's scope even if its handler forgets to check.
-  const gate = await inDispatchContext(() => enforceDeviceArgs(tool, effectiveInput, auth));
-  if (!gate.ok) return JSON.stringify({ error: gate.error });
+  //
+  // Then the tenant AI data policy (spec 2026-10-15 §2): the device file read
+  // level, resolved from the DEVICE org(s) the gate just verified — never the
+  // session org — and refused closed when that org's partner cannot be
+  // established. Here, so it holds for every principal (chat, agent runs, MCP,
+  // helper, script builder, durable approval releases re-entering this
+  // function). Same dispatch context as the device gate. Cost: a context that
+  // cannot see its partner's ceiling row in place (an organization session,
+  // currentPartnerId null) reads it through the pinned system escape in
+  // readOwnPartnerAxisRows, a short second connection; only policy-relevant
+  // calls pay it.
+  const gate = await inDispatchContext(async () => {
+    const devices = await enforceDeviceArgs(tool, effectiveInput, auth);
+    if (!devices.ok) return devices;
+    return applyDevicePathPolicy(toolName, effectiveInput, devices.devices);
+  });
+  if (!gate.ok) {
+    const { ok: _ok, ...denial } = gate; // { error } or { error, condition, policy }
+    return JSON.stringify(denial);
+  }
 
   // A-W05 (D13a/Q4): `read_artifact` must read with the SAME anchor capture
   // would write with — the exact org/run/session this call is attributed to,
@@ -691,8 +864,20 @@ export async function executeTool(
   // existing identity — `aiTools.executeToolGate.test.ts` asserts a
   // caller-supplied context is passed through with `toBe` (reference)
   // equality, and a context rebuilt for every call would break that.
-  const captureAnchor = toolName === 'read_artifact' ? captureContextFrom(auth, opts, toolName) : null;
+  //
+  // Wisp W04 (w00 A24): a chat session attached to a thread also reads that
+  // thread's attachments — the key is added ONLY when the capture scope
+  // carries one, so every other anchor keeps its exact shape.
+  const writeAnchor = toolName === 'read_artifact' || toolName === 'run_flow' ? captureContextFrom(auth, opts, toolName) : null;
+  const wispThreadId = opts?.capture?.wispThreadId;
+  const captureAnchor = writeAnchor && wispThreadId ? { ...writeAnchor, wispThreadId } : writeAnchor;
   let handlerContext = captureAnchor ? { ...opts?.context, captureAnchor } : opts?.context;
+  // `run_flow` trusts the anchor's session id, so a caller-supplied anchor is
+  // dropped when the server computed none (no chat session => run_flow refuses).
+  if (toolName === 'run_flow' && !captureAnchor && handlerContext?.captureAnchor) {
+    const { captureAnchor: _dropped, ...rest } = handlerContext;
+    handlerContext = rest;
+  }
 
   // Topology M4-D1 (#6000): every topology tool runs only against the site a
   // server-owned context pins — the active topology session, or a one-site

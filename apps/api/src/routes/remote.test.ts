@@ -20,6 +20,19 @@ const mockAuthState = vi.hoisted(() => ({
 
 vi.mock('../services', () => ({}));
 
+// Existing route cases exercise the non-isolated ICE plan (relay-only has its
+// own suites: remote/sessions.relayOnly.test.ts, desktopWs.relayOnly.test.ts).
+vi.mock('./remote/desktopRelayPolicy', async () => {
+  const { getIceServers } = await import('./remote/helpers');
+  return {
+    resolveDesktopIcePlan: async (_deviceId: string, scope: import('./remote/helpers').TurnCredentialScope) => ({
+      ok: true,
+      relayOnly: false,
+      iceServers: getIceServers(scope),
+    }),
+  };
+});
+
 vi.mock('../services/permissions', () => ({
   canAccessSite: (permissions: { allowedSiteIds?: string[] }, siteId: string) => !permissions.allowedSiteIds || permissions.allowedSiteIds.includes(siteId),
   PERMISSIONS: {
@@ -36,7 +49,8 @@ vi.mock('../services/remoteSessionAuth', () => ({
 }));
 
 vi.mock('./agentWs', () => ({
-  sendCommandToAgent: vi.fn(() => true)
+  sendCommandToAgent: vi.fn(() => true),
+  sendDesktopIceCandidateToAgent: vi.fn(() => true)
 }));
 
 vi.mock('../services/viewerTokenRevocation', () => ({
@@ -220,7 +234,7 @@ vi.mock('../services/redis', () => ({
 
 import { db } from '../db';
 import { checkRemoteAccess } from '../services/remoteAccessPolicy';
-import { sendCommandToAgent } from './agentWs';
+import { sendCommandToAgent, sendDesktopIceCandidateToAgent } from './agentWs';
 import { remoteAccessInlineSettingsSchema } from '@breeze/shared/validators';
 
 /** Helper to build a fluent mock chain for db.select() */
@@ -804,7 +818,8 @@ describe('remote routes', () => {
         },
         device: {
           id: DEVICE_UUID,
-          orgId: 'org-123'
+          orgId: 'org-123',
+          agentId: 'agent-123'
         }
       };
 
@@ -833,6 +848,15 @@ describe('remote routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.iceCandidatesCount).toBe(2);
+      // #9182: the rail is no longer write-only — the candidate reaches the
+      // agent that hosts the session, tagged with the session's start.
+      expect(body.forwarded).toBe(true);
+      expect(vi.mocked(sendDesktopIceCandidateToAgent)).toHaveBeenCalledWith('agent-123', {
+        type: 'desktop_ice_candidate',
+        sessionId: SESSION_UUID,
+        startGeneration: '0',
+        candidate: { candidate: 'candidate-2', sdpMid: '0', sdpMLineIndex: 0 },
+      });
     });
   });
 

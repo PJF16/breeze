@@ -26,8 +26,9 @@ import type { SQL } from 'drizzle-orm';
  *    hardening pass (`8763a3239`) — which is NOT on main, so this file re-proves
  *    the property for the alert-resolve predicate rather than inheriting it.
  */
-const { dbMock, updateWheres, updateReturns, selectRows, alertRow } = vi.hoisted(() => {
+const { dbMock, updateWheres, updateSets, updateReturns, selectRows, alertRow } = vi.hoisted(() => {
   const updateWheres: unknown[] = [];
+  const updateSets: Record<string, unknown>[] = [];
   const updateReturns: unknown[][] = [];
   // Feeds the post-CAS cooldown lookups (alert rule, then its template).
   const selectRows: unknown[][] = [];
@@ -48,15 +49,18 @@ const { dbMock, updateWheres, updateReturns, selectRows, alertRow } = vi.hoisted
       from: () => ({ where: () => ({ limit: () => Promise.resolve(selectRows.shift() ?? []) }) }),
     }),
     update: () => ({
-      set: () => ({
-        where: (predicate: unknown) => {
-          updateWheres.push(predicate);
-          return { returning: () => Promise.resolve(updateReturns.shift() ?? []) };
-        },
-      }),
+      set: (values: Record<string, unknown>) => {
+        updateSets.push(values);
+        return {
+          where: (predicate: unknown) => {
+            updateWheres.push(predicate);
+            return { returning: () => Promise.resolve(updateReturns.shift() ?? []) };
+          },
+        };
+      },
     }),
   };
-  return { dbMock, updateWheres, updateReturns, selectRows, alertRow };
+  return { dbMock, updateWheres, updateSets, updateReturns, selectRows, alertRow };
 });
 
 const publishEvent = vi.fn((..._args: unknown[]) => Promise.resolve('evt'));
@@ -135,6 +139,7 @@ const resolveRequest = () =>
 
 beforeEach(() => {
   updateWheres.length = 0;
+  updateSets.length = 0;
   updateReturns.length = 0;
   selectRows.length = 0;
   vi.clearAllMocks();
@@ -190,6 +195,15 @@ describe('POST /alerts/:id/resolve — the winning caller', () => {
     expect(publishEvent.mock.calls[0]?.[0]).toBe('alert.resolved');
     expect(emitAlertStateFeedback).toHaveBeenCalledTimes(1);
     expect(writeRouteAudit).toHaveBeenCalledTimes(1);
+  });
+
+  it("stamps resolution_reason 'manual' on the human resolve (#7281)", async () => {
+    updateReturns.push([{ ...alertRow, status: 'resolved' }]);
+
+    await resolveRequest();
+
+    expect(updateSets).toHaveLength(1);
+    expect(updateSets[0]).toMatchObject({ status: 'resolved', resolutionReason: 'manual' });
   });
 
   it('still short-circuits an alert the pre-read already saw as resolved', async () => {
@@ -290,4 +304,48 @@ it.each([null, 'disk:3'])('manual web resolution isolates subject %s', async sub
 it('has no legacy policy cooldown import or branch', () => {
   expect(readFileSync(new URL('./alerts.ts', import.meta.url), 'utf8'))
     .not.toMatch(/markConfigPolicyRuleCooldown|else if \(alert\.configPolicyId\)/);
+});
+
+// Device-less ownership must not interrupt a successful resolve after its CAS.
+it.each(['backup_workload', 'topology_site'])('resolves a %s alert while skipping device cooldown', async (ownerKind) => {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const row = { ...alertRow, ownerKind, ownerRef: 'workload-1', deviceId: null, ruleId: 'rule-1' };
+    getAlertWithOrgCheck.mockResolvedValue(row);
+    updateReturns.push([{ ...row, status: 'resolved' }]);
+    const res = await resolveRequest();
+    expect(res.status).toBe(200);
+    expect(setCooldown).not.toHaveBeenCalled();
+    expect(publishEvent).toHaveBeenCalledExactlyOnceWith('alert.resolved', row.orgId,
+      expect.objectContaining({ alertId: row.id, deviceId: null }),
+      expect.any(String), { userId: 'user-1' });
+    expect(emitAlertStateFeedback).toHaveBeenCalledTimes(1);
+    expect(writeRouteAudit).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({
+      action: 'alert.resolve', orgId: row.orgId, resourceId: row.id,
+    }));
+    expect(warn).toHaveBeenCalledWith(expect.any(String), {
+      alertId: row.id, orgId: row.orgId, ownerKind, reason: 'alert_has_no_device',
+    });
+    expect(error).not.toHaveBeenCalled();
+  } finally {
+    warn.mockRestore();
+    error.mockRestore();
+  }
+});
+
+it('finishes resolution and audit when the device cooldown write fails', async () => {
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const row = { ...alertRow, ruleId: 'rule-1' };
+    getAlertWithOrgCheck.mockResolvedValue(row);
+    selectRows.push([{ id: 'rule-1', templateId: 'template-1' }], [{ cooldownMinutes: 15 }]);
+    updateReturns.push([{ ...row, status: 'resolved' }]);
+    setCooldown.mockRejectedValueOnce(new Error('cooldown unavailable'));
+    expect((await resolveRequest()).status).toBe(200);
+    expect(publishEvent).toHaveBeenCalledTimes(1);
+    expect(emitAlertStateFeedback).toHaveBeenCalledTimes(1);
+    expect(writeRouteAudit).toHaveBeenCalledTimes(1);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('cooldown'), expect.any(Error));
+  } finally { error.mockRestore(); }
 });

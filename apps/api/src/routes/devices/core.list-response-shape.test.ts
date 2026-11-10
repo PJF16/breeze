@@ -92,7 +92,7 @@ import { coreRoutes } from './core';
 import { db } from '../../db';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { eq, type SQL } from 'drizzle-orm';
-import { deviceHardwareHealth, devices } from '../../db/schema';
+import { deviceHardware, deviceHardwareHealth, devices, deviceWarranty } from '../../db/schema';
 import { authMiddleware } from '../../middleware/auth';
 
 function rigDeviceListRows(
@@ -106,8 +106,8 @@ function rigDeviceListRows(
   const limit = vi.fn().mockReturnValue({ offset });
   const orderBy = vi.fn().mockReturnValue({ limit });
   const where = vi.fn().mockReturnValue({ orderBy });
-  // Three chained leftJoins (deviceHardware, deviceReliability #1720,
-  // deviceHardwareHealth #6854), so each leftJoin returns an object exposing
+  // Three base joins plus the opt-in deviceWarranty join (#9863).
+  // Each leftJoin returns an object exposing
   // the next leftJoin and the terminal where().
   const chain: Record<string, unknown> = {};
   const leftJoin = vi.fn().mockReturnValue(chain);
@@ -254,10 +254,8 @@ describe('GET /devices — response shape', () => {
       new Date('2026-05-26T19:24:00.000Z').toISOString(),
     );
     expect(row).toHaveProperty('helperInstallIssue', 'awaiting_server_offer');
-    // #7067 — the "logs silent" list badge (DeviceList.tsx) reads lastLogAt
-    // off the list row directly; the detail route already returns it via
-    // projectPublicDevice, but the list select/mapper needs the same fix as
-    // #7068/#7023 above or the badge silently never renders on the list.
+    // #7067 — lastLogAt stays on the list row (public API shape); the detail
+    // route already returns it via projectPublicDevice.
     expect(row).toHaveProperty(
       'lastLogAt',
       new Date('2026-05-26T19:30:00.000Z').toISOString(),
@@ -410,6 +408,26 @@ describe('GET /devices — response shape', () => {
     expect(row.lastLogAt).toBeNull();
   });
 
+  it.each(['TEST-SERIAL-01', null])('includes hardware serialNumber %s in list rows', async serialNumber => {
+    rigDeviceListRows([{ id: '11111111-1111-4111-8111-111111111111', serialNumber }]);
+    const response = await app.request('/devices');
+    expect(response.status).toBe(200);
+    expect((await response.json()).data[0]).toHaveProperty('hardware.serialNumber', serialNumber);
+    expect(vi.mocked(db.select).mock.calls[0]?.[0]).toMatchObject({
+      serialNumber: deviceHardware.serialNumber,
+    });
+  });
+
+  it.each(['5S3F8EA#ABB', null])('includes hardware productSku %s in list rows (#9593)', async productSku => {
+    rigDeviceListRows([{ id: '11111111-1111-4111-8111-111111111111', productSku }]);
+    const response = await app.request('/devices');
+    expect(response.status).toBe(200);
+    expect((await response.json()).data[0]).toHaveProperty('hardware.productSku', productSku);
+    expect(vi.mocked(db.select).mock.calls[0]?.[0]).toMatchObject({
+      productSku: deviceHardware.productSku,
+    });
+  });
+
   it.each(['ok', 'warning', 'critical', 'unknown'] as const)('projects the hardware %s rollup on list rows', async health => {
     const { leftJoin } = rigDeviceListRows([{
       id: '11111111-1111-4111-8111-111111111111', hostname: 'hardware-host',
@@ -429,6 +447,112 @@ describe('GET /devices — response shape', () => {
     const response = await app.request('/devices');
     expect((await response.json()).data[0]).toMatchObject({ hardwareHealth: null, hardwareHealthSummary: null });
   });
+  // #9863 — fleet-wide warranty view. The list row carries the device's
+  // warranty end date and stored status from device_warranty, joined on the
+  // device subject only (manual-asset warranty rows have device_id NULL), so
+  // the Warranty column needs no per-row fetch.
+  it.each(['', '?includeWarranty=false'])('keeps warranty off the base list query (%s)', async (query) => {
+    const { leftJoin } = rigDeviceListRows([{ id: '11111111-1111-4111-8111-111111111111' }]);
+    const response = await app.request(`/devices${query}`);
+    expect(response.status).toBe(200);
+    expect(leftJoin.mock.calls.map(([table]) => table)).not.toContain(deviceWarranty);
+    expect(leftJoin).toHaveBeenCalledTimes(3);
+    const projection = vi.mocked(db.select).mock.calls[0]?.[0];
+    expect(projection).not.toHaveProperty('warrantyEndDate');
+    expect(projection).not.toHaveProperty('warrantyStatus');
+    // No extra query for warranty enrichment on the default hot path.
+    expect(db.select).toHaveBeenCalledTimes(1);
+    expect(db.execute).toHaveBeenCalledTimes(2);
+  });
+  it('projects the warranty end date and status on list rows', async () => {
+    const { leftJoin } = rigDeviceListRows([{
+      id: '11111111-1111-4111-8111-111111111111', hostname: 'warranty-host',
+      warrantyEndDate: '2026-12-31', warrantyStatus: 'expiring',
+    }]);
+    const response = await app.request('/devices?includeWarranty=true');
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.data[0]).toMatchObject({ warrantyEndDate: '2026-12-31', warrantyStatus: 'expiring' });
+    expect(vi.mocked(db.select).mock.calls[0]?.[0]).toMatchObject({
+      warrantyEndDate: deviceWarranty.warrantyEndDate, warrantyStatus: deviceWarranty.status,
+    });
+    const warrantyJoin = leftJoin.mock.calls.find(([table]) => table === deviceWarranty);
+    expect(warrantyJoin).toBeDefined();
+    const on = new PgDialect().sqlToQuery(warrantyJoin![1] as SQL);
+    expect(on.sql).toBe('"devices"."id" = "device_warranty"."device_id"');
+  });
+  it('returns null warranty fields when the device has no warranty row', async () => {
+    rigDeviceListRows([{ id: '11111111-1111-4111-8111-111111111111', warrantyEndDate: null, warrantyStatus: null }]);
+    const row = (await (await app.request('/devices?includeWarranty=true')).json()).data[0];
+    expect(Object.prototype.hasOwnProperty.call(row, 'warrantyEndDate')).toBe(true);
+    expect(row).toMatchObject({ warrantyEndDate: null, warrantyStatus: null });
+  });
+  // Log-shipping health W01 (#8608): the list row carries ONLY the derived
+  // `logShipping` object. The raw columns must never reach the response, so
+  // `lastError` surfaces solely through the derived view while `failing`.
+  it('exposes a derived logShipping object and never the raw log-shipping columns', async () => {
+    const base = {
+      orgId: 'org-1', siteId: 'site-1', agentId: 'a', hostname: 'h', displayName: null,
+      osType: 'linux', deviceRole: 'server', deviceRoleSource: 'auto', osVersion: '1', osBuild: null,
+      architecture: 'x64', agentVersion: 'v1', watchdogVersion: null, watchdogStatus: null,
+      mainAgentSilentSince: null, pendingReboot: false, lastSeenAt: new Date(), lastSeenIp: null,
+      enrolledAt: new Date(), tags: [], customFields: {}, desktopAccess: null, lastUser: null,
+      uptimeSeconds: null, isHeadless: false, linkGroupId: null, linkGroupRole: null,
+      createdAt: new Date(), updatedAt: new Date(), cpuModel: null, cpuCores: null, ramTotalMb: null,
+      diskTotalGb: null, reliabilityScore: null, reliabilityTrend: null, reliabilityProvisional: null,
+      helperLifecycleMode: null, purchaseDate: null, purchaseDateSource: null,
+      updateOfferWithheldReason: null, updateAttemptTargetVersion: null, updateAttemptStartedAt: null,
+      updateAttemptLastAt: null, helperInstallIssue: null, lastLogAt: null,
+    };
+    const started = new Date(Date.now() - 45 * 60_000);
+    rigDeviceListRows([
+      {
+        ...base, id: '11111111-1111-4111-8111-111111111111', status: 'online',
+        logShippingState: 'failing', logShippingFailureStartedAt: started, logShippingLastError: 'http 503',
+      },
+      { ...base, id: '22222222-2222-4222-8222-222222222222', status: 'online',
+        logShippingState: null, logShippingFailureStartedAt: null, logShippingLastError: null },
+      { ...base, id: '33333333-3333-4333-8333-333333333333', status: 'offline',
+        logShippingState: 'failing', logShippingFailureStartedAt: started, logShippingLastError: 'http 503' },
+    ]);
+
+    const res = await app.request('/devices?limit=50', { headers: { Authorization: 'Bearer t' } });
+    expect(res.status).toBe(200);
+    const rows = (await res.json()).data;
+    expect(rows[0].logShipping).toEqual({
+      state: 'failing', failingSince: started.toISOString(), lastError: 'http 503',
+    });
+    expect(rows[1].logShipping).toEqual({ state: 'unknown', failingSince: null, lastError: null });
+    // Offline devices never report a shipping failure.
+    expect(rows[2].logShipping).toEqual({ state: 'unknown', failingSince: null, lastError: null });
+    for (const row of rows) {
+      expect(row).not.toHaveProperty('logShippingState');
+      expect(row).not.toHaveProperty('logShippingFailureStartedAt');
+      expect(row).not.toHaveProperty('logShippingLastError');
+    }
+  });
+
+  // Watchdog install W02 (#8620): the banner view is a DETAIL-only field. List
+  // rows must carry neither the raw watchdog_install_* columns nor a derived
+  // `watchdogInstall` key, even if the row source happens to include them.
+  it('never forwards watchdog install columns or the derived view on list rows', async () => {
+    rigDeviceListRows([
+      {
+        id: '11111111-1111-4111-8111-111111111111', orgId: 'org-1', siteId: 'site-1', agentId: 'a',
+        hostname: 'h', displayName: null, osType: 'linux', status: 'online',
+        watchdogInstallState: 'gave_up', watchdogInstallErrorClass: 'signature',
+        watchdogInstallSince: new Date(),
+      },
+    ]);
+    const res = await app.request('/devices?limit=50', { headers: { Authorization: 'Bearer t' } });
+    expect(res.status).toBe(200);
+    const row = (await res.json()).data[0];
+    expect(row).not.toHaveProperty('watchdogInstallState');
+    expect(row).not.toHaveProperty('watchdogInstallErrorClass');
+    expect(row).not.toHaveProperty('watchdogInstallSince');
+    expect(row).not.toHaveProperty('watchdogInstall');
+  });
+
   // Filtering on hardware health goes through the shared filter engine
   // (`hardware.health`), not a bespoke list query param.
   it('does not filter on a hardwareHealth query param', async () => {

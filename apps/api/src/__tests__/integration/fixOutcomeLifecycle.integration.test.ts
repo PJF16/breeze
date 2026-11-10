@@ -573,6 +573,33 @@ describe('fix outcome lifecycle (real Postgres)', () => {
     expect(await advanceOutcome(a.outcomeId, { now: new Date(t0.getTime() + 6 * H) })).toBe('recurred');
   });
 
+  it('pages a burst of same-millisecond alerts without overlap and still finds the recurrence (#7279)', async () => {
+    const w = await world();
+    const t0 = new Date(Date.UTC(2026, 10, 14));
+    const a = await attempt(w, w.o1, w.d1, w.partnerScript, t0);
+    await advanceOutcome(a.outcomeId, { now: new Date(t0.getTime() + 2 * 60_000) });
+    await resolveByCondition(a.alertId, new Date(t0.getTime() + H));
+    expect(await advanceOutcome(a.outcomeId, { now: new Date(t0.getTime() + 2 * H) })).toBe('holding');
+    // 120 noise alerts and the recurrence, all inside ONE millisecond, a microsecond apart.
+    // A JS Date keyset cursor (millisecond precision) re-reads the same page forever and the
+    // scan gives up as 'unscanned'; the recurrence is the 61st row, past the first page.
+    const burst = new Date(t0.getTime() + 3 * H);
+    const other = await w.mkScript({ partnerId: w.partnerId });
+    const noise = await sys(() => db.insert(alerts).values(Array.from({ length: 120 }, (_, i) => ({
+      orgId: w.o1, deviceId: w.d1, severity: 'low' as const, title: `burst ${i}`, triggeredAt: burst,
+      context: { source: 'script_exit_code', scriptId: other.scriptId, exitCode: 1 },
+    }))).returning({ id: alerts.id }));
+    const [again] = await sys(() => db.insert(alerts).values({
+      orgId: w.o1, deviceId: w.d1, severity: 'high', title: 'exit 3 again', triggeredAt: burst,
+      context: { source: 'script_exit_code', scriptId: w.partnerScript.scriptId, exitCode: 3 },
+    }).returning({ id: alerts.id }));
+    const ordered = [...noise.slice(0, 60).map((r) => r.id), again!.id, ...noise.slice(60).map((r) => r.id)];
+    for (const [i, id] of ordered.entries()) {
+      await sys(() => db.execute(sql`UPDATE alerts SET triggered_at = ${burst.toISOString()}::timestamptz + make_interval(secs => ${i} / 1000000.0) WHERE id = ${id}`));
+    }
+    expect(await advanceOutcome(a.outcomeId, { now: new Date(t0.getTime() + 6 * H) })).toBe('recurred');
+  });
+
   it('a proven partner fix whose script is re-scoped to org A is never offered to org B, even under system scope (Review Focus 5)', async () => {
     const w = await world();
     const base = Date.UTC(2026, 10, 15);
@@ -672,6 +699,69 @@ describe('fix outcome lifecycle (real Postgres)', () => {
       else process.env.ORG_MERGE_FENCE_DRAIN_MS = prior;
     }
   }, 240_000); // executeOrgMerge + the org cascade each walk every tenant table (30-110 s locally, load-dependent): far over the 30 s default
+
+  it('#8746: a loser kept under a PAM evidence hold is erased scoped; its organizations row survives, yet the rebuild still lifts the request', async () => {
+    const prior = process.env.ORG_MERGE_FENCE_DRAIN_MS;
+    process.env.ORG_MERGE_FENCE_DRAIN_MS = '0';
+    try {
+      const w = await world();
+      const base = Date.UTC(2026, 10, 23);
+      await verify(w, w.o1, w.d1, w.partnerScript, new Date(base)); // loser
+      await verify(w, w.o2, w.d2, w.partnerScript, new Date(base + 30 * H)); // survivor
+      await verify(w, w.o2, w.d2, w.partnerScript, new Date(base + 60 * H)); // survivor
+      const actor = await createUser({ partnerId: w.partnerId, orgId: null, email: `held-${randomUUID()}@example.com` });
+
+      await executeOrgMerge({ loserOrgId: w.o1, survivorOrgId: w.o2, partnerId: w.partnerId, performedBy: actor.id, performedByEmail: actor.email });
+      // The PAM evidence hold Phase B would write for a loser that kept PAM
+      // history (blocks-merge still refuses such merges until W6): raw insert
+      // against the real merge event.
+      await getTestDb().execute(sql`
+        INSERT INTO org_evidence_holds (loser_org_id, partner_id, survivor_org_id, merge_event_id, reason)
+        SELECT e.loser_org_id, e.partner_id, e.survivor_org_id, e.id, 'pam_evidence'
+          FROM org_merge_events e WHERE e.loser_org_id = ${w.o1}::uuid`);
+
+      const stats = await eraseOrgWithFixMemory(w.o1, actor.id, actor.email);
+      expect(stats.evidenceHoldScoped).toBe(true);
+      const [shell] = (await getTestDb().execute(sql`SELECT 1 AS present FROM organizations WHERE id = ${w.o1}::uuid`)) as unknown as Array<{ present: number }>;
+      expect(shell, 'the held shell organizations row must survive a scoped erasure').toBeDefined();
+      expect(await sys(() => db.select().from(fixOutcomes).where(eq(fixOutcomes.orgId, w.o1)))).toEqual([]);
+      // The org row survives, but its outcomes are gone, so the request is satisfied.
+      expect((await partnerMemory(w.partnerId))[0]).toMatchObject({ attempts: 2, verifiedCount: 2, staleSince: null, rebuildPendingOrgIds: [] });
+    } finally {
+      if (prior === undefined) delete process.env.ORG_MERGE_FENCE_DRAIN_MS;
+      else process.env.ORG_MERGE_FENCE_DRAIN_MS = prior;
+    }
+  }, 240_000);
+
+  it('#8746: the scoped-erasure stamp satisfies a request only on a held shell, and a held shell without it stays pending', async () => {
+    const w = await world();
+    const base = Date.UTC(2026, 10, 25);
+    await verify(w, w.o1, w.d1, w.partnerScript, new Date(base));
+    await verify(w, w.o2, w.d2, w.partnerScript, new Date(base + 30 * H));
+    expect(await sys(() => markFixMemoryStaleForOrgErasure(w.o2))).toBe(w.partnerId);
+    const stamp = `{"evidenceHoldScopedErasureAt":"2026-01-01T00:00:00Z"}`;
+
+    // A stray stamp on a live, un-held org satisfies nothing.
+    await getTestDb().execute(sql`
+      UPDATE organizations SET settings = COALESCE(settings, '{}'::jsonb) || ${stamp}::jsonb WHERE id = ${w.o2}::uuid`);
+    await sys(() => rebuildFixMemory({ partnerId: w.partnerId }));
+    expect((await partnerMemory(w.partnerId))[0]).toMatchObject({ rebuildPendingOrgIds: [w.o2] });
+
+    // A held shell whose scoped erasure has not completed (no stamp) stays pending.
+    await getTestDb().execute(sql`
+      UPDATE organizations SET settings = settings - 'evidenceHoldScopedErasureAt' WHERE id = ${w.o2}::uuid`);
+    const [event] = (await getTestDb().execute(sql`
+      INSERT INTO org_merge_events (partner_id, loser_org_id, loser_org_name, survivor_org_id, summary)
+      VALUES (${w.partnerId}::uuid, ${w.o2}::uuid, 'held fixture', ${w.o1}::uuid, '{"tables":{},"warnings":[]}'::jsonb)
+      RETURNING id`)) as unknown as Array<{ id: string }>;
+    await getTestDb().execute(sql`
+      INSERT INTO org_evidence_holds (loser_org_id, partner_id, survivor_org_id, merge_event_id, reason)
+      VALUES (${w.o2}::uuid, ${w.partnerId}::uuid, ${w.o1}::uuid, ${event!.id}::uuid, 'pam_evidence')`);
+    await sys(() => rebuildFixMemory({ partnerId: w.partnerId }));
+    const pending = (await partnerMemory(w.partnerId))[0]!;
+    expect(pending).toMatchObject({ rebuildPendingOrgIds: [w.o2] });
+    expect(pending.staleSince).not.toBeNull();
+  });
 
   it('the inline script hook fails the attempt once and the recount pass aggregates it (decision D-a)', async () => {
     const w = await world();

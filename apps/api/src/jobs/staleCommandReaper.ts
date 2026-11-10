@@ -1,9 +1,9 @@
-import { SOFTWARE_INSTALL_SERVER_TIMEOUT_MS } from '@breeze/shared';
+import { RESTORE_POINT_PAYLOAD_KEY, SOFTWARE_INSTALL_SERVER_TIMEOUT_MS } from '@breeze/shared';
 import { REMOTE_SESSION_ACTIVE_MAX_AGE_MS } from '../services/remoteSessionStaleness';
 import { Job, Queue, Worker } from 'bullmq';
-import { and, eq, lt, sql, inArray, isNotNull, isNull, or } from 'drizzle-orm';
+import { and, eq, lt, lte, sql, inArray, isNotNull, isNull, or } from 'drizzle-orm';
 import * as dbModule from '../db';
-import { db } from '../db';
+import { db, hasDbAccessContext, withDbTransaction } from '../db';
 import {
   deviceCommands,
   scriptExecutions,
@@ -32,10 +32,13 @@ import {
 import { DEFAULT_OFFLINE_THRESHOLD_MINUTES } from '../services/deviceLiveness';
 import { UNINSTALL_REASON_DEVICE_REMOVE } from '../services/deviceUninstallDrain';
 import { captureException } from '../services/sentry';
+import { releaseFilesystemScanGenerationForCommand } from '../services/filesystemScanGenerationRelease';
+import { finalizeContainmentAction } from '../services/incidentContainmentResults';
 import { recordBackupCommandTimeout, recordRestoreTimeout } from '../services/backupMetrics';
 import { revokeViewerSession } from '../services/viewerTokenRevocation';
 import { terminalIntentSet } from '../services/remoteDesktopTerminalIntent';
 import { backupHelperSupportsQueue } from '../services/backupHelperCapabilities';
+import { catchUpExpiryReason } from './backupCatchUp';
 import { queueBackupStopCommand, CommandTypes } from '../services/commandQueue';
 import { envInt } from '../utils/envInt';
 
@@ -90,10 +93,11 @@ const DEPLOYMENT_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours
 // Software deployment (`deployment_results`) stale thresholds — §1.5 of the
 // 2026-07-28 software-deployment-visibility plan. Exported for tests.
 //
-// Tier 1 (delivered but silent): 55 min sits above the agent's own hard
-// ceilings (15 min download + 30 min install,
-// agent/internal/remote/tools/software_install.go:22-26), so the server only
-// declares a timeout after the agent's ceilings have provably lapsed.
+// Tier 1 (delivered but silent): 75 min sits above the agent's worst-case
+// budget: download 15 + installer 30 (software_install.go) + two install
+// scripts 2×10 (#6958; agent-side enforcement lands with the agent PR) +
+// detection settle window 1 = 66 min, plus margin. The server only declares a
+// timeout after the agent's ceilings have provably lapsed.
 // Lives in @breeze/shared (#3578) so the web deployment view's "no update from
 // the agent" hint quotes the same number this reaper enforces.
 export const SOFTWARE_INSTALL_TIMEOUT_MS = SOFTWARE_INSTALL_SERVER_TIMEOUT_MS;
@@ -110,7 +114,9 @@ const BACKUP_ABSOLUTE_TIMEOUT_MS = BACKUP_JOB_ABSOLUTE_TIMEOUT_MS; // legacy age
 const BACKUP_PENDING_TIMEOUT_MS = 60 * 60 * 1000;    // dispatch enqueued but never flipped/failed
 
 // #2798 no-transfer rule: the agent is alive (keepalive fresh) but neither
-// bytes nor files have advanced. Helpers before v0.118.0 report counters only
+// bytes nor files have advanced — nor, since #11014, the verified counters a
+// resume or dedupe check pass reports (applyBackupProgress folds all of them
+// into last_progress_at). Helpers before v0.118.0 report counters only
 // when a whole FILE completes, so a single large file legitimately shows zero
 // advance for its entire upload. The window is therefore sized from the bytes
 // still to go, not a flat timer: the file in flight is at most
@@ -131,8 +137,8 @@ export const BACKUP_NO_TRANSFER_MAX_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const BACKUP_NO_TRANSFER_FLOOR_RATE_BYTES_PER_SEC = 512 * 1024; // ~4 Mbit/s
 
 /**
- * How long a live backup may go without any byte/file advance before the
- * reaper treats it as wedged. See BACKUP_NO_TRANSFER_MIN_WINDOW_MS.
+ * How long a live backup may go without any byte/file/verified advance before
+ * the reaper treats it as wedged. See BACKUP_NO_TRANSFER_MIN_WINDOW_MS.
  */
 export function backupNoTransferWindowMs(
   totalSize: number | null | undefined,
@@ -320,6 +326,52 @@ export async function propagateTimedOutDeviceCommand(params: {
         `[StaleCommandReaper] Timed-out ${params.commandType} command ${commandId} names no valid backup job id; ` +
         'its job is left to the backup reaper',
       );
+    }
+  }
+
+  // #9105 — a filesystem_analysis command the reaper times out never reaches
+  // handleFilesystemAnalysisCommandResult, so release the volume's scan
+  // generation here (conditionally on this command still owning it) or older
+  // good results keep being dropped as superseded. Contained like the blocks
+  // above: a failure must not skip the DR reconcile.
+  if (params.commandType === 'filesystem_analysis' && params.deviceId) {
+    try {
+      await releaseFilesystemScanGenerationForCommand(
+        { id: commandId, deviceId: params.deviceId, payload },
+        params.kind ?? 'timeout',
+      );
+    } catch (err) {
+      console.error(`[StaleCommandReaper] Failed to release filesystem scan generation for timed-out command ${commandId}:`, err);
+      captureException(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  // #9662 — an execute_containment command the server stopped waiting for
+  // leaves its incident action `in_progress` forever otherwise; nothing else
+  // ever revisits it. Recorded as a server timeout, which a late real agent
+  // result may still repair. Contained like the blocks above: a failure must
+  // not skip the DR reconcile — and, because the manual mark-timed-out route
+  // calls this inside its request transaction, it runs in a real savepoint so
+  // a caught SQL fault does not leave that transaction aborted.
+  // Delivery failure cannot prove absence. Legacy AI actions without an episode
+  // still require the generic finalizer to stop waiting for a terminal transport row.
+  if (params.commandType === CommandTypes.EXECUTE_CONTAINMENT || params.commandType === CommandTypes.RELEASE_CONTAINMENT) {
+    const finalize = async () => {
+      const episode = (payload?.actionType === 'network_isolation' || params.commandType === CommandTypes.RELEASE_CONTAINMENT)
+        ? await (await import('../services/networkIsolation/episodeStore')).findEpisodeByCommand(db, commandId) : null;
+      if (episode) {
+        const { journalIsolationEvent } = await import('../services/networkIsolation/reconcile');
+        await journalIsolationEvent(db, episode, 'isolate_command_timed_out', completedAt);
+        console.warn('[isolation] command timed out; heartbeat intent retained', { commandId, deviceId: episode.deviceId, isolationId: episode.id });
+      } else if (params.commandType === CommandTypes.EXECUTE_CONTAINMENT) {
+        await finalizeContainmentAction({ commandId, payload, outcome: { kind: 'timeout', error: errorMsg }, completedAt });
+      }
+    };
+    try {
+      await (hasDbAccessContext() ? withDbTransaction(finalize) : finalize());
+    } catch (err) {
+      console.error(`[StaleCommandReaper] Failed to finalize the containment action for timed-out command ${commandId}:`, err);
+      captureException(err instanceof Error ? err : new Error(String(err)));
     }
   }
 
@@ -729,14 +781,15 @@ export async function reapStaleScriptExecutions(): Promise<number> {
     // The per-row deadline must use the script's own value too. Leaving this
     // check on a fixed constant would keep enforcing the old floor and make
     // the fix inert for exactly the short-timeout case #3190 describes.
-    const timeoutMs = getCommandTimeoutMs(CommandTypes.SCRIPT, {
-      timeoutSeconds: resolveExecutionTimeoutSeconds(exec),
-    });
+    const timeoutSeconds = resolveExecutionTimeoutSeconds(exec);
     const referenceTime = exec.status === 'running' && exec.startedAt
       ? exec.startedAt.getTime()
       : exec.createdAt.getTime();
 
-    if (now - referenceTime < timeoutMs) continue;
+    // Cheap first pass on the execution row alone. The restore-point budget
+    // below can only LENGTHEN the deadline, so a row not due without it is not
+    // due at all — and skips the command lookup.
+    if (now - referenceTime < getCommandTimeoutMs(CommandTypes.SCRIPT, { timeoutSeconds })) continue;
 
     // #3097: this lookup used to happen AFTER the update, purely to find the
     // batch. It runs first now because it also answers whether the agent
@@ -770,6 +823,18 @@ export async function reapStaleScriptExecutions(): Promise<number> {
       .limit(1);
 
     const cmd = relatedCmd[0];
+
+    // #9162: the restore-point stamp lives on the COMMAND payload, not the
+    // execution row. Re-check the deadline with it, so this reaper and
+    // `reapStaleDeviceCommands` (which passes the full payload) agree on when a
+    // stamped script is overdue. Only the stamp is taken from the command: the
+    // timeout stays the execution's own snapshot.
+    const cmdPayload = cmd?.payload as Record<string, unknown> | null | undefined;
+    const timeoutMs = getCommandTimeoutMs(CommandTypes.SCRIPT, {
+      timeoutSeconds,
+      [RESTORE_POINT_PAYLOAD_KEY]: cmdPayload?.[RESTORE_POINT_PAYLOAD_KEY],
+    });
+    if (now - referenceTime < timeoutMs) continue;
 
     // #5128 — THE DELIVERY CLOCK HAS ONE OWNER. A not-yet-running execution
     // whose command row is still `pending` or `sent` is waiting for the device,
@@ -1370,7 +1435,9 @@ async function reapStaleRemoteSessions(): Promise<number> {
   const pendingCutoff = new Date(Date.now() - REMOTE_SESSION_PENDING_TIMEOUT_MS);
   const activeCutoff = new Date(Date.now() - REMOTE_SESSION_ACTIVE_TIMEOUT_MS);
 
-  // Pending/connecting sessions older than 10 minutes
+  // Pending/connecting sessions with no start attempt in 10 minutes. Not keyed on
+  // created_at: a live session re-offering is `connecting` on its original row
+  // (#11149).
   const pendingResult = await db
     .update(remoteSessions)
     .set(terminalIntentSet({
@@ -1381,7 +1448,7 @@ async function reapStaleRemoteSessions(): Promise<number> {
     .where(
       and(
         inArray(remoteSessions.status, ['pending', 'connecting']),
-        lt(remoteSessions.createdAt, pendingCutoff),
+        lt(remoteSessions.lastStartAttemptAt, pendingCutoff),
       ),
     )
     .returning({ id: remoteSessions.id });
@@ -1529,7 +1596,10 @@ async function failBackupJobForTimedOutCommand(
  *
  * Two clocks (#2798): liveness = lastKeepaliveAt (any agent signal; falls
  * back to lastProgressAt for rows written before the column existed), and
- * progress = lastProgressAt (bytes or files actually advanced).
+ * progress = lastProgressAt (bytes or files actually advanced, or — #11014 —
+ * the agent's verified counters: files/bytes it finished checking during a
+ * resume or dedupe pass, which can run for hours before the first upload;
+ * see applyBackupProgress).
  *
  * A `running` job is reaped when ANY of:
  *  A (silent):   liveness is set and stale past BACKUP_STALL_TIMEOUT_MS
@@ -1611,7 +1681,7 @@ export async function reapStaleBackupJobs(): Promise<number> {
     } else if (deviceOffline && now - livenessRef.getTime() > BACKUP_OFFLINE_GRACE_MS) {
       errorMsg = 'Device went offline during backup';
     } else if (liveness && now - transferRef.getTime() > noTransferWindowMs) {
-      errorMsg = `Backup stalled: no data transferred for ${formatWindow(now - transferRef.getTime())} while the agent was still responding (limit ${formatWindow(noTransferWindowMs)})`;
+      errorMsg = `Backup stalled: no data transferred or verified for ${formatWindow(now - transferRef.getTime())} while the agent was still responding (limit ${formatWindow(noTransferWindowMs)})`;
     } else if (!liveness && now - livenessRef.getTime() > BACKUP_ABSOLUTE_TIMEOUT_MS) {
       // No progress signal ever (legacy agent) OR a zombie with no started_at —
       // reap on the absolute cap against progressRef (started_at ?? createdAt).
@@ -1648,6 +1718,8 @@ export async function reapStaleBackupJobs(): Promise<number> {
       createdAt: backupJobs.createdAt,
       lastProgressAt: backupJobs.lastProgressAt,
       lastKeepaliveAt: backupJobs.lastKeepaliveAt,
+      startedAt: backupJobs.startedAt,
+      catchUpUntil: backupJobs.catchUpUntil,
       deviceStatus: devices.status,
       deviceLastSeenAt: devices.lastSeenAt,
       deviceBackupVersion: devices.backupVersion,
@@ -1657,7 +1729,12 @@ export async function reapStaleBackupJobs(): Promise<number> {
     .where(
       and(
         eq(backupJobs.status, 'pending'),
-        lt(backupJobs.createdAt, pendingCutoff),
+        // #11013: a pending job's started_at is set only by the claim of a job
+        // that waited for its device, whose clock starts there, not at the
+        // schedule. A job still waiting is left out until its window lapses, so
+        // waiting rows cannot use up this run's MAX_REAP_PER_RUN.
+        sql`COALESCE(${backupJobs.startedAt}, ${backupJobs.createdAt}) < ${pendingCutoff.toISOString()}`,
+        sql`(${backupJobs.catchUpUntil} IS NULL OR ${backupJobs.catchUpUntil} <= ${new Date(now).toISOString()})`,
         sql`(COALESCE(${backupJobs.lastKeepaliveAt}, ${backupJobs.lastProgressAt}) IS NULL OR COALESCE(${backupJobs.lastKeepaliveAt}, ${backupJobs.lastProgressAt}) < ${pendingProgressCutoff.toISOString()})`,
       ),
     )
@@ -1665,7 +1742,33 @@ export async function reapStaleBackupJobs(): Promise<number> {
 
   for (const job of pendingCandidates) {
     if (reaped >= MAX_REAP_PER_RUN) break;
-    if (now - job.createdAt.getTime() < BACKUP_PENDING_TIMEOUT_MS) continue;
+    if (now - (job.startedAt ?? job.createdAt).getTime() < BACKUP_PENDING_TIMEOUT_MS) continue;
+
+    // #11013: never sent, so there is no late result to recognise and nothing on
+    // the helper to stop. Settled with the exact reason reporting keys on.
+    if (job.catchUpUntil) {
+      if (job.catchUpUntil.getTime() > now) continue;
+      const failedAt = new Date();
+      const expired = await db
+        .update(backupJobs)
+        .set({
+          status: 'failed',
+          completedAt: failedAt,
+          updatedAt: failedAt,
+          errorLog: catchUpExpiryReason(job.deviceLastSeenAt, job.createdAt),
+        })
+        .where(and(
+          eq(backupJobs.id, job.id),
+          eq(backupJobs.status, 'pending'),
+          // Still waiting and still lapsed: never a row a catch-up claimed.
+          isNotNull(backupJobs.catchUpUntil),
+          lte(backupJobs.catchUpUntil, new Date(now)),
+        ))
+        .returning({ id: backupJobs.id });
+      if (expired.length > 0) reaped++;
+      continue;
+    }
+
     // A pending job still being kept alive by recent pings is not dead.
     const pendingLiveness = job.lastKeepaliveAt ?? job.lastProgressAt ?? null;
     if (pendingLiveness && now - pendingLiveness.getTime() < BACKUP_STALL_TIMEOUT_MS) continue;

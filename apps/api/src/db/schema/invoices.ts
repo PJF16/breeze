@@ -89,6 +89,15 @@ export const invoices = pgTable('invoices', {
   // reads ONLY this column afterwards, so a later partner-default change cannot
   // alter what a sanctioned re-render produces.
   deviceAppendix: boolean('device_appendix'),
+  // #8604 line itemization override. NULL on a draft = inherit the partner's
+  // invoice_line_* default; both issue writers stamp the RESOLVED values and
+  // renderers read only these afterwards (resolveInvoiceLineDetail). NULL on an
+  // issued row = issued before #8604 → the default (= pre-#8604) document.
+  // line_grouping is CHECK (NULL | 'entry' | 'day') in SQL.
+  lineGrouping: varchar('line_grouping', { length: 8 }),
+  lineShowDate: boolean('line_show_date'),
+  lineShowNote: boolean('line_show_note'),
+  lineShowWorkedTime: boolean('line_show_worked_time'),
   // #6227 presentation snapshot. NULL on a draft = preview the partner's live
   // document_theme / document_page_size; both issue writers (issueInvoice and
   // the quote-accept direct issue) freeze the RESOLVED values here, and every
@@ -184,6 +193,15 @@ export const invoiceLines = pgTable('invoice_lines', {
   // worked-vs-billed disclosure note only — never for money. NULL for
   // non-time-entry lines and for legacy rows predating this column.
   workedMinutes: integer('worked_minutes'),
+  // #8603: the day a time_entry line was worked, from the entry's started_at
+  // in the partner timezone, captured at assembly and copied on reissue. NULL
+  // for non-time-entry lines (incl. block-hours overage) and pre-column rows.
+  workDate: date('work_date'),
+  // #8606: true once an operator hand-edits the description (updateLine, only
+  // on an actual change); "Refresh from time entries" then never overwrites
+  // it. Copied verbatim on reissue. Backfilled true for draft time_entry
+  // lines that predate the column (migration 2026-12-27-070000).
+  descriptionEdited: boolean('description_edited').notNull().default(false),
   sortOrder: integer('sort_order').notNull().default(0),
   createdAt: timestamp('created_at').defaultNow().notNull()
 }, (t) => [
@@ -246,10 +264,17 @@ export const invoicePayments = pgTable('invoice_payments', {
   receivedAt: date('received_at').notNull(),
   recordedBy: uuid('recorded_by').references(() => users.id),
   note: text('note'),
+  // #3803: caller-supplied key for a manual payment; a retry carrying the same
+  // key answers with this row instead of recording again (recordPayment).
+  // NULL for every payment recorded without one (Stripe, accounting pull, older rows).
+  idempotencyKey: varchar('idempotency_key', { length: 255 }),
   createdAt: timestamp('created_at').defaultNow().notNull()
 }, (t) => [
   index('invoice_payments_invoice_idx').on(t.invoiceId),
-  index('invoice_payments_org_idx').on(t.orgId)
+  index('invoice_payments_org_idx').on(t.orgId),
+  uniqueIndex('invoice_payments_invoice_idempotency_key_uq')
+    .on(t.invoiceId, t.idempotencyKey)
+    .where(sql`${t.idempotencyKey} IS NOT NULL`)
 ]);
 
 export const partnerInvoiceSequences = pgTable('partner_invoice_sequences', {

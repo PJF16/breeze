@@ -55,6 +55,8 @@ vi.mock('../db', () => {
     },
     withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
     withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+    withDbTransaction: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+    withDbTransactionIfHeld: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   };
 });
 
@@ -130,10 +132,13 @@ const findForeignSnapshotClaimMock = vi.fn();
 // (backupStorageWriteSessions / backupSnapshotIdReservations integration
 // suites); here no job has a write session unless a test says otherwise.
 const allowedSnapshotIdsForJobMock = vi.hoisted(() => vi.fn(async (): Promise<string[] | null> => null));
+const loadReservationKeyRootMock = vi.hoisted(() =>
+  vi.fn(async (_snapshotId: string): Promise<{ keyLayout: string; keyPrefix: string | null } | null> => null));
 vi.mock('./backupSnapshotIdReservations', () => ({
   SNAPSHOT_ID_RESERVATION_CONSTRAINT: 'backup_snapshot_id_reservations_pkey',
   allowedSnapshotIdsForJob: allowedSnapshotIdsForJobMock,
   isReservedToAnotherJob: vi.fn(async () => false),
+  loadReservationKeyRoot: loadReservationKeyRootMock,
 }));
 const createAuditLogMock = vi.hoisted(() => vi.fn(async () => undefined));
 vi.mock('./auditService', () => ({ createAuditLog: createAuditLogMock }));
@@ -201,6 +206,7 @@ import {
 } from '../jobs/backupRetention';
 import { applyBackupSnapshotImmutability } from './backupSnapshotStorage';
 import { checkBackupProviderCapabilities } from './backupSnapshotStorage';
+import { setBackupMetricsRecorder } from './backupMetrics';
 
 function chainMock(resolvedValue: unknown = []) {
   const chain: Record<string, any> = {};
@@ -1497,6 +1503,8 @@ describe('backup result persistence', () => {
               kind: 'symlink',
               linkTarget: 'usr/bin',
             },
+            // #11235: and a directory entry, with the kind hydration records.
+            { sourcePath: '/srv/empty', backupPath: '', kind: 'dir' },
           ],
         },
       },
@@ -1507,10 +1515,17 @@ describe('backup result persistence', () => {
       expect.objectContaining({
         sourcePath: 'C:\\assure\\src\\x',
         backupPath: 'snapshots/snap-1/files/x.gz',
+        kind: null,
       }),
       expect.objectContaining({
         sourcePath: '/bin',
         backupPath: '',
+        kind: 'symlink',
+      }),
+      expect.objectContaining({
+        sourcePath: '/srv/empty',
+        backupPath: '',
+        kind: 'dir',
       }),
     ]);
   });
@@ -2805,5 +2820,168 @@ describe('snapshot attestation hand-off', () => {
       dispatchExpectationVerified: true,
     });
     expect(attestLateAgentResultMock).not.toHaveBeenCalled();
+  });
+});
+
+// #7081: a published snapshot row records the key root its id was reserved
+// with — copied from the reservation, never from the helper's result — and
+// the root is never rewritten by a later publish of the same row.
+describe('snapshot key root at publish (#7081)', () => {
+  const PREFIX = 'msp/acme';
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(txSelect).mockReturnValue(chainMock([]) as any);
+    findForeignSnapshotClaimMock.mockResolvedValue(null);
+  });
+
+  function arrange(existing: Record<string, unknown> | null = null) {
+    vi.mocked(db.update)
+      .mockReturnValueOnce(chainMock([{ id: 'job-1', orgId: 'org-1', configId: 'config-1', backupType: 'file', createdAt: new Date() }]) as any)
+      .mockReturnValue(chainMock(existing ? [{ ...existing }] : []) as any);
+    vi.mocked(db.select)
+      .mockReturnValueOnce(chainMock(existing ? [existing] : []) as any)
+      .mockReturnValue(chainMock([]) as any);
+    vi.mocked(db.insert).mockReturnValueOnce(
+      chainMock([{ id: 'snapshot-db-1', jobId: 'job-1', snapshotId: 'provider-snap-1' }]) as any,
+    );
+    vi.mocked(applyGfsTagsToSnapshot).mockResolvedValue({ daily: true });
+    vi.mocked(resolveGfsConfigForJob).mockResolvedValue(null);
+    vi.mocked(computeExpiresAt).mockReturnValue(null);
+    resolveBackupProtectionForDeviceMock.mockResolvedValue(null);
+  }
+
+  const publish = (result: Record<string, unknown> = {}) => applyBackupCommandResultToJob({
+    jobId: 'job-1',
+    orgId: 'org-1',
+    deviceId: 'device-1',
+    resultStatus: 'completed',
+    result: { snapshotId: 'provider-snap-1', filesBackedUp: 1, ...result },
+  });
+
+  const written = () => (vi.mocked(db.insert).mock.results[0]?.value?.values as any).mock.calls[0][0];
+
+  it('copies a prefixed reservation root onto the new row, with the physical location', async () => {
+    arrange();
+    loadReservationKeyRootMock.mockResolvedValue({ keyLayout: 'prefixed_flat', keyPrefix: PREFIX });
+    await publish();
+    expect(loadReservationKeyRootMock).toHaveBeenCalledWith('provider-snap-1');
+    expect(written()).toMatchObject({ keyLayout: 'prefixed_flat', keyPrefix: PREFIX, location: `${PREFIX}/snapshots/provider-snap-1` });
+  });
+
+  it('records legacy_flat with no reservation (legacy ids), keeping today\'s location', async () => {
+    arrange();
+    loadReservationKeyRootMock.mockResolvedValue(null);
+    await publish({ snapshot: { id: 'provider-snap-1', metadata: { storagePrefix: 's3://b/legacy/snapshots/provider-snap-1' } } });
+    expect(written()).toMatchObject({ keyLayout: 'legacy_flat', keyPrefix: null });
+  });
+
+  it('ignores a helper-reported keyLayout and metadata.storagePrefix for the root', async () => {
+    arrange();
+    loadReservationKeyRootMock.mockResolvedValue({ keyLayout: 'prefixed_flat', keyPrefix: PREFIX });
+    await publish({
+      keyLayout: 'legacy_flat',
+      keyPrefix: 'evil',
+      metadata: { storagePrefix: 'evil/snapshots/provider-snap-1' },
+      snapshot: { id: 'provider-snap-1', metadata: { storagePrefix: 'evil/snapshots/provider-snap-1' } },
+    });
+    expect(written()).toMatchObject({ keyLayout: 'prefixed_flat', keyPrefix: PREFIX, location: `${PREFIX}/snapshots/provider-snap-1` });
+  });
+
+  it('never writes the root when it updates an existing row', async () => {
+    arrange({ id: 'snapshot-db-1', deviceId: 'device-1', resultProvenance: 'agent_result', keyLayout: 'legacy_flat', keyPrefix: null });
+    loadReservationKeyRootMock.mockResolvedValue({ keyLayout: 'prefixed_flat', keyPrefix: PREFIX });
+    await publish();
+    expect(db.insert).not.toHaveBeenCalled();
+    const sets = vi.mocked(db.update).mock.results
+      .flatMap((r) => ((r.value as any)?.set?.mock?.calls ?? []).map((c: unknown[]) => c[0] as Record<string, unknown>));
+    const snapshotSet = sets.find((v) => 'snapshotId' in v);
+    expect(snapshotSet).toBeDefined();
+    expect(snapshotSet).not.toHaveProperty('keyLayout');
+    expect(snapshotSet).not.toHaveProperty('keyPrefix');
+  });
+});
+
+describe('recoverable index drops are not job warnings (#11026)', () => {
+  const NOTE = 'snapshot file index omitted (17950 entries): the result exceeded the 4934464 byte server result budget, so per-file restore browsing is unavailable for this snapshot';
+  const onSnapshotFileIndex = vi.fn();
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    resolveBackupProtectionForDeviceMock.mockReset();
+    vi.mocked(txSelect).mockReturnValue(chainMock([]) as any);
+    vi.mocked(db.delete).mockReturnValue(chainMock([]) as any);
+    setBackupMetricsRecorder({ onSnapshotFileIndex });
+  });
+  afterEach(() => setBackupMetricsRecorder(null));
+
+  function mockSuccessPath() {
+    vi.mocked(db.update)
+      .mockReturnValueOnce(chainMock([{ id: 'job-1', orgId: 'org-1', configId: 'config-1', backupType: 'file', backupMode: 'file' }]) as any)
+      .mockReturnValueOnce(chainMock([]) as any)
+      .mockReturnValueOnce(chainMock([]) as any);
+    vi.mocked(db.select)
+      .mockReturnValueOnce(chainMock([]) as any)
+      .mockReturnValueOnce(chainMock([{ featureLinkId: 'feature-1', policyId: null, deviceId: 'device-1' }]) as any);
+    vi.mocked(db.insert).mockReturnValueOnce(chainMock([{ id: 'snapshot-db-1', jobId: 'job-1', snapshotId: 'provider-snap-1' }]) as any);
+    vi.mocked(applyGfsTagsToSnapshot).mockResolvedValue({ daily: true });
+    vi.mocked(resolveGfsConfigForJob).mockResolvedValue(null);
+    vi.mocked(computeExpiresAt).mockReturnValue(null);
+  }
+
+  const complete = (warning: string) => applyBackupCommandResultToJob({
+    jobId: 'job-1',
+    orgId: 'org-1',
+    deviceId: 'device-1',
+    resultStatus: 'completed',
+    result: { snapshotId: 'provider-snap-1', filesBackedUp: 17950, warning, snapshot: { id: 'provider-snap-1', files: [] } } as any,
+  });
+  const jobSet = () => vi.mocked(db.update).mock.results[0]?.value?.set.mock.calls[0][0] as { errorLog: unknown };
+  const snapshotValues = () => vi.mocked(db.insert).mock.results[0]?.value?.values.mock.calls[0][0] as { metadata: Record<string, unknown> };
+
+  it('a completed result carrying only the note persists no error log, records the count, and counts once', async () => {
+    mockSuccessPath();
+    await complete(`bounded: ${NOTE}`);
+    expect(jobSet().errorLog).toBeNull();
+    expect(snapshotValues().metadata.fileIndexInlineDroppedEntries).toBe(17950);
+    expect(onSnapshotFileIndex).toHaveBeenCalledTimes(1);
+    expect(onSnapshotFileIndex).toHaveBeenCalledWith('inline_dropped', 'dropped', 1);
+  });
+
+  it('a warning with other text keeps that text', async () => {
+    mockSuccessPath();
+    await complete(`vss warning || bounded: ${NOTE}`);
+    expect(jobSet().errorLog).toBe('vss warning');
+    expect(snapshotValues().metadata.fileIndexInlineDroppedEntries).toBe(17950);
+  });
+
+  it('a result without the note records no count and no metadata key', async () => {
+    mockSuccessPath();
+    await complete('vss warning');
+    expect(jobSet().errorLog).toBe('vss warning');
+    expect(snapshotValues().metadata).not.toHaveProperty('fileIndexInlineDroppedEntries');
+    expect(onSnapshotFileIndex).not.toHaveBeenCalled();
+  });
+
+  it("a failed job's error log also omits the note", async () => {
+    const updateChain = chainMock([{ id: 'job-1', orgId: 'org-1', configId: null, backupType: 'file' }]);
+    vi.mocked(db.update).mockReturnValue(updateChain as any);
+    await applyBackupCommandResultToJob({
+      jobId: 'job-1', orgId: 'org-1', deviceId: 'device-1', resultStatus: 'failed',
+      result: { error: 'disk full', warning: `vss warning || bounded: ${NOTE}` } as any,
+    });
+    const errorLog = (updateChain.set.mock.calls[0][0] as { errorLog: string }).errorLog;
+    expect(errorLog).toBe('disk full; vss warning');
+    expect(errorLog).not.toContain('snapshot file index');
+  });
+
+  it("a failed job whose only warning is the note keeps the error alone", async () => {
+    const updateChain = chainMock([{ id: 'job-1', orgId: 'org-1', configId: null, backupType: 'file' }]);
+    vi.mocked(db.update).mockReturnValue(updateChain as any);
+    await applyBackupCommandResultToJob({
+      jobId: 'job-1', orgId: 'org-1', deviceId: 'device-1', resultStatus: 'failed',
+      result: { error: 'disk full', warning: `bounded: ${NOTE}` } as any,
+    });
+    expect((updateChain.set.mock.calls[0][0] as { errorLog: string }).errorLog).toBe('disk full');
   });
 });

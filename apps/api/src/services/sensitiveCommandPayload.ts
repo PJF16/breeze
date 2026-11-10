@@ -34,6 +34,7 @@ const AAD = 'device_commands.payload';
 
 const SENSITIVE_PAYLOAD_FIELDS: Record<string, readonly string[]> = {
   encryption_rotate_key: ['password', 'currentRecoveryKey'],
+  execute_containment: ['breakGlassSecret'],
   // W05a: the payload carries a server-minted recovery token (a bearer
   // credential for the public /bmr/recover/* routes) — never the 9-char code.
   bare_metal_rebuild: ['token'],
@@ -150,7 +151,8 @@ function openStorageDestination(type: string, envelope: string, ctx: SecretPaylo
  */
 export const TERMINAL_PAYLOAD_STRIP_KEYS: readonly string[] = [
   ...new Set([
-    ...Object.values(SENSITIVE_PAYLOAD_FIELDS).flat(),
+    // Isolation's secret is type-scoped; preserve unrelated process-kill forensics.
+    ...Object.entries(SENSITIVE_PAYLOAD_FIELDS).filter(([type]) => type !== 'execute_containment').flatMap(([, fields]) => fields),
     SCRIPT_SECRET_ENVELOPE_FIELD,
     // Stripped for EVERY type, not just the storage-destination ones: a
     // destination is credential material wherever it appears, and rows queued
@@ -159,6 +161,30 @@ export const TERMINAL_PAYLOAD_STRIP_KEYS: readonly string[] = [
     STORAGE_DESTINATION_ENVELOPE_FIELD,
   ]),
 ].sort();
+
+/**
+ * Keys erased at terminal state for ONE command type only. Endpoint messages
+ * (`notify_user`, #8741) carry technician-authored `title`/`body`; those must
+ * not outlive delivery in this RLS-free, unbounded-retention table, but
+ * `title`/`body` are ordinary forensic fields on other command types, so they
+ * are NOT in the global list above and `notify_user` is deliberately NOT in
+ * SENSITIVE_PAYLOAD_FIELDS (that would also encrypt the fields at enqueue).
+ * `messageId`, `batchId`, `severity`, `expiresAt` survive: the message-events
+ * route uses `messageId` as its proof that a message was sent to the device.
+ */
+export const TYPE_SCOPED_TERMINAL_STRIP_KEYS: Readonly<Record<string, readonly string[]>> = {
+  execute_containment: ['breakGlassSecret'],
+  [CommandTypes.NOTIFY_USER]: ['title', 'body'],
+  // PAM outcome notice (#8928): `reason` is the technician's deny reason as
+  // shown to the end user. `requestId` / `outcome` survive for forensics.
+  [CommandTypes.PAM_REQUEST_NOTIFY]: ['reason'],
+  // Endpoint live chat (#8743): `message` holds the chat body and the sender
+  // name. The top-level `conversationId` / `chatMessageId` survive: the chat
+  // result handlers and forensics key on them. Bodies live (with retention)
+  // in endpoint_conversation_messages, never here.
+  [CommandTypes.CHAT_OPEN]: ['message'],
+  [CommandTypes.CHAT_MESSAGE]: ['message'],
+};
 
 /**
  * The `.set({...})` fragment every terminal `device_commands` update must
@@ -180,12 +206,19 @@ export function terminalPayloadErasureSet(): { payload: SQL } {
   // never sql.raw string interpolation, even for module-owned identifiers.
   // The explicit ::text cast is required: `jsonb - anyelement` is ambiguous
   // between the text and integer overloads for an untyped placeholder.
-  const stripped = TERMINAL_PAYLOAD_STRIP_KEYS.reduce<SQL>(
-    (expr, key) => sql`${expr} - ${key}::text`,
-    sql`${deviceCommands.payload}`,
+  const subtract = (base: SQL, keys: readonly string[]): SQL =>
+    keys.reduce<SQL>((expr, key) => sql`${expr} - ${key}::text`, base);
+  const stripped = subtract(sql`${deviceCommands.payload}`, TERMINAL_PAYLOAD_STRIP_KEYS);
+  // Type-scoped branches: only rows of that command type lose the extra keys.
+  // Built with nested template fragments (not sql.join) so every caller's
+  // `sql`-template-only drizzle mock keeps working.
+  const caseExpr = Object.entries(TYPE_SCOPED_TERMINAL_STRIP_KEYS).reduce<SQL>(
+    (expr, [type, keys]) =>
+      sql`${expr} WHEN ${deviceCommands.type} = ${type} THEN ${subtract(stripped, keys)}`,
+    sql`CASE WHEN ${deviceCommands.payload} IS NULL THEN NULL`,
   );
   return {
-    payload: sql`CASE WHEN ${deviceCommands.payload} IS NULL THEN NULL ELSE ${stripped} END`,
+    payload: sql`${caseExpr} ELSE ${stripped} END`,
   };
 }
 

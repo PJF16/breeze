@@ -19,7 +19,6 @@ import {
   getViewerAccessTokenExpirySeconds,
 } from '../services/remoteSessionAuth';
 import {
-  getIceServers,
   logSessionAudit,
   buildRemoteSessionPromptPayload,
   createDesktopStartCommandId,
@@ -41,8 +40,15 @@ import {
   startIntentDenialCode,
   startIntentDenialMessage,
 } from '../services/remoteDesktopStartIntent';
+import { releaseDesktopStartInFlight } from '../services/desktopStartInFlight';
 import { webrtcOfferSchema } from './remote/schemas';
-import { sendCommandToAgent, isAgentConnected } from './agentWs';
+import { resolveDesktopIcePlan } from './remote/desktopRelayPolicy';
+import { sendCommandToAgent, sendDesktopIceCandidateToAgent, isAgentConnected } from './agentWs';
+import {
+  agentIceCandidatesForViewer,
+  submitViewerIceCandidate,
+  viewerIceCandidateBodySchema,
+} from '../services/remoteDesktopIceTrickle';
 import { checkRemoteAccess, resolveDesktopSessionPolicy } from '../services/remoteAccessPolicy';
 import {
   AGENT_UPGRADE_REQUIRED_CODE,
@@ -54,6 +60,7 @@ import { getRedis } from '../services/redis';
 import { rateLimiter } from '../services/rate-limit';
 import { getTrustedClientIp } from '../services/clientIp';
 import { isViewerJtiRevoked, isViewerSessionRevoked, revokeViewerSession } from '../services/viewerTokenRevocation';
+import { enforceExpiredDesktopReconnectHold, markDesktopViewerReconnectIntent } from '../services/desktopReconnectGrace';
 import { createAuditLogAsync } from '../services/auditService';
 import {
   bindRemoteConnection,
@@ -355,6 +362,24 @@ async function validateViewerSessionAccess(
   }
   if (live.user.email !== payload.email) {
     return { valid: false, status: 403, error: 'Viewer token does not match session owner' };
+  }
+  if (accessMode === 'live') {
+    // #10542: a peer drop during a viewer reconnect holds the session's end
+    // for a short grace. Once that deadline has passed, end the session here
+    // before this token is served again, on whichever instance gets the
+    // request, so a hold whose timer was lost cannot leave the token live.
+    const session = live.session as typeof remoteSessions.$inferSelect;
+    const hold = await enforceExpiredDesktopReconnectHold({
+      id: session.id,
+      deviceId: session.deviceId,
+      desktopStartGeneration: BigInt(session.desktopStartGeneration ?? 0),
+    });
+    if (hold === 'ended') {
+      return { valid: false, status: 401, error: 'Session closed' };
+    }
+    if (hold === 'unavailable') {
+      return { valid: false, status: 503, error: 'Unable to verify current remote access' };
+    }
   }
   return {
     valid: true,
@@ -1842,12 +1867,28 @@ export function createDesktopWsRoutes(
         }, 400);
       }
 
-      return c.json({
-        iceServers: getIceServers({
+      // #10542: on a live session this fetch is the start of a reconnect (the
+      // first connect fetches while the row is still pending or connecting).
+      // The viewer sends it before it closes its old peer (older viewers send
+      // it just after), so the agent's peer-drop report for that peer follows
+      // the mark, and the mark lets that drop wait for this viewer's new offer
+      // instead of ending the session under it. Written before the ICE plan is
+      // resolved, so it lands as early as possible.
+      if (access.session.status === 'active') {
+        await markDesktopViewerReconnectIntent(sessionId, BigInt(access.session.desktopStartGeneration ?? 0));
+      }
+
+      const icePlan = await withSystemDbAccessContext(() =>
+        resolveDesktopIcePlan(access.device.id, {
           sessionId,
           userId: access.session.userId,
           deviceId: access.session.deviceId,
         })
+      );
+      if (!icePlan.ok) return c.json({ error: icePlan.error, code: icePlan.code }, 409);
+      return c.json({
+        iceServers: icePlan.iceServers,
+        ...(icePlan.relayOnly ? { relayOnly: true } : {}),
       });
     }
   );
@@ -1966,6 +2007,16 @@ export function createDesktopWsRoutes(
           code: CONSENT_UPGRADE_REQUIRED_CODE,
         }, 409);
       }
+      // Refuse isolation policy conflicts before minting a lease or publishing a start intent.
+      const icePlan = await withSystemDbAccessContext(() =>
+        resolveDesktopIcePlan(access.device.id, {
+          sessionId,
+          userId: access.session.userId,
+          deviceId: access.session.deviceId,
+        })
+      );
+      if (!icePlan.ok) return c.json({ error: icePlan.error, code: icePlan.code }, 409);
+
       // Fail-closed revocation lease (same gate as the JWT offer route).
       const offerLease = await prepareRevocationLeaseForStart(sessionId);
       if (!offerLease.ok) {
@@ -2008,69 +2059,122 @@ export function createDesktopWsRoutes(
             code: 'SESSION_TERMINAL',
           }, 409);
         }
+        if (startIntent.reason === 'start_in_flight') {
+          // #8947: a concurrent second offer for a start still waiting on its
+          // answer. Refused rather than superseding it: superseding orphaned
+          // the first peer and started a second capture on the agent.
+          return c.json({
+            error: startIntentDenialMessage(startIntent.reason),
+            code: startIntentDenialCode(startIntent.reason),
+          }, 409);
+        }
         return c.json({ error: 'Session state changed while submitting offer' }, 409);
       }
 
-      const startGeneration = startIntent.generation;
+      // Every exit below that does not hand the start to the agent — a refusal,
+      // an unreachable agent, or a throw — drops this start's in-flight marker,
+      // so the viewer's retry is not refused as a duplicate of a start the
+      // agent never received (#8947).
+      let dispatched = false;
+      try {
+        const startGeneration = startIntent.generation;
 
-      await logSessionAudit(
-        'session_offer_submitted',
-        access.user.id,
-        access.device.orgId,
-        {
-          sessionId,
-          type: access.session.type,
-          via: 'viewer_token',
-          startCommandId,
-          promptMode,
-          startGeneration: formatDesktopGeneration(startGeneration),
-        },
-        getTrustedClientIp(c, 'unknown')
-      );
+        await logSessionAudit(
+          'session_offer_submitted',
+          access.user.id,
+          access.device.orgId,
+          {
+            sessionId,
+            type: access.session.type,
+            via: 'viewer_token',
+            startCommandId,
+            promptMode,
+            startGeneration: formatDesktopGeneration(startGeneration),
+          },
+          getTrustedClientIp(c, 'unknown')
+        );
 
-      // Pre-publication re-read — see the twin check on the JWT offer route.
-      const stillCurrent = await withSystemDbAccessContext(() =>
-        assertDesktopStartIntentCurrent(sessionId, startGeneration)
-      );
-      if (!stillCurrent.ok) {
+        // Pre-publication re-read — see the twin check on the JWT offer route.
+        const stillCurrent = await withSystemDbAccessContext(() =>
+          assertDesktopStartIntentCurrent(sessionId, startGeneration)
+        );
+        if (!stillCurrent.ok) {
+          return c.json({
+            error: 'This session was ended while the stream was starting',
+            code: startIntentDenialCode(stillCurrent.reason),
+          }, 409);
+        }
+
+        const agentReachable = sendCommandToAgent(access.device.agentId, {
+          id: startCommandId,
+          type: 'start_desktop',
+          payload: {
+            sessionId,
+            startGeneration: formatDesktopGeneration(startGeneration),
+            offer: data.offer,
+            iceServers: icePlan.iceServers,
+            ...(icePlan.relayOnly ? { relayOnly: true } : {}),
+            clipboard: desktopPolicy.clipboard,
+            idleTimeoutMinutes: desktopPolicy.idleTimeoutMinutes,
+            maxSessionDurationHours: desktopPolicy.maxSessionDurationHours,
+            revocationLease: offerLease.lease,
+            ...(data.displayIndex != null ? { displayIndex: data.displayIndex } : {}),
+            ...(data.targetSessionId != null ? { targetSessionId: data.targetSessionId } : {}),
+            ...(prompt ? { prompt } : {})
+          }
+        });
+
+        if (!agentReachable) {
+          console.warn(`[desktop-ws] Agent ${access.device.agentId} not connected, cannot send start_desktop for session ${sessionId}`);
+          return c.json({ error: 'Agent is not currently connected. Please verify the device is online and try again.' }, 502);
+        }
+        dispatched = true;
+
         return c.json({
-          error: 'This session was ended while the stream was starting',
-          code: startIntentDenialCode(stillCurrent.reason),
+          id: sessionId,
+          status: 'connecting',
+          webrtcOffer: data.offer,
+        });
+      } finally {
+        if (!dispatched) await releaseDesktopStartInFlight(sessionId, startCommandId);
+      }
+    }
+  );
+
+  // POST /desktop-ws/:id/viewer/ice — trickle ICE (#9182).
+  //
+  // The viewer gathers for a few seconds before it sends its offer; a
+  // candidate it gathers after that (typically a TURN relay) arrives here,
+  // after the agent's answer, and is relayed to the agent. Same authorization
+  // as the offer; the write is guarded to the session's current start and the
+  // relay only follows a successful write.
+  app.post(
+    '/:id/viewer/ice',
+    zValidator('param', desktopSessionIdParamSchema),
+    zValidator('json', viewerIceCandidateBodySchema),
+    async (c) => {
+      const { id: sessionId } = c.req.valid('param');
+      const { candidate } = c.req.valid('json');
+      const access = await validateViewerSessionAccess(c.req.header('Authorization'), sessionId);
+      if (!access.valid) {
+        return c.json({ error: access.error }, access.status);
+      }
+
+      const result = await withSystemDbAccessContext(() =>
+        submitViewerIceCandidate({
+          session: access.session,
+          agentId: access.device.agentId ?? null,
+          candidate,
+          send: sendDesktopIceCandidateToAgent,
+        })
+      );
+      if (!result.ok) {
+        return c.json({
+          error: 'Cannot add ICE candidate for session in current state',
+          status: access.session.status,
         }, 409);
       }
-
-      const agentReachable = sendCommandToAgent(access.device.agentId, {
-        id: startCommandId,
-        type: 'start_desktop',
-        payload: {
-          sessionId,
-          startGeneration: formatDesktopGeneration(startGeneration),
-          offer: data.offer,
-          iceServers: getIceServers({
-            sessionId,
-            userId: access.session.userId,
-            deviceId: access.session.deviceId,
-          }),
-          clipboard: desktopPolicy.clipboard,
-          idleTimeoutMinutes: desktopPolicy.idleTimeoutMinutes,
-          maxSessionDurationHours: desktopPolicy.maxSessionDurationHours,
-          revocationLease: offerLease.lease,
-          ...(data.displayIndex != null ? { displayIndex: data.displayIndex } : {}),
-          ...(data.targetSessionId != null ? { targetSessionId: data.targetSessionId } : {}),
-          ...(prompt ? { prompt } : {})
-        }
-      });
-
-      if (!agentReachable) {
-        console.warn(`[desktop-ws] Agent ${access.device.agentId} not connected, cannot send start_desktop for session ${sessionId}`);
-        return c.json({ error: 'Agent is not currently connected. Please verify the device is online and try again.' }, 502);
-      }
-
-      return c.json({
-        id: sessionId,
-        status: 'connecting',
-        webrtcOffer: data.offer,
-      });
+      return c.json({ accepted: true, forwarded: result.forwarded });
     }
   );
 
@@ -2146,6 +2250,11 @@ export function createDesktopWsRoutes(
         status: access.session.status,
         terminationPhase,
         webrtcAnswer: answerWithheld ? null : access.session.webrtcAnswer,
+        // #9182: the agent's candidates gathered after its answer, for the
+        // current start only, ordered by seq. Withheld exactly like the answer.
+        agentIceCandidates: answerWithheld
+          ? []
+          : agentIceCandidatesForViewer(access.session.iceCandidates, access.session.desktopStartGeneration),
         errorMessage: access.session.errorMessage,
         // #6818: in consent mode the agent answers only after the end user
         // does, so the viewer extends its answer poll to this budget.

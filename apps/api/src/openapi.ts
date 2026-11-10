@@ -349,10 +349,10 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
           email: { type: 'string', format: 'email' },
           name: { type: 'string', minLength: 1, maxLength: 255 },
           roleId: { type: 'string', format: 'uuid' },
-          orgAccess: { type: 'string', enum: ['all', 'selected', 'none'] },
-          orgIds: { type: 'array', items: { type: 'string', format: 'uuid' } },
-          siteIds: { type: 'array', items: { type: 'string', format: 'uuid' } },
-          deviceGroupIds: { type: 'array', items: { type: 'string', format: 'uuid' } }
+          orgAccess: { type: 'string', enum: ['all', 'selected', 'none'], description: 'Partner scope only; 400 in organization scope.' },
+          orgIds: { type: 'array', items: { type: 'string', format: 'uuid' }, description: 'Partner scope only, with orgAccess=selected; 400 in organization scope.' },
+          siteIds: { type: 'array', items: { type: 'string', format: 'uuid' }, description: 'Organization scope only; 400 in partner scope.' },
+          deviceGroupIds: { type: 'array', items: { type: 'string', format: 'uuid' }, description: 'Not supported yet: any value is rejected with 400.' }
         },
         required: ['email', 'name', 'roleId']
       },
@@ -375,7 +375,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
           name: { type: 'string' },
           slug: { type: 'string' },
           type: { type: 'string', enum: ['msp', 'enterprise', 'internal'] },
-          plan: { type: 'string', enum: ['free', 'pro', 'enterprise', 'unlimited'] },
+          plan: { type: 'string', enum: ['free', 'starter', 'community', 'pro', 'enterprise', 'unlimited'] },
           maxOrganizations: { type: 'integer', nullable: true },
           maxDevices: { type: 'integer', nullable: true },
           billingEmail: { type: 'string', format: 'email', nullable: true },
@@ -444,6 +444,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
           ramTotalMb: { type: 'integer', nullable: true },
           diskTotalGb: { type: 'integer', nullable: true },
           serialNumber: { type: 'string', nullable: true },
+          productSku: { type: 'string', nullable: true, description: 'System SKU from SMBIOS (the HP product number); null until reported' },
           manufacturer: { type: 'string', nullable: true },
           model: { type: 'string', nullable: true },
           motherboardManufacturer: { type: 'string', nullable: true },
@@ -651,6 +652,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
           triggeredAt: { type: 'string', format: 'date-time' },
           acknowledgedAt: { type: 'string', format: 'date-time', nullable: true },
           acknowledgedBy: { type: 'string', format: 'uuid', nullable: true },
+          acknowledgedByPrincipalId: { type: 'string', format: 'uuid', nullable: true, description: 'Partner API service principal that acknowledged the alert, or null.' },
           acknowledgedByName: {
             type: 'string',
             nullable: true,
@@ -658,6 +660,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
           },
           resolvedAt: { type: 'string', format: 'date-time', nullable: true },
           resolvedBy: { type: 'string', format: 'uuid', nullable: true },
+          resolvedByPrincipalId: { type: 'string', format: 'uuid', nullable: true, description: 'Partner API service principal that resolved the alert, or null.' },
           resolvedByName: {
             type: 'string',
             nullable: true,
@@ -1336,8 +1339,59 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
           '400': { $ref: '#/components/responses/BadRequest' },
           '401': { $ref: '#/components/responses/Unauthorized' },
           '403': { description: 'Organization or partner policy still requires MFA for this user.' },
-          '409': { description: 'Another authentication issuance is in flight, or MFA was disabled concurrently. No factor was removed.' },
+          '409': { description: 'Another authentication issuance is in flight, or MFA was disabled concurrently. No factor was removed. Also returned with `code: "factor_removal_required"` while the account has active passkeys: remove the passkeys first, or remove the authenticator app on its own with POST /auth/mfa/totp/remove.' },
           '428': { description: 'The client auth binding must be rotated before a session can be issued. Retry after re-bootstrapping the binding.' }
+        }
+      }
+    },
+    '/auth/mfa/totp/remove': {
+      post: {
+        operationId: 'removeTotpFactor',
+        tags: ['Auth'],
+        summary: 'Remove the authenticator app',
+        description: 'Remove the caller\'s authenticator app without switching MFA off, leaving the passkeys as the MFA method. Requires an MFA-assured session, a re-verified password (or `ssoReauthGrantId` for a passwordless account) and a single-use existing-factor step-up grant minted by POST /auth/mfa/step-up for operation `remove_totp` (SMS cannot mint it). When the authenticator app is the only factor, use POST /auth/mfa/disable instead.',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  currentPassword: { type: 'string', description: 'The account password. Omit for a passwordless account and send ssoReauthGrantId instead.' },
+                  ssoReauthGrantId: { type: 'string', format: 'uuid', description: 'Single-use SSO re-authentication grant for an account without a password.' },
+                  stepUpGrantId: { type: 'string', description: 'Step-up grant id from POST /auth/mfa/step-up (operation remove_totp).' }
+                }
+              }
+            }
+          }
+        },
+        responses: {
+          '200': {
+            description: 'Authenticator app removed; the account now uses its passkeys',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean' },
+                    mfaMethod: { type: 'string', enum: ['passkey'] },
+                    tokens: {
+                      type: 'object',
+                      description: 'Replacement session for the caller when one was issued. Install it before the next request.',
+                      properties: {
+                        accessToken: { type: 'string' },
+                        expiresInSeconds: { type: 'integer' }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          '400': { description: 'Invalid request. `code: "totp_not_enrolled"` when there is no authenticator app to remove, or `code: "use_mfa_disable"` when it is the only factor.' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { description: 'The session is not MFA-assured, `code: "last_mfa_factor_required"`, or `error: "existing_factor_step_up_required"` when the step-up grant is missing or invalid.' },
+          '409': { description: 'Factor state changed concurrently (`code: "factor_state_changed"`). The step-up grant was spent (`stepUpGrantConsumed: true`); mint a new one and retry.' }
         }
       }
     },
@@ -1528,7 +1582,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
         operationId: 'enableMfa',
         tags: ['Auth'],
         summary: 'Enable MFA (confirm setup)',
-        description: 'Confirm TOTP MFA setup by providing the 6-digit code from the authenticator app. Requires a prior call to /auth/mfa/setup.',
+        description: 'Confirm TOTP MFA setup by providing the 6-digit code from the authenticator app. Requires a prior call to /auth/mfa/setup. When the account has a primary passkey and no authenticator app yet, this adds the authenticator app as a backup instead: the response carries `backup: true` and no recovery codes.',
         requestBody: {
           required: true,
           content: {
@@ -1552,15 +1606,25 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
                   type: 'object',
                   properties: {
                     success: { type: 'boolean' },
-                    recoveryCodes: { type: 'array', items: { type: 'string' } },
-                    message: { type: 'string' }
+                    recoveryCodes: { type: 'array', items: { type: 'string' }, description: 'Present on initial enrollment only; absent when the authenticator app was added as a backup beside a passkey.' },
+                    backup: { type: 'boolean', description: 'True when the authenticator app was added as a backup beside a primary passkey.' },
+                    message: { type: 'string' },
+                    tokens: {
+                      type: 'object',
+                      description: 'Replacement session for the caller when one was issued.',
+                      properties: {
+                        accessToken: { type: 'string' },
+                        expiresInSeconds: { type: 'integer' }
+                      }
+                    }
                   }
                 }
               }
             }
           },
           '400': { $ref: '#/components/responses/BadRequest' },
-          '401': { $ref: '#/components/responses/Unauthorized' }
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '409': { description: 'Factor state changed concurrently (`code: "factor_state_changed"`); the write lost a race. `stepUpGrantConsumed` says whether the step-up grant was spent.' }
         }
       }
     },
@@ -2133,7 +2197,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
                   name: { type: 'string', minLength: 1 },
                   slug: { type: 'string', minLength: 1, maxLength: 100 },
                   type: { type: 'string', enum: ['msp', 'enterprise', 'internal'] },
-                  plan: { type: 'string', enum: ['free', 'pro', 'enterprise', 'unlimited'] },
+                  plan: { type: 'string', enum: ['free', 'starter', 'community', 'pro', 'enterprise', 'unlimited'] },
                   maxOrganizations: { type: 'integer', nullable: true },
                   maxDevices: { type: 'integer', nullable: true },
                   billingEmail: { type: 'string', format: 'email' }
@@ -2586,6 +2650,217 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
         }
       }
     },
+    '/devices/{id}/force-reboot': {
+      post: {
+        operationId: 'forceRebootDevice',
+        tags: ['Devices'],
+        summary: 'Force reboot a device now (closes running apps)',
+        description: 'Queue a `force_reboot` command: an immediate reboot that force-closes running applications, discarding unsaved work. On Windows the agent runs `shutdown /r /f /t 0`; on macOS and Linux it runs `shutdown -r +0`, where force changes nothing. Plain reboot is unchanged and stays on POST /devices/{id}/commands. This route is the only way to queue `force_reboot`. Requires devices:execute, an interactive user session (API keys, MCP grants and AI agents are refused), an MFA-assured session, and, while two-factor authentication is enabled on the deployment, a single-use step-up grant minted by POST /auth/mfa/step-up for operation `device_force_reboot` bound to { deviceId }. The device must be online now and run an agent that knows `force_reboot`. The command still waits behind in-flight work like any reboot, and expires if it is not claimed within the live-only window (15 minutes by default).',
+        parameters: [{ $ref: '#/components/parameters/idParam' }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  stepUpGrant: { type: 'string', format: 'uuid', description: 'Step-up grant id from POST /auth/mfa/step-up (operation device_force_reboot, resource { deviceId }). Required when two-factor authentication is enabled.' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '201': {
+            description: 'Force reboot queued',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'string', format: 'uuid' },
+                    deviceId: { type: 'string', format: 'uuid' },
+                    type: { type: 'string', enum: ['force_reboot'] },
+                    status: { type: 'string' },
+                    createdAt: { type: 'string', format: 'date-time' },
+                    delivery: { type: 'string', description: 'How the command was handed over (e.g. delivered, queued_live)' },
+                    deliverBy: { type: 'string', format: 'date-time', nullable: true, description: 'The command expires if not claimed by this time' },
+                    argv: { type: 'array', items: { type: 'string' }, description: 'The exact command the agent runs on this OS' },
+                  },
+                },
+              },
+            },
+          },
+          '400': { description: 'Invalid body, decommissioned device, or unsupported OS' },
+          '403': { description: '`Interactive user session required` for machine principals; `MFA_REQUIRED` for a non-assured session; `STEP_UP_REQUIRED` when the step-up grant is missing, stale, bound to another device or already consumed; site access denied; or a partner trust denial' },
+          '404': { description: 'Device not found' },
+          '409': { description: '`DEVICE_OFFLINE` (the device is not online now; a force reboot is never queued for later), `AGENT_UPGRADE_REQUIRED` (the agent predates force_reboot; the body carries agentVersion and minAgentVersion), or the device is pending assignment' },
+          '503': { description: 'Step-up binding could not be established (auth state or session id unavailable); retry' },
+        },
+      },
+    },
+    '/devices/{id}/oem-updates/run': {
+      post: {
+        operationId: 'runDeviceVendorUpdates',
+        tags: ['Devices'],
+        summary: 'Run vendor updates on a device now',
+        description: "Runs the device maker's own update tool (Dell Command Update today), which can install drivers and applications and flash BIOS and firmware. Requires devices:execute, an interactive user session (API keys, MCP grants and AI agents are refused) and an MFA-assured session. Every category whose gate is open is requested. `reboot` has no default: `when_finished` queues a `schedule_reboot` with the device's patch policy delay and prompt text if the run reports it needs one; `leave_to_me` queues no reboot and skips BIOS and firmware, which need a reboot Breeze controls. Closed by default: the deployment flag and the per-vendor gates must be open.",
+        parameters: [{ $ref: '#/components/parameters/idParam' }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['reboot'],
+                properties: {
+                  reboot: { type: 'string', enum: ['when_finished', 'leave_to_me'] },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '202': {
+            description: 'Run queued',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    commandId: { type: 'string', format: 'uuid' },
+                    categories: { type: 'array', items: { type: 'string', enum: ['bios', 'firmware', 'driver', 'application'] }, description: 'What the run will do' },
+                    skippedCategories: { type: 'array', items: { type: 'string', enum: ['bios', 'firmware', 'driver', 'application'] }, description: 'Open categories dropped because the reboot was left to the technician' },
+                  },
+                },
+              },
+            },
+          },
+          '400': { description: 'Invalid body' },
+          '403': { description: '`Interactive user session required` for machine principals; `MFA_REQUIRED` for a non-assured session; missing devices:execute; site access denied; or a partner trust denial (`trust_denied`)' },
+          '404': { description: 'Device not found, or no longer in the organization the request was made under' },
+          '409': { description: 'Refused, nothing runs. `code` is one of `flag_off`, `lane_closed`, `kill_switch`, `agent_too_old` (the body carries minAgentVersion), `not_applicable`, `not_supported`, `ephemeral`, `parked`, `offline`, `run_in_flight`, `no_open_categories`, `decommissioned` or `cancelled_at_claim`' },
+        },
+      },
+    },
+    '/devices/{id}/oem-updates/status': {
+      get: {
+        operationId: 'getDeviceVendorUpdateStatus',
+        tags: ['Devices'],
+        summary: 'Vendor update state of a device',
+        description: 'The display state, the lane a run would use (null when none could reach this device, including when the feature is off), the last run, and whether each category is open. Requires devices:read.',
+        parameters: [{ $ref: '#/components/parameters/idParam' }],
+        responses: {
+          '200': {
+            description: 'Vendor update state',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    displayState: { type: 'string', enum: ['up_to_date', 'overdue', 'failing', 'not_supported', 'not_managed', 'waiting_for_reboot', 'reboot_overdue'] },
+                    lane: { type: 'string', enum: ['dell', 'surface', 'hp', 'lenovo'], nullable: true },
+                    status: { type: 'object', nullable: true, additionalProperties: true, description: 'The last run; null when none has been recorded' },
+                    gates: { type: 'object', additionalProperties: { type: 'string', enum: ['open', 'closed'] } },
+                  },
+                },
+              },
+            },
+          },
+          '403': { description: 'Missing devices:read or site access denied' },
+          '404': { description: 'Device not found' },
+        },
+      },
+    },
+    '/oem-updates/fleet': {
+      get: {
+        operationId: 'getVendorUpdatesFleet',
+        tags: ['Devices'],
+        summary: 'Vendor update state across a fleet',
+        description: 'Counts per display state, and one page of devices, for every device the caller can reach, site restrictions included. Quick Support, parked and decommissioned devices are left out. Counts follow orgId and lane but not state; total is the filtered list before paging. A system-scope caller must pass orgId. Requires devices:read.',
+        parameters: [
+          { name: 'state', in: 'query', schema: { type: 'string', enum: ['up_to_date', 'overdue', 'failing', 'not_supported', 'not_managed', 'waiting_for_reboot', 'reboot_overdue'] } },
+          { name: 'orgId', in: 'query', schema: { type: 'string', format: 'uuid' } },
+          { name: 'lane', in: 'query', schema: { type: 'string', enum: ['dell', 'surface', 'hp', 'lenovo'] } },
+          { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 200, default: 50 } },
+          { name: 'offset', in: 'query', schema: { type: 'integer', minimum: 0, default: 0 } },
+        ],
+        responses: {
+          '200': {
+            description: 'Counts and one page of devices',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    counts: { type: 'object', additionalProperties: { type: 'integer' }, description: 'Devices per display state' },
+                    total: { type: 'integer' },
+                    devices: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          deviceId: { type: 'string', format: 'uuid' },
+                          hostname: { type: 'string' },
+                          orgId: { type: 'string', format: 'uuid' },
+                          orgName: { type: 'string' },
+                          siteId: { type: 'string', format: 'uuid' },
+                          siteName: { type: 'string', nullable: true },
+                          deviceStatus: { type: 'string' },
+                          lane: { type: 'string', enum: ['dell', 'surface', 'hp', 'lenovo'], nullable: true },
+                          displayState: { type: 'string', enum: ['up_to_date', 'overdue', 'failing', 'not_supported', 'not_managed', 'waiting_for_reboot', 'reboot_overdue'] },
+                          lastOutcome: { type: 'string', nullable: true },
+                          lastAttemptAt: { type: 'string', format: 'date-time', nullable: true },
+                          lastSuccessAt: { type: 'string', format: 'date-time', nullable: true },
+                          rebootPendingSince: { type: 'string', format: 'date-time', nullable: true },
+                          scheduleNotHandedBack: { type: 'boolean', description: "True when Breeze gave up returning the vendor tool's own schedule to it" },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          '400': { description: 'Invalid filter, or a system-scope caller without orgId' },
+          '403': { description: 'Missing devices:read, or the organization is out of reach' },
+        },
+      },
+    },
+    '/devices/{id}/oem-updates/history': {
+      get: {
+        operationId: 'listDeviceVendorUpdateRuns',
+        tags: ['Devices'],
+        summary: 'Vendor update runs on a device',
+        description: "Newest first. Only runs queued during the device's time in its current organization. A run whose result cannot be read shows `outcome: null`. Requires devices:read.",
+        parameters: [
+          { $ref: '#/components/parameters/idParam' },
+          { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 100, default: 10 } },
+          { name: 'offset', in: 'query', schema: { type: 'integer', minimum: 0, default: 0 } },
+        ],
+        responses: {
+          '200': {
+            description: 'Runs and the total across all pages',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    runs: { type: 'array', items: { type: 'object', additionalProperties: true } },
+                    total: { type: 'integer' },
+                  },
+                },
+              },
+            },
+          },
+          '400': { description: 'Invalid limit or offset' },
+          '403': { description: 'Missing devices:read or site access denied' },
+          '404': { description: 'Device not found' },
+        },
+      },
+    },
     '/devices/{id}/move-org': {
       post: {
         operationId: 'moveDeviceOrg',
@@ -2628,7 +2903,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
           '400': { description: 'Invalid input (e.g. target site not in target org, target org equals source)' },
           '403': { description: 'Access denied: target org or cross-partner move without system scope; `Interactive user session required` for machine principals; `MFA_REQUIRED` for a non-assured session; `STEP_UP_REQUIRED` when the step-up grant is missing, stale, mismatched or already consumed' },
           '404': { description: 'Device or target organization not found' },
-          '409': { description: 'Move blocked: `TICKET_MOVE_CURRENCY_BLOCKED` (unbilled ticket money in another currency; resend with acceptCurrencyMismatch), `DELIVERABLE_TICKET_PINNED`, `HOUR_BLOCK_DRAWN_TIME` (a ticket carries time drawn from a block of prepaid hours), or `PAM_DEVICE_MOVE_BLOCKED`' },
+          '409': { description: 'Move blocked: `TICKET_MOVE_CURRENCY_BLOCKED` (unbilled ticket money in another currency; resend with acceptCurrencyMismatch), `DELIVERABLE_TICKET_PINNED`, `HOUR_BLOCK_DRAWN_TIME` (a ticket carries time drawn from a block of prepaid hours), `APPROVAL_REQUEST_PENDING` (a ticket has a pending customer approval request), `PAM_DEVICE_MOVE_ACTIVE` (PAM ownership transfer is enabled and an elevation session on the device has not finished cleanup; retry once it closes), or `PAM_DEVICE_MOVE_BLOCKED` (the device has PAM history and transfer is not enabled)' },
           '503': { description: 'Step-up binding could not be established (auth state or session id unavailable); retry' },
         },
       },
@@ -3624,6 +3899,38 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
         }
       }
     },
+    '/alerts/{id}/external-tickets': {
+      get: {
+        operationId: 'listAlertExternalTickets',
+        tags: ['Alerts'],
+        summary: 'List external ticket references and PSA mappings for an alert',
+        description: 'Requires alerts.read and access to the alert organization and site. Partner-level viewers see every integration principal reference and PSA mappings from connections owned by their partner or the alert organization. Org-scoped users see only mappings from PSA connections owned by the alert organization with no partner owner; partner-principal references and partner-owned PSA mappings are excluded.',
+        parameters: [{ $ref: '#/components/parameters/idParam' }],
+        responses: {
+          '200': {
+            description: 'External tickets in deterministic source and creation order',
+            content: { 'application/json': { schema: {
+              type: 'object', required: ['data'], additionalProperties: false,
+              properties: { data: { type: 'array', items: {
+                type: 'object', additionalProperties: false,
+                required: ['source', 'partnerServicePrincipalId', 'externalId', 'externalUrl', 'externalNumber', 'state', 'createdAt', 'updatedAt'],
+                properties: {
+                  source: { type: 'string', enum: ['partner_api', 'psa'] },
+                  partnerServicePrincipalId: { type: 'string', format: 'uuid', nullable: true },
+                  externalId: { type: 'string' },
+                  externalUrl: { type: 'string', nullable: true },
+                  externalNumber: { type: 'string', nullable: true },
+                  state: { type: 'string', nullable: true },
+                  createdAt: { type: 'string', format: 'date-time' },
+                  updatedAt: { type: 'string', format: 'date-time', nullable: true },
+                },
+              } } },
+            } } },
+          },
+          '404': { description: 'Alert not found or outside the caller’s reach' },
+        },
+      },
+    },
     '/alerts/{id}/acknowledge': {
       post: {
         operationId: 'acknowledgeAlert',
@@ -3719,6 +4026,25 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
         responses: {
           '200': {
             description: 'Alert suppressed',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/Alert' }
+              }
+            }
+          }
+        }
+      }
+    },
+    '/alerts/{id}/unsuppress': {
+      post: {
+        operationId: 'unsuppressAlert',
+        tags: ['Alerts'],
+        summary: 'Lift an alert mute',
+        description: 'Restores a suppressed alert to acknowledged (if it was acknowledged before the mute) or active, and clears the mute deadline. Returns 409 if the alert is not suppressed.',
+        parameters: [{ $ref: '#/components/parameters/idParam' }],
+        responses: {
+          '200': {
+            description: 'Alert restored',
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/Alert' }
@@ -4726,6 +5052,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
         operationId: 'addIceCandidate',
         tags: ['Remote'],
         summary: 'Add ICE candidate',
+        description: 'Trickles a viewer ICE candidate gathered after the offer: stored against the session\'s current start and relayed to the agent hosting it.',
         parameters: [{ $ref: '#/components/parameters/idParam' }],
         responses: {
           '200': {

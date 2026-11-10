@@ -34,7 +34,13 @@ export type PolicyInstallSkipReason =
    * rather than dropped: the audit row is the only durable place a technician
    * can see that a requested install was not attempted, and why.
    */
-  | 'not_currently_missing';
+  | 'not_currently_missing'
+  /**
+   * #6960, generated (security agents) policies only: the installer-readiness
+   * preflight says the vendor cannot serve this device (org not mapped, keys
+   * missing, platform unsupported, ...). No deployment is created.
+   */
+  | 'installer_not_ready';
 
 export type PolicyInstallTarget =
   | { kind: 'install_method'; catalogId: string; installMethodId: string }
@@ -255,10 +261,9 @@ export async function hasUnfinishedPolicyOwnedInstall(
  * no ambient context. It never rejects. A command that is never pushed stays
  * queued for the heartbeat claim.
  *
- * Nothing here touches the EDR secret-resolution branch
- * (softwareDeployment.ts:554-584): that fires only when the resolved catalog
- * item's integrationProvider is 'huntress' or 'sentinelone', and this path adds
- * no special handling for it either way.
+ * Nothing here touches the EDR secret-resolution branch in softwareDeployment.ts:
+ * that fires only when the resolved catalog item has an integrationProvider, and
+ * this path adds no special handling for it either way.
  */
 export async function createPolicyOwnedInstallDeployment(input: {
   policyId: string;

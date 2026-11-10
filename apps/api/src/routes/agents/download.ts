@@ -781,6 +781,8 @@ AGENT_BINARY="/usr/local/bin/breeze-agent"
 AGENT_BINARY_TRUSTED="/Library/Breeze/bin/breeze-agent"
 WATCHDOG_BINARY="/usr/local/bin/breeze-watchdog"
 BACKUP_BINARY="/usr/local/bin/breeze-backup"
+ISOLATION_RECOVERY_ROOT="/usr/local/lib/breeze"
+ISOLATION_DATA_DIR="/var/lib/breeze"
 
 fatal() {
   echo "Error: $*" >&2
@@ -886,6 +888,54 @@ uninstall_macos() {
   echo "Logs at /Library/Logs/Breeze/ were kept. To remove them: sudo rm -rf /Library/Logs/Breeze"
 }
 
+# Network isolation is released before anything it depends on is touched:
+# removing the agent or the recovery timers first would leave this host cut off
+# with nothing left to undo it. Returns non-zero when the release cannot be
+# confirmed. A host that was never isolated has no journal and no table.
+release_isolation_linux() {
+  local data_dir="$ISOLATION_DATA_DIR"
+  local journal=0 rules="absent" tables
+  if [[ -e "$data_dir/isolation.json" ]]; then
+    journal=1
+  fi
+  # A failed listing is "unknown", never "absent": only a listing that ran and
+  # lacks our table proves the rules are gone.
+  if command -v nft >/dev/null 2>&1; then
+    if tables="$(nft list tables 2>/dev/null)"; then
+      # Not grep -q: it can SIGPIPE printf under pipefail.
+      if printf '%s\\n' "$tables" | grep -Fx 'table inet breeze_isolation' >/dev/null; then
+        rules="present"
+      fi
+    else
+      rules="unknown"
+    fi
+  fi
+  # No journal: no build that isolates has run here, so nothing is ours to
+  # release, even when the engine cannot be asked (a kernel without nf_tables).
+  if [[ "$journal" -eq 0 && "$rules" != "present" ]]; then
+    return 0
+  fi
+  if [[ -x "$AGENT_BINARY" ]] && "$AGENT_BINARY" containment release-all --reason uninstall; then
+    return 0
+  fi
+  # A broken agent must not block this: the recovery binary is installed
+  # separately for exactly that case.
+  local recovery
+  for recovery in "$ISOLATION_RECOVERY_ROOT"/isolation-recovery/*/breeze-isolation-recovery; do
+    if [[ -x "$recovery" ]] && "$recovery" release-all --data-dir "$data_dir" --reason uninstall; then
+      return 0
+    fi
+  done
+  # Nothing could run. A journal alone is harmless once the rules are observably
+  # gone (a half-removed install); rules still in place, or an engine that cannot
+  # be asked, are not.
+  if [[ "$rules" == "absent" ]] && command -v nft >/dev/null 2>&1; then
+    warn "no agent or recovery binary to record the release; no isolation rules are installed"
+    return 0
+  fi
+  return 1
+}
+
 uninstall_linux() {
   local agent_service="/etc/systemd/system/breeze-agent.service"
   local watchdog_service="/etc/systemd/system/breeze-watchdog.service"
@@ -895,7 +945,11 @@ uninstall_linux() {
 
   echo "Uninstalling Breeze Agent for Linux..."
 
+  release_isolation_linux || fatal "network isolation could not be released; nothing was removed. Release it from the console or with: sudo breeze-agent containment release --force"
+
   if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop breeze-isolation-poll.timer 2>/dev/null || true
+    systemctl disable breeze-isolation-poll.timer breeze-isolation.service 2>/dev/null || true
     if systemctl is-active --quiet breeze-agent 2>/dev/null; then
       systemctl stop breeze-agent
       echo "Service stopped."
@@ -921,6 +975,11 @@ uninstall_linux() {
   rm -f "$AGENT_BINARY"
   rm -f "$WATCHDOG_BINARY"
   rm -f "$BACKUP_BINARY"
+  rm -f /etc/systemd/system/breeze-isolation.service \\
+    /etc/systemd/system/breeze-isolation-poll.service \\
+    /etc/systemd/system/breeze-isolation-poll.timer
+  rm -rf "$ISOLATION_RECOVERY_ROOT/isolation-recovery"
+  rmdir "$ISOLATION_RECOVERY_ROOT" 2>/dev/null || true
   rmdir "$ipc_dir" 2>/dev/null || true
 
   if command -v systemctl >/dev/null 2>&1; then
@@ -1062,6 +1121,25 @@ else
   CONFIG_DIR="/etc/breeze"
 fi
 BINARY_NAME="breeze-agent"
+# The macOS .pkg installs the agent to /Library/Breeze/bin or /usr/local/bin
+# (agent/installer/macos/install-location.sh, #7211), so enrollment must use
+# the binary it actually installed (#8778).
+MACOS_TRUSTED_BIN_DIR="/Library/Breeze/bin"
+
+# resolve_macos_agent_bin: print the agent binary the .pkg installed. Mirrors
+# choose_bin_dir in install-location.sh: an agent already in the trusted dir
+# stays there (so it wins over a leftover pre-relocation copy), otherwise the
+# package used /usr/local/bin. Fails when neither holds an executable agent.
+resolve_macos_agent_bin() {
+  local p
+  for p in "\$MACOS_TRUSTED_BIN_DIR/\$BINARY_NAME" "\$INSTALL_DIR/\$BINARY_NAME"; do
+    if [[ -f "\$p" && ! -L "\$p" && -x "\$p" ]]; then
+      echo "\$p"
+      return 0
+    fi
+  done
+  return 1
+}
 DOWNLOAD_URL="\${BREEZE_SERVER}/api/v1/agents/download/\${OS}/\${ARCH}"
 PKG_URL="\${BREEZE_SERVER}/api/v1/agents/download/\${OS}/\${ARCH}/pkg"
 VERSION_METADATA_URL="\${BREEZE_SERVER}/api/v1/agent-versions/latest?platform=\${OS}&arch=\${ARCH}&component=agent"
@@ -1250,9 +1328,6 @@ if [[ "\$OS" == "darwin" ]]; then
   # Enroll agent
   info "Enrolling agent with Breeze server..."
   ENROLL_ARGS=(enroll --server "\$BREEZE_SERVER")
-  if [[ -n "\$BREEZE_SITE_ID" ]]; then
-    ENROLL_ARGS+=(--site-id "\$BREEZE_SITE_ID")
-  fi
   if [[ -n "\$BREEZE_DEVICE_ROLE" ]]; then
     ENROLL_ARGS+=(--device-role "\$BREEZE_DEVICE_ROLE")
   fi
@@ -1262,8 +1337,10 @@ if [[ "\$OS" == "darwin" ]]; then
   # read a process's argv (e.g. /proc/*/cmdline on Linux, ps on macOS), but
   # not another user's environment. Scoped with a VAR=value prefix so it only
   # applies to this one invocation, never exported into this shell.
+  MACOS_AGENT_BIN="\$(resolve_macos_agent_bin)" || \
+    fatal "The package installed, but no breeze-agent was found in \$MACOS_TRUSTED_BIN_DIR or \$INSTALL_DIR."
   if ! BREEZE_AGENT_ENROLLMENT_KEY="\$BREEZE_ENROLL_TOKEN" BREEZE_AGENT_ENROLLMENT_SECRET="\$BREEZE_ENROLLMENT_SECRET" \
-      "\$INSTALL_DIR/\$BINARY_NAME" "\${ENROLL_ARGS[@]}"; then
+      "\$MACOS_AGENT_BIN" "\${ENROLL_ARGS[@]}"; then
     fatal "Enrollment failed. Check the server URL and that the enrollment token is valid and not expired (plus the enrollment secret, if your server requires one)."
   fi
   success "Agent enrolled successfully"
@@ -1324,6 +1401,26 @@ success "Downloaded agent binary ($(wc -c < "\$TMPFILE" | tr -d ' ') bytes)"
 info "Verifying agent binary checksum..."
 verify_sha256 "\$TMPFILE" "\$EXPECTED_SHA256"
 success "Verified agent binary checksum"
+
+# ----- Refuse an agent too old for this script's enrollment flow (#9566) -----
+# This script hands the enrollment token to \`breeze-agent enroll\` through
+# BREEZE_AGENT_ENROLLMENT_KEY with no positional argument. Agents before
+# MIN_AGENT_VERSION only knew \`enroll <enrollment-key>\`, so against one the user
+# would see a bare cobra "accepts 1 arg(s), received 0" after a good download.
+# 0.118.0 is the first tag containing env-var enrollment (aa95674df5, #7199).
+# Conservative: only fail when the version parses AND is clearly lower; a binary
+# that cannot be executed here (noexec tmp) or prints something unparseable
+# (dev build) is let through. Runs before the existing install is touched.
+MIN_AGENT_VERSION="0.118.0"
+chmod 755 "\$TMPFILE" 2>/dev/null || true
+DOWNLOADED_VERSION_RAW="$("\$TMPFILE" version 2>/dev/null | head -n 1)" || DOWNLOADED_VERSION_RAW=""
+DOWNLOADED_VERSION="$(printf '%s' "\$DOWNLOADED_VERSION_RAW" | sed -n 's/^[^0-9]*\\([0-9][0-9]*\\.[0-9][0-9]*\\.[0-9][0-9]*\\).*/\\1/p' | head -n 1)"
+if [[ -n "\$DOWNLOADED_VERSION" ]]; then
+  OLDEST_VERSION="$(printf '%s\\n%s\\n' "\$MIN_AGENT_VERSION" "\$DOWNLOADED_VERSION" | sort -t. -k1,1n -k2,2n -k3,3n | head -n 1)"
+  if [[ "\$DOWNLOADED_VERSION" != "\$MIN_AGENT_VERSION" && "\$OLDEST_VERSION" == "\$DOWNLOADED_VERSION" ]]; then
+    fatal "The agent binary served by this server is v\$DOWNLOADED_VERSION, which is older than this server's install flow (needs v\$MIN_AGENT_VERSION or newer). Set BREEZE_VERSION on the server (or check the release channel) so it serves a current agent, then re-run this script."
+  fi
+fi
 
 # ----- Stop existing service before replacing binary (safe for upgrades) -----
 if command -v systemctl &>/dev/null && systemctl is-active --quiet breeze-agent 2>/dev/null; then
@@ -1408,12 +1505,20 @@ mkdir -p "\$CONFIG_DIR"
 chmod 0700 "\$CONFIG_DIR"
 success "Config directory ready"
 
+# ----- Create data directory and breeze group (#9566) -----
+# Without these a first enroll logs WARNs about the DNS cache file
+# (/var/lib/breeze/dns-cache.json) and the missing breeze group (helper token
+# left root-only). Mirrors agent/scripts/install/install-linux.sh and
+# \`breeze-agent service install\` (0755 data dir, system group).
+mkdir -p /var/lib/breeze
+chmod 0755 /var/lib/breeze
+if command -v groupadd &>/dev/null && ! getent group breeze &>/dev/null; then
+  groupadd --system breeze 2>/dev/null || warn "Could not create the breeze group; the helper token file will stay root-only"
+fi
+
 # ----- Enroll agent -----
 info "Enrolling agent with Breeze server..."
 ENROLL_ARGS=(enroll --server "\$BREEZE_SERVER")
-if [[ -n "\$BREEZE_SITE_ID" ]]; then
-  ENROLL_ARGS+=(--site-id "\$BREEZE_SITE_ID")
-fi
 if [[ -n "\$BREEZE_DEVICE_ROLE" ]]; then
   ENROLL_ARGS+=(--device-role "\$BREEZE_DEVICE_ROLE")
 fi

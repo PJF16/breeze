@@ -22,6 +22,7 @@
  * Only full partner admins (canManagePartnerWidePolicies) and system scope
  * may assign; the check is repeated here, not only in the route.
  */
+import { assertNoUnresolvedIsolation, NetworkIsolationUnresolvedError } from '../networkIsolation/lifecycle';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
 import type { AuthContext } from '../../middleware/auth';
 import { canManagePartnerWidePolicies } from '../partnerWideAccess';
@@ -33,7 +34,12 @@ import {
 } from '../deviceOrgMove/moveDeviceOrgInTransaction';
 import { TicketMoveCurrencyBlockedError } from '../ticketMoveCurrencyGuard';
 import { TicketMoveHourBlockError } from '../ticketMoveHourBlockGuard';
-import { PamDeviceMoveBlockedError } from '../pamDeviceMoveGuard';
+import { TicketMoveApprovalPendingError } from '../ticketMoveApprovalGuard';
+import {
+  PAM_MOVE_GUARD_CONSTRAINT,
+  PAM_MOVE_OPEN_ACTUATION_CONSTRAINT,
+  PamDeviceMoveBlockedError,
+} from '../pamDeviceMoveGuard';
 import { TicketServiceError } from '../ticketService';
 import { isTransientLockError, pgErrorNode } from '../../utils/pgErrors';
 import {
@@ -53,6 +59,7 @@ import { raiseDeviceIdentityCollisionAlert } from '../deviceIdentityCollisionAle
 import { writeAuditEvent, type RequestLike } from '../auditEvents';
 import { schedulePeripheralPolicyDevice } from '../../jobs/peripheralJobs';
 import { expireDiagnosticApprovalsForMovedDevice } from '../diagnosticAccess/deviceMove';
+import { invalidateDevicePolicyCaches } from '../devicePolicyCache';
 import { captureException } from '../sentry';
 import { isUnassignedPoolOrgType } from './orgType';
 import { isParkedDeviceExpired } from './limits';
@@ -67,6 +74,7 @@ import {
   type IdentityCollision,
 } from './assignParkedDeviceSteps';
 import { devicePoolAssignmentEvents } from '../../db/schema';
+import { scheduleTicketLinkRemovalNotes } from '../ticketLinkMoveNotes';
 import type { DevicePoolAssignmentMethod } from '../../db/schema/devicePoolAssignmentEvents';
 
 export type ParkedAssignRefusalCode =
@@ -84,14 +92,18 @@ export type ParkedAssignRefusalCode =
   | 'POOL_MEMBERSHIP_REFUSED'
   | 'TICKET_MOVE_CURRENCY_BLOCKED'
   | 'HOUR_BLOCK_DRAWN_TIME'
+  | 'APPROVAL_REQUEST_PENDING'
   | 'PAM_DEVICE_MOVE_BLOCKED'
+  | 'PAM_DEVICE_MOVE_ACTIVE'
   | 'DELIVERABLE_TICKET_PINNED'
   // Lost a lock race (a bounded lock wait timed out, or a deadlock victim):
   // nothing was written; retrying shortly succeeds.
   | 'ASSIGNMENT_BUSY'
-  | 'ASSIGNMENT_FAILED';
+  | 'ASSIGNMENT_FAILED'
+  | 'isolation_unresolved';
 
 const REFUSAL_MESSAGES: Record<ParkedAssignRefusalCode, string> = {
+  isolation_unresolved: 'Release network isolation first',
   PARTNER_WIDE_WRITE_DENIED: 'Assigning parked devices requires full partner org access',
   DEVICE_NOT_FOUND: 'Parked device not found',
   DEVICE_NOT_PARKED: 'This device is not waiting for assignment',
@@ -105,7 +117,9 @@ const REFUSAL_MESSAGES: Record<ParkedAssignRefusalCode, string> = {
   POOL_MEMBERSHIP_REFUSED: 'This device cannot be moved this way',
   TICKET_MOVE_CURRENCY_BLOCKED: 'Tickets on this device bill in a different currency than the target organization',
   HOUR_BLOCK_DRAWN_TIME: 'Tickets on this device carry time drawn from a block of prepaid hours',
+  APPROVAL_REQUEST_PENDING: 'A ticket on this device has a pending customer approval request',
   PAM_DEVICE_MOVE_BLOCKED: 'This device carries privileged-access history and cannot change organization',
+  PAM_DEVICE_MOVE_ACTIVE: 'This device has a privileged-access session that has not finished cleanup. Try again once it closes',
   DELIVERABLE_TICKET_PINNED: 'A ticket on this device is pinned to a service deliverable',
   ASSIGNMENT_BUSY: 'Another change to this partner\'s devices is in progress. Try again in a moment',
   ASSIGNMENT_FAILED: 'Failed to assign device',
@@ -234,6 +248,7 @@ async function assignInTransaction(
   if (isParkedDeviceExpired(device.createdAt, now)) {
     throw new ParkedAssignmentRefusedError('DEVICE_PARKING_EXPIRED');
   }
+  await assertNoUnresolvedIsolation(tx, { deviceId: device.id }, 'assign_parked_device');
   await hooks?.afterDeviceLock?.(device.id);
 
   const target = await lockTargetOrg(tx, item.targetOrgId);
@@ -346,13 +361,15 @@ async function admitOrRefuse(check: () => Promise<PartnerDeviceCapacityResult>):
  * transaction back like any other refusal; they are answers, not failures.
  */
 function engineRefusal(err: unknown): ParkedAssignmentRefusedError | null {
+  if (err instanceof NetworkIsolationUnresolvedError) return new ParkedAssignmentRefusedError('isolation_unresolved');
   if (err instanceof DevicePoolMembershipRefusedError) return new ParkedAssignmentRefusedError('POOL_MEMBERSHIP_REFUSED');
   if (err instanceof OrgVanishedDuringMoveError) {
     return new ParkedAssignmentRefusedError(err.which === 'target' ? 'TARGET_ORG_INVALID' : 'DEVICE_NOT_FOUND');
   }
   if (err instanceof TicketMoveCurrencyBlockedError) return new ParkedAssignmentRefusedError('TICKET_MOVE_CURRENCY_BLOCKED');
   if (err instanceof TicketMoveHourBlockError) return new ParkedAssignmentRefusedError('HOUR_BLOCK_DRAWN_TIME');
-  if (err instanceof PamDeviceMoveBlockedError) return new ParkedAssignmentRefusedError('PAM_DEVICE_MOVE_BLOCKED');
+  if (err instanceof TicketMoveApprovalPendingError) return new ParkedAssignmentRefusedError('APPROVAL_REQUEST_PENDING');
+  if (err instanceof PamDeviceMoveBlockedError) return new ParkedAssignmentRefusedError(err.code);
   if (err instanceof TicketServiceError && err.code === 'DELIVERABLE_TICKET_PINNED') {
     return new ParkedAssignmentRefusedError('DELIVERABLE_TICKET_PINNED');
   }
@@ -361,9 +378,17 @@ function engineRefusal(err: unknown): ParkedAssignmentRefusedError | null {
   // as a deadlock victim, rolled everything back and is worth a retry.
   if (isTransientLockError(err)) return new ParkedAssignmentRefusedError('ASSIGNMENT_BUSY');
   const pgNode = pgErrorNode(err);
+  // eslint-disable-next-line breeze/no-direct-sqlstate -- Driver node unwrapped by pgErrorNode.
+  if (pgNode?.code === '55000' && typeof pgNode.message === 'string' && pgNode.message.startsWith('isolation_unresolved:')) {
+    return new ParkedAssignmentRefusedError('isolation_unresolved');
+  }
   // eslint-disable-next-line breeze/no-direct-sqlstate -- Driver node already unwrapped by pgErrorNode.
-  if (pgNode?.code === '23514' && pgNode.constraint_name === 'devices_pam_history_move_guard') {
+  if (pgNode?.code === '23514' && pgNode.constraint_name === PAM_MOVE_GUARD_CONSTRAINT) {
     return new ParkedAssignmentRefusedError('PAM_DEVICE_MOVE_BLOCKED');
+  }
+  // eslint-disable-next-line breeze/no-direct-sqlstate -- Driver node already unwrapped by pgErrorNode.
+  if (pgNode?.code === '23514' && pgNode.constraint_name === PAM_MOVE_OPEN_ACTUATION_CONSTRAINT) {
+    return new ParkedAssignmentRefusedError('PAM_DEVICE_MOVE_ACTIVE');
   }
   return null;
 }
@@ -412,6 +437,11 @@ function afterCommit(
   const { item } = committed;
   const collidingDeviceIds = committed.collisions.map((c) => c.id);
 
+  // #7900 W02: notes on tickets that lost a link when the device's tickets
+  // left the holding org. Committed already; scheduled through the commit-only
+  // queue so a context still held by the caller is respected.
+  safely(item.deviceId, 'ticket link notes', () => scheduleTicketLinkRemovalNotes(committed.move.removedTicketLinks));
+
   safely(item.deviceId, 'audit', () => {
     const { customFieldRehome } = committed.move;
     writeAuditEvent(audit, {
@@ -440,7 +470,8 @@ function afterCommit(
     return requestDeviceGroupReevaluation({
       deviceId: item.deviceId,
       orgId: item.targetOrgId,
-      eventType: 'device.updated',
+      // The move cleared memberships; device.created evaluates every target-org dynamic group.
+      eventType: 'device.created',
       reason: 'parked_device_assigned',
     });
   });
@@ -451,6 +482,9 @@ function afterCommit(
       invalidateOrgDeviceCount(redis, item.targetOrgId),
     ]);
   });
+  // #8257: the device's cached heartbeat policy config was resolved for the
+  // holding org (org-bound, so never served to the target org anyway).
+  safely(item.deviceId, 'policy cache invalidation', () => invalidateDevicePolicyCaches(item.deviceId));
   safely(item.deviceId, 'diagnostic approval expiry', () => {
     void expireDiagnosticApprovalsForMovedDevice(item.deviceId).catch((error) => {
       console.error(`[parkedAssignment] failed to expire diagnostic access approvals for ${item.deviceId}:`, error);

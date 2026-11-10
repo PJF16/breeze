@@ -53,3 +53,107 @@ export const WORKLOAD_INVENTORY_PROTOCOL_VERSION = 1;
 export const WORKLOAD_INVENTORY_MIN_INTERVAL_MINUTES = 15;
 export const WORKLOAD_INVENTORY_MAX_INTERVAL_MINUTES = 1440;
 export const WORKLOAD_INVENTORY_DEFAULT_INTERVAL_MINUTES = 60;
+
+/**
+ * Image provenance (#9067): the agent's evidence, per container, for where its
+ * image came from. `confirmed` = a registry digest the engine vouches for;
+ * `local` = never pulled from this repository (a build, a load, a retag);
+ * `unknown` = the engine cannot say (Docker's containerd image store before
+ * Engine API 1.54). Agents that predate #9067 send nothing (stored as NULL),
+ * which keeps the behaviour from before the field existed.
+ */
+export const WORKLOAD_IMAGE_PROVENANCES = ['confirmed', 'local', 'unknown'] as const;
+export type WorkloadImageProvenance = (typeof WORKLOAD_IMAGE_PROVENANCES)[number];
+
+/**
+ * Image currency (#3813, spec §9.1): per container row, how its local image
+ * compares with the registry's current digest for the same tag. The
+ * unknown-class statuses (pending, private, unsupported_registry, error,
+ * provenance_unknown) never count as current (spec §10). `provenance_unknown`
+ * (#9067): the agent could not tell where the image came from, so its name was
+ * never sent to any registry.
+ */
+export const WORKLOAD_UPSTREAM_STATUSES = [
+  'pending',
+  'current',
+  'behind',
+  'pinned',
+  'local',
+  'private',
+  'unsupported_registry',
+  'not_found',
+  'error',
+  'provenance_unknown',
+] as const;
+export type WorkloadUpstreamStatus = (typeof WORKLOAD_UPSTREAM_STATUSES)[number];
+
+/**
+ * How a status counts toward patch compliance (spec §10.1, OD-2 option b):
+ * - `stale`   (behind)  → a pending item;
+ * - `current`           → an installed item;
+ * - `unknown` (pending, private, unsupported_registry, error,
+ *   provenance_unknown) → outside the
+ *   denominator, surfaced as "N images not checked";
+ * - `not_applicable` (pinned, local, not_found) → neither stale nor current,
+ *   and not a coverage gap either: there is nothing to compare.
+ */
+export type WorkloadUpstreamStatusClass = 'stale' | 'current' | 'unknown' | 'not_applicable';
+
+export const WORKLOAD_UPSTREAM_UNKNOWN_STATUSES = [
+  'pending',
+  'private',
+  'unsupported_registry',
+  'error',
+  'provenance_unknown',
+] as const satisfies readonly WorkloadUpstreamStatus[];
+
+export function workloadUpstreamStatusClass(status: WorkloadUpstreamStatus): WorkloadUpstreamStatusClass {
+  switch (status) {
+    case 'behind':
+      return 'stale';
+    case 'current':
+      return 'current';
+    case 'pinned':
+    case 'local':
+    case 'not_found':
+      return 'not_applicable';
+    case 'pending':
+    case 'private':
+    case 'unsupported_registry':
+    case 'error':
+    case 'provenance_unknown':
+      return 'unknown';
+  }
+}
+
+/**
+ * Per-device (or summed) container image term of patch compliance: counts of
+ * DISTINCT image repository:tag pairs, replicas of one image on one host
+ * counted once. Computed only by `containerImageComplianceTerms` in the API.
+ */
+export interface ContainerImageComplianceTerms {
+  stale: number;
+  current: number;
+  unknown: number;
+}
+
+export function hasImageComplianceTerm(terms: ContainerImageComplianceTerms | null | undefined): boolean {
+  return !!terms && terms.stale + terms.current + terms.unknown > 0;
+}
+
+/**
+ * THE patch-compliance arithmetic with the image term folded in. Every
+ * compute site (device %, org %, the CSV report, the web fallback) passes its
+ * own existing `installed` / `total` and gets back exactly its old number when
+ * `terms` is absent or all zero. A stale image adds one pending item, a
+ * current image one installed item; unknown images never touch the ratio.
+ */
+export function compliancePercentWithImageTerm(
+  installed: number,
+  total: number,
+  terms: ContainerImageComplianceTerms | null | undefined,
+): number {
+  const numerator = installed + (terms?.current ?? 0);
+  const denominator = total + (terms?.stale ?? 0) + (terms?.current ?? 0);
+  return denominator > 0 ? Math.round((numerator / denominator) * 100) : 100;
+}

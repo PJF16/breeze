@@ -7,7 +7,7 @@ package mgmtdetect
 func AllSignatures() []Signature {
 	return []Signature{
 		// =====================================================================
-		// RMM — Remote Monitoring & Management (11 tools)
+		// RMM — Remote Monitoring & Management (12 tools)
 		// =====================================================================
 
 		// ConnectWise Automate (LabTech)
@@ -154,8 +154,19 @@ func AllSignatures() []Signature {
 			},
 		},
 
+		// OpenFrame
+		{
+			Name: "OpenFrame", Category: CategoryRMM,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "com.openframe.client", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "openframe-client.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files\OpenFrame\bin\openframe-client.exe`, OS: "windows"},
+			},
+		},
+
 		// =====================================================================
-		// Remote Access (7 tools)
+		// Remote Access (18 tools)
 		// =====================================================================
 
 		// TeamViewer
@@ -191,8 +202,10 @@ func AllSignatures() []Signature {
 			Checks: []Check{
 				{Type: CheckServiceRunning, Value: "SplashtopRemoteService", OS: "windows"},
 				{Type: CheckProcessRunning, Value: "SRService.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "SRManager.exe", OS: "windows"},
 				{Type: CheckProcessRunning, Value: "SplashtopStreamer", OS: "darwin"},
 				{Type: CheckFileExists, Value: `C:\Program Files (x86)\Splashtop\Splashtop Remote\Server\SRService.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files\Splashtop\Splashtop Remote\Server\SRService.exe`, OS: "windows"},
 				{Type: CheckFileExists, Value: "/Applications/Splashtop Streamer.app", OS: "darwin"},
 			},
 		},
@@ -249,8 +262,156 @@ func AllSignatures() []Signature {
 			},
 		},
 
+		// SimpleHelp (JWrapper-packaged; the install directory carries the
+		// deployment brand, so only the reported default path is probed).
+		{
+			Name: "SimpleHelp", Category: CategoryRemoteAccess,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "Remote Access Service", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "SimpleService.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\ProgramData\JWrapper-Remote Access\JWAppsSharedConfig\restricted\SimpleService.exe`, OS: "windows"},
+			},
+		},
+
+		// MeshCentral (Mesh Agent). Tactical RMM bundles the stock Mesh Agent,
+		// so Tactical hosts report both rows; that is accurate, not a dupe.
+		{
+			Name: "MeshCentral", Category: CategoryRemoteAccess,
+			OS: []string{"windows", "darwin"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "Mesh Agent", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "MeshAgent.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "meshagent", OS: "darwin"},
+				{Type: CheckFileExists, Value: `C:\Program Files\Mesh Agent\MeshAgent.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: "/usr/local/mesh_services/meshagent/meshagent", OS: "darwin"},
+			},
+		},
+
+		// TightVNC
+		{
+			Name: "TightVNC", Category: CategoryRemoteAccess,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "tvnserver", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "tvnserver.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files\TightVNC\tvnserver.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files (x86)\TightVNC\tvnserver.exe`, OS: "windows"},
+			},
+		},
+
+		// RealVNC (VNC Server)
+		{
+			Name: "RealVNC", Category: CategoryRemoteAccess,
+			OS: []string{"windows", "darwin"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "vncserver", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "vncserver.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "vncserver", OS: "darwin"},
+				{Type: CheckFileExists, Value: `C:\Program Files\RealVNC\VNC Server\vncserver.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: "/Library/vnc/vncserver", OS: "darwin"},
+			},
+		},
+
+		// UltraVNC
+		{
+			Name: "UltraVNC", Category: CategoryRemoteAccess,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "uvnc_service", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "winvnc.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files\uvnc bvba\UltraVNC\winvnc.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files (x86)\uvnc bvba\UltraVNC\winvnc.exe`, OS: "windows"},
+			},
+		},
+
+		// Remote support tools common in tech-support scams (#11306). The API
+		// alerts partners when a scan reports one the previous scan did not,
+		// which includes an existing install on the first scan after an agent
+		// upgrade that adds its signature. Quick Assist is left out on
+		// purpose: it ships with Windows 11. A name added here must also be
+		// added to KNOWN_REMOTE_TOOLS (apps/api/src/services/remoteToolAlerts/knownTools.ts).
+
+		// UltraViewer (32-bit installer, so Program Files (x86) only)
+		{
+			Name: "UltraViewer", Category: CategoryRemoteAccess,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "UltraViewService", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "UltraViewer_Service.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "UltraViewer_Desktop.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files (x86)\UltraViewer\UltraViewer_Service.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files (x86)\UltraViewer\UltraViewer_Desktop.exe`, OS: "windows"},
+			},
+		},
+
+		// Zoho Assist: the unattended agent (ZohoURS*) and the on-demand
+		// session applet (ZA_Access). The registry key is the one Zoho
+		// documents for install detection; both registry views are probed.
+		{
+			Name: "Zoho Assist", Category: CategoryRemoteAccess,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckProcessRunning, Value: "ZohoURSService.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "ZohoURS.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "ZA_Access.exe", OS: "windows"},
+				{Type: CheckRegistryValue, Value: `HKLM\SOFTWARE\Zoho Assist\Unattended Remote Support`, OS: "windows"},
+				{Type: CheckRegistryValue, Value: `HKLM\SOFTWARE\WOW6432Node\Zoho Assist\Unattended Remote Support`, OS: "windows"},
+			},
+		},
+
+		// DWService (DWAgent), at its default service name and install path.
+		{
+			Name: "DWService", Category: CategoryRemoteAccess,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "DWAgent", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "dwagent.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files\DWAgent`, OS: "windows"},
+			},
+		},
+
+		// Supremo
+		{
+			Name: "Supremo", Category: CategoryRemoteAccess,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckProcessRunning, Value: "SupremoService.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "Supremo.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "SupremoSystem.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\ProgramData\SupremoRemoteDesktop`, OS: "windows"},
+			},
+		},
+
+		// Ammyy Admin: usually run portable, so processes lead; ProgramData
+		// holds its config and access log once it has run as a service.
+		{
+			Name: "Ammyy Admin", Category: CategoryRemoteAccess,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckProcessRunning, Value: "AA_v3.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "AMMYY_Admin.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\ProgramData\AMMYY`, OS: "windows"},
+			},
+		},
+
+		// Chrome Remote Desktop host (not the browser extension alone). The
+		// Windows host installs into a versioned folder, so the folder is probed.
+		{
+			Name: "Chrome Remote Desktop", Category: CategoryRemoteAccess,
+			OS: []string{"windows", "darwin"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "chromoting", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "remoting_host.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "remoting_me2me_host", OS: "darwin"},
+				{Type: CheckFileExists, Value: `C:\Program Files (x86)\Google\Chrome Remote Desktop`, OS: "windows"},
+				{Type: CheckFileExists, Value: "/Library/PrivilegedHelperTools/ChromeRemoteDesktopHost.app", OS: "darwin"},
+				{Type: CheckLaunchDaemon, Value: "org.chromium.chromoting", OS: "darwin"},
+			},
+		},
+
 		// =====================================================================
-		// Endpoint Security — AV/EDR (13 tools)
+		// Endpoint Security — AV/EDR (14 tools)
 		// =====================================================================
 
 		// CrowdStrike Falcon
@@ -385,6 +546,23 @@ func AllSignatures() []Signature {
 				{Type: CheckProcessRunning, Value: "fshoster64.exe", OS: "windows"},
 				{Type: CheckProcessRunning, Value: "fshoster32.exe", OS: "windows"},
 				{Type: CheckFileExists, Value: `C:\Program Files (x86)\F-Secure\PSB`, OS: "windows"},
+			},
+		},
+
+		// Trend Micro Apex One / Worry-Free / Vision One endpoint agents (#8171).
+		// Probes come from vendor product naming and are not yet verified on a
+		// lab host. The install folders differ by product: Apex One "Security
+		// Agent", Worry-Free "Client Server Security Agent", Vision One "Endpoint
+		// Basecamp". macOS omitted until verified on a lab host.
+		{
+			Name: "Trend Micro", Category: CategoryEndpointSecurity,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "ntrtscan", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "PccNTMon.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files (x86)\Trend Micro\Security Agent`, OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files (x86)\Trend Micro\Client Server Security Agent`, OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files\Trend Micro\Endpoint Basecamp`, OS: "windows"},
 			},
 		},
 

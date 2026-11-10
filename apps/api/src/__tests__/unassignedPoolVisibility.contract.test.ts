@@ -149,6 +149,8 @@ const EPHEMERAL_ONLY: Record<string, string> = {
   'services/portal/hardwareInventoryReadModel.ts': 'portal users belong to one customer org, never a holding org',
   'services/portal/performanceReadModel.ts': 'portal users belong to one customer org, never a holding org',
   'services/portal/softwareInventoryReadModel.ts': 'portal users belong to one customer org, never a holding org',
+  'services/portal/patchDetailReadModel.ts': 'portal users belong to one customer org, never a holding org',
+  'services/portal/vulnerabilityDetailReadModel.ts': 'portal users belong to one customer org, never a holding org',
   'services/portal/securityReadModel.ts': 'portal users belong to one customer org, never a holding org',
   'services/portal/backupReadModel.ts': 'portal users belong to one customer org, never a holding org',
   'services/quickSupportOrg.ts': 'the Quick Support helpers themselves',
@@ -166,8 +168,29 @@ const EPHEMERAL_ONLY: Record<string, string> = {
   'services/topology/originEligibility.ts': 'pinned to the calling technician\'s org and site',
 };
 
-/** Pinned: every file with an ephemeral-device filter, all buckets together. */
-const EPHEMERAL_DISCOVERED_FILES = 72;
+/**
+ * Pinned: every file with an ephemeral-device filter, all buckets together.
+ * 76 → 74 (#9611): routes/patches/compliance.ts and
+ * jobs/patchComplianceReportWorker.ts now take their device population from
+ * techFacingDeviceConditions() in services/deviceStats.ts, which stays in this
+ * scan with the ephemeral filter and notParkedDeviceCondition() side by side.
+ * 74 → 75 (#6263 W05): services/securityScanSweepTargets.ts, the IOC sweep
+ * target selector (a FANOUT_MODULES entry, parked guard beside the filter).
+ * 75 → 76 (#9635): services/softwarePolicyCoverage.ts, the org device set the
+ * Inventory Approve / Deny placement check resolves (parked guard beside it).
+ * 76 → 77 (#11065): jobs/oemUpdatesWorker.ts, the vendor update not-returned
+ * monitor (a FANOUT_MODULES entry, parked guard beside the filter).
+ * 77 → 80 (#11072): services/oemUpdates/candidates.ts, rebootSweep.ts and
+ * releaseSweep.ts, the vendor update scheduler's device selectors (each a
+ * parkedFanoutModules entry, parked guard beside the filter).
+ * 80 → 81 (#11073): services/oemUpdates/laneDelivery.ts, which classes a vendor
+ * lane delivers on a device (a parkedFanoutModules entry, parked guard beside the
+ * filter).
+ * 81 → 82 (#11074): routes/oemUpdates/fleet.ts, the Vendor updates fleet list
+ * (parked guard beside the filter), and services/oemUpdates/overdueSweep.ts,
+ * its alerts (a parkedFanoutModules entry) 82 → 83.
+ */
+const EPHEMERAL_DISCOVERED_FILES = 83;
 
 describe('contract: device counts and listings leave parked devices out', () => {
   const found = DEVICE_FILES

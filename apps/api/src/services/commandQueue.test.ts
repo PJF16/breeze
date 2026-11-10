@@ -15,10 +15,12 @@ import {
   queueCommandForExecution,
   rearmIdempotentCommandForDelivery,
   resolveCommandCreatedBy,
+  enqueueWatchdogCommand,
 } from './commandQueue';
 import { db } from '../db';
 import { createAuditLogAsync } from './auditService';
 import { sendCommandToAgent, isAgentConnected } from '../routes/agentWs';
+import { agentReachability, dispatchCommandToAgent } from './agentCommandRelay';
 import {
   claimPendingCommandForDelivery,
   releaseClaimedCommandDelivery,
@@ -87,6 +89,27 @@ vi.mock('../routes/agentWs', () => ({
   isAgentConnected: vi.fn(),
 }));
 
+// #4142: commandQueue reaches agents through the relay facade. The facade mock
+// bridges over the agentWs mock above (a local socket send), so the transport
+// tests read as "the send succeeded / failed"; the facade-outcome tests below
+// drive these mocks directly. The real mapping is pinned in agentCommandRelay.test.ts.
+vi.mock('./agentCommandRelay', async () => {
+  const ws = await import('../routes/agentWs');
+  return {
+    dispatchCommandToAgent: vi.fn(async (agentId: string, frame: unknown) => (
+      vi.mocked(ws.sendCommandToAgent)(agentId, frame as never)
+        ? { status: 'sent', via: 'local' }
+        : { status: 'offline' }
+    )),
+    agentReachability: vi.fn(async (agentId: string) => (
+      vi.mocked(ws.isAgentConnected)(agentId) ? 'connected' : 'absent'
+    )),
+    dispatchDisposition: (o: { status: string }) => (
+      o.status === 'sent' ? 'delivered' : o.status === 'indeterminate' ? 'uncertain' : 'not_delivered'
+    ),
+  };
+});
+
 vi.mock('./commandDispatch', () => ({
   claimPendingCommandForDelivery: vi.fn(),
   releaseClaimedCommandDelivery: vi.fn(),
@@ -95,6 +118,7 @@ vi.mock('./commandDispatch', () => ({
 
 vi.mock('./sentry', () => ({
   captureException: vi.fn(),
+  captureMessage: vi.fn(),
 }));
 
 vi.mock('./backupMetrics', () => ({
@@ -278,6 +302,9 @@ describe('command queue service', () => {
     await expect(queueCommandForExecution('d1', 'script', {})).resolves.toMatchObject({
       error: 'TRUST_PROBATION',
       trust: { reason: 'probation_default_deny' },
+      // #8022: the refusal class rides beside the message, so a caller can
+      // report WHY without shipping the (scrubbed) error text.
+      refusal: 'trust_denied',
     });
   });
 
@@ -369,6 +396,118 @@ describe('command queue service', () => {
       commandId, deviceId, type: 'desktop_stream_stop', payload,
     })).resolves.toEqual({ delivered: false, reason: 'command_cancelled' });
     expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
+  it('re-arms and pushes to the agent id read in the claim, not the one read before it (#8318 §6.4)', async () => {
+    const commandId = '11111111-1111-4111-8111-111111111111';
+    const deviceId = '22222222-2222-4222-8222-222222222222';
+    const payload = { sessionId: '33333333-3333-4333-8333-333333333333', finalizationId: commandId };
+    vi.mocked(db.select)
+      .mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{
+              id: commandId, deviceId, type: 'desktop_stream_stop', targetRole: 'agent', payload,
+            }]),
+          }),
+        }),
+      } as any)
+      .mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          // Read before the claim.
+          where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([{ agentId: 'agent-1' }]) }),
+        }),
+      } as any);
+    vi.mocked(db.update).mockReturnValue({
+      set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) }),
+    } as any);
+    vi.mocked(isAgentConnected).mockReturnValue(true);
+    // A reattach / re-enroll committed between that read and the claim.
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({
+      status: 'claimed', id: commandId, executedAt: new Date(), agentId: 'agent-after-reattach',
+    });
+    vi.mocked(sendCommandToAgent).mockReturnValue(true);
+
+    await expect(rearmIdempotentCommandForDelivery({
+      commandId, deviceId, type: 'desktop_stream_stop', payload,
+    })).resolves.toEqual({ delivered: true });
+    expect(sendCommandToAgent).toHaveBeenCalledTimes(1);
+    expect(sendCommandToAgent).toHaveBeenCalledWith('agent-after-reattach', {
+      id: commandId, type: 'desktop_stream_stop', payload,
+    });
+  });
+
+  describe('rearm through the relay facade (#4142 W1.T3)', () => {
+    const commandId = '11111111-1111-4111-8111-111111111111';
+    const deviceId = '22222222-2222-4222-8222-222222222222';
+    const payload = { sessionId: '33333333-3333-4333-8333-333333333333', finalizationId: commandId };
+    const executedAt = new Date('2026-11-08T12:00:00Z');
+    function rigRearm() {
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([{
+                id: commandId, deviceId, type: 'desktop_stream_stop', targetRole: 'agent', payload,
+              }]),
+            }),
+          }),
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([{ agentId: 'agent-1' }]) }),
+          }),
+        } as any);
+      vi.mocked(db.update).mockReturnValue({
+        set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) }),
+      } as any);
+      vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({
+        status: 'claimed', id: commandId, executedAt, agentId: 'agent-1',
+      });
+    }
+
+    it('rearm: indeterminate keeps the claim and reports delivery_indeterminate', async () => {
+      rigRearm();
+      vi.mocked(agentReachability).mockResolvedValueOnce('connected');
+      vi.mocked(dispatchCommandToAgent).mockResolvedValueOnce({ status: 'indeterminate' });
+
+      await expect(rearmIdempotentCommandForDelivery({
+        commandId, deviceId, type: 'desktop_stream_stop', payload,
+      })).resolves.toEqual({ delivered: false, reason: 'delivery_indeterminate' });
+      expect(releaseClaimedCommandDelivery).not.toHaveBeenCalled();
+    });
+
+    it('rearm: an agent on another instance is not agent_disconnected; a relayed send delivers', async () => {
+      rigRearm();
+      vi.mocked(agentReachability).mockResolvedValueOnce('connected');
+      vi.mocked(dispatchCommandToAgent).mockResolvedValueOnce({ status: 'sent', via: 'relay' });
+
+      await expect(rearmIdempotentCommandForDelivery({
+        commandId, deviceId, type: 'desktop_stream_stop', payload,
+      })).resolves.toEqual({ delivered: true });
+    });
+
+    it('rearm: unreadable presence proceeds to the claim; a not-delivered answer releases', async () => {
+      rigRearm();
+      vi.mocked(agentReachability).mockResolvedValueOnce('unknown');
+      vi.mocked(dispatchCommandToAgent).mockResolvedValueOnce({ status: 'offline' });
+
+      await expect(rearmIdempotentCommandForDelivery({
+        commandId, deviceId, type: 'desktop_stream_stop', payload,
+      })).resolves.toEqual({ delivered: false, reason: 'delivery_failed' });
+      expect(claimPendingCommandForDelivery).toHaveBeenCalled();
+      expect(releaseClaimedCommandDelivery).toHaveBeenCalledWith(commandId, executedAt);
+    });
+
+    it('rearm: an absent lease is agent_disconnected without a claim', async () => {
+      rigRearm();
+      vi.mocked(agentReachability).mockResolvedValueOnce('absent');
+
+      await expect(rearmIdempotentCommandForDelivery({
+        commandId, deviceId, type: 'desktop_stream_stop', payload,
+      })).resolves.toEqual({ delivered: false, reason: 'agent_disconnected' });
+      expect(claimPendingCommandForDelivery).not.toHaveBeenCalled();
+    });
   });
 
   it('should queue a command for a device', async () => {
@@ -1104,6 +1243,7 @@ describe('command queue service', () => {
         status: 'claimed',
         id: 'cmd-x',
         executedAt: new Date(),
+        agentId: 'agent-1',
       });
       vi.mocked(releaseClaimedCommandDelivery).mockResolvedValue(undefined);
     }
@@ -1200,6 +1340,128 @@ describe('command queue service', () => {
       expect(result.error).toBe(DEVICE_UNREACHABLE_ERROR);
     });
 
+    describe('relay facade outcomes (#4142 W1.T3)', () => {
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it('interactive command does not fast-fail when the agent is connected to another instance', async () => {
+        setupOnlineDeviceMocks();
+        vi.mocked(isAgentConnected).mockReturnValue(false); // no local socket
+        vi.mocked(agentReachability).mockResolvedValueOnce('connected'); // a lease on another instance
+        vi.mocked(dispatchCommandToAgent).mockResolvedValueOnce({ status: 'sent', via: 'relay' });
+
+        const result = await executeCommand('dev-online', CommandTypes.FILE_LIST, { path: '/' });
+
+        expect(result.error).not.toBe(DEVICE_UNREACHABLE_ERROR);
+        expect(result.status).toBe('completed');
+        expect(dispatchCommandToAgent).toHaveBeenCalledTimes(1);
+        expect(releaseClaimedCommandDelivery).not.toHaveBeenCalled();
+      });
+
+      it('interactive command does not fast-fail when presence cannot be read', async () => {
+        setupOnlineDeviceMocks();
+        vi.mocked(isAgentConnected).mockReturnValue(false);
+        vi.mocked(agentReachability).mockResolvedValueOnce('unknown');
+        vi.mocked(dispatchCommandToAgent).mockResolvedValueOnce({ status: 'sent', via: 'relay' });
+
+        const result = await executeCommand('dev-online', CommandTypes.FILE_LIST, { path: '/' });
+
+        expect(db.insert).toHaveBeenCalled();
+        expect(result.status).toBe('completed');
+      });
+
+      it('retries only on offline and stops on indeterminate without releasing', async () => {
+        vi.useFakeTimers();
+        setupOnlineDeviceMocks();
+        vi.mocked(isAgentConnected).mockReturnValue(true);
+        vi.mocked(dispatchCommandToAgent)
+          .mockResolvedValueOnce({ status: 'offline' })
+          .mockResolvedValueOnce({ status: 'indeterminate' });
+
+        const promise = executeCommand('dev-online', CommandTypes.FILE_LIST, { path: '/' });
+        await vi.advanceTimersByTimeAsync(2000);
+        const result = await promise;
+
+        expect(dispatchCommandToAgent).toHaveBeenCalledTimes(2);
+        // Same command id on both attempts.
+        const ids = vi.mocked(dispatchCommandToAgent).mock.calls.map((c) => (c[1] as { id: string }).id);
+        expect(new Set(ids).size).toBe(1);
+        expect(releaseClaimedCommandDelivery).not.toHaveBeenCalled();
+        expect(result.status).toBe('completed');
+      });
+
+      it('indeterminate on an interactive command polls instead of returning DEVICE_UNREACHABLE_ERROR', async () => {
+        setupOnlineDeviceMocks();
+        vi.mocked(isAgentConnected).mockReturnValue(true);
+        vi.mocked(dispatchCommandToAgent).mockResolvedValueOnce({ status: 'indeterminate' });
+
+        const result = await executeCommand('dev-online', CommandTypes.FILE_LIST, { path: '/' });
+
+        expect(dispatchCommandToAgent).toHaveBeenCalledTimes(1);
+        expect(releaseClaimedCommandDelivery).not.toHaveBeenCalled();
+        expect(result.error).not.toBe(DEVICE_UNREACHABLE_ERROR);
+        expect(result.status).toBe('completed');
+      });
+
+      it('a rejected dispatch is uncertain: claim kept, no retry, polls', async () => {
+        setupOnlineDeviceMocks();
+        vi.mocked(isAgentConnected).mockReturnValue(true);
+        vi.mocked(dispatchCommandToAgent).mockRejectedValueOnce(new Error('facade contract violated'));
+
+        const result = await executeCommand('dev-online', CommandTypes.FILE_LIST, { path: '/' });
+
+        expect(dispatchCommandToAgent).toHaveBeenCalledTimes(1);
+        expect(releaseClaimedCommandDelivery).not.toHaveBeenCalled();
+        expect(result.status).toBe('completed');
+      });
+
+      it.each(['expired', 'owner_mismatch'] as const)('%s is final: one attempt, one release', async (status) => {
+        setupOnlineDeviceMocks();
+        vi.mocked(isAgentConnected).mockReturnValue(true);
+        vi.mocked(dispatchCommandToAgent).mockResolvedValueOnce({ status });
+
+        await executeCommand('dev-online', CommandTypes.FILE_LIST, { path: '/' });
+
+        expect(dispatchCommandToAgent).toHaveBeenCalledTimes(1);
+        expect(releaseClaimedCommandDelivery).toHaveBeenCalledTimes(1);
+      });
+
+      it('infrastructure_error releases once and does not retry', async () => {
+        setupOnlineDeviceMocks();
+        vi.mocked(isAgentConnected).mockReturnValue(true);
+        vi.mocked(dispatchCommandToAgent).mockResolvedValueOnce({
+          status: 'infrastructure_error', message: 'relay refused inside a held DB context',
+        });
+
+        const result = await executeCommand('dev-online', CommandTypes.FILE_LIST, { path: '/' });
+
+        expect(dispatchCommandToAgent).toHaveBeenCalledTimes(1);
+        expect(releaseClaimedCommandDelivery).toHaveBeenCalledTimes(1);
+        expect(result.status).toBe('failed');
+        expect(result.error).toBe(DEVICE_UNREACHABLE_ERROR);
+      });
+    });
+
+    it('pushes every attempt to the agent id read in the claim, not the device row read before it (#8318 §6.4)', async () => {
+      vi.useFakeTimers();
+      setupOnlineDeviceMocks(); // the device row read before the claim says agent-1
+      vi.mocked(isAgentConnected).mockReturnValue(true);
+      // A reattach / re-enroll committed between that read and the claim.
+      vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({
+        status: 'claimed', id: 'cmd-x', executedAt: new Date(), agentId: 'agent-after-reattach',
+      });
+      vi.mocked(sendCommandToAgent).mockReturnValueOnce(false).mockReturnValueOnce(true);
+
+      const promise = executeCommand('dev-online', CommandTypes.FILE_LIST, { path: '/' });
+      await vi.advanceTimersByTimeAsync(2000);
+      const result = await promise;
+
+      expect(sendCommandToAgent).toHaveBeenCalledTimes(2);
+      for (const call of vi.mocked(sendCommandToAgent).mock.calls) expect(call[0]).toBe('agent-after-reattach');
+      expect(result.status).toBe('completed');
+    });
+
     it('skips dispatch entirely when the push claim reports not_claimable', async () => {
       // Simulates another worker (or the heartbeat path) having already
       // claimed the command. The send path must be a no-op so we don't
@@ -1247,6 +1509,7 @@ describe('command queue service', () => {
       const result = await queueCommandForExecution('dev-online', CommandTypes.FILE_LIST, { path: '/' });
 
       expect(result.error).toBe(cancelledCommandError('requester_inactive'));
+      expect(result.refusal).toBe('cancelled');
       expect(result.command?.status).toBe('cancelled');
       expect(sendCommandToAgent).not.toHaveBeenCalled();
     });
@@ -1730,6 +1993,33 @@ describe('command queue service', () => {
       expect(insertValues).toHaveBeenCalled();
     });
 
+    it("gates on the WATCHDOG's own reported edition, read by the device SELECT (#4297)", async () => {
+      // Main agent silent inside the check band — the agent_edition proxy
+      // alone would refuse — but the watchdog, the binary that downloads,
+      // reported its own edition.
+      const insertValues = mockDevice({
+        ...strandedDevice,
+        agentEdition: null,
+        agentVersion: '0.105.1',
+        watchdogVersion: '0.108.0',
+        watchdogEdition: 'self-host',
+      });
+
+      const result = await executeCommand(
+        'dev-stranded',
+        'update_agent',
+        { version: '0.109.0' },
+        { userId: 'user-1', targetRole: 'watchdog' },
+      );
+
+      expect(result.status).toBe('completed');
+      expect(insertValues).toHaveBeenCalled();
+      // The real SELECT must project the column, or the gate silently reads
+      // undefined and drops back to the proxy on every dispatch.
+      const projection = vi.mocked(db.select).mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+      expect(projection).toHaveProperty('watchdogEdition');
+    });
+
     it('allows update_agent for a pre-check build (< 0.105.0) with no reported edition', async () => {
       const insertValues = mockDevice({ ...strandedDevice, agentVersion: '0.104.0', watchdogVersion: '0.104.0' });
 
@@ -1989,6 +2279,7 @@ describe('command queue service', () => {
 
       // Matches the adjacent "Device not found" contract — no info leak.
       expect(result.error).toBe('Device not found');
+      expect(result.refusal).toBe('device_not_found');
       // Must not have proceeded to queue the command.
       expect(db.insert).not.toHaveBeenCalled();
     });
@@ -2006,6 +2297,7 @@ describe('command queue service', () => {
       );
 
       expect(result.error).toBe('Device is offline, cannot execute command');
+      expect(result.refusal).toBe('device_offline');
     });
 
     it('is unaffected when expectedOrgId is omitted (existing callers)', async () => {
@@ -2445,6 +2737,28 @@ describe('ai.command.executed (#5022 W01)', () => {
     );
   });
 
+  // Tool catalog W04 (#5219), Decision 16: a flow-origin command is audited as
+  // system automation carrying its run — never as the flow's synthetic user id
+  // with actorType 'user', and never as an AI decision.
+  it('audits a flow origin as system automation with its run id', async () => {
+    mockQueueCommandDb();
+
+    await queueCommand('dev-1', 'get_processes', {}, 'flow-1', {
+      aiOrigin: { kind: 'flow', flowRunId: 'flow-run-1' },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(createAuditLogAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'ai.command.executed',
+        actorType: 'system',
+        actorId: '00000000-0000-0000-0000-000000000000',
+        initiatedBy: 'automation',
+        details: expect.objectContaining({ aiInitiatorKind: 'flow', flowRunId: 'flow-run-1' }),
+      }),
+    );
+  });
+
   it('writes no ai.command.executed row when there is no AI origin', async () => {
     mockQueueCommandDb();
 
@@ -2554,5 +2868,141 @@ describe('ai.command.executed — the executeCommand path (#5022 W01)', () => {
 
     const actions = vi.mocked(createAuditLogAsync).mock.calls.map((c) => c[0]!.action);
     expect(actions).not.toContain('ai.command.executed');
+  });
+});
+
+// #9234 step 1 — the device-page "Restart agent" button. Same precheck and the
+// same row as executeCommand(..., { targetRole: 'watchdog' }), but it returns as
+// soon as the row exists: the watchdog polls every ~30s, so a request that
+// waited (and, on timeout, marked the row failed) would cancel restarts the
+// watchdog had not yet had a chance to claim.
+describe('enqueueWatchdogCommand', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    parkedDeviceIds.clear();
+    partnerTrustCommandMocks.assertDeviceExecuteAllowed.mockResolvedValue(undefined);
+  });
+
+  function mockDevice(device: Record<string, unknown>) {
+    const limit = vi.fn().mockResolvedValue([device]);
+    vi.mocked(db.select).mockImplementation(() => ({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({ limit }),
+      }),
+    }) as any);
+    return limit;
+  }
+
+  const silentDevice = {
+    id: 'dev-silent',
+    status: 'offline',
+    agentId: 'agent-silent',
+    orgId: 'org-1',
+    hostname: 'host-silent',
+    watchdogLastSeen: new Date(),
+  };
+
+  it('writes a watchdog-targeted row and returns without waiting for a result', async () => {
+    const deviceLookup = mockDevice(silentDevice);
+    const insertValues = vi.fn().mockReturnValue({
+      returning: vi.fn().mockResolvedValue([{ id: 'cmd-w', type: 'restart_agent', status: 'pending' }]),
+      execute: vi.fn().mockResolvedValue(undefined),
+    });
+    vi.mocked(db.insert).mockReturnValue({ values: insertValues } as any);
+    vi.mocked(isAgentConnected).mockReturnValue(true);
+
+    const result = await enqueueWatchdogCommand('dev-silent', 'restart_agent', {
+      userId: 'user-1',
+      expectedOrgId: 'org-1',
+    });
+
+    expect(result).toEqual({ status: 'queued', commandId: 'cmd-w' });
+    expect(insertValues).toHaveBeenCalledWith(
+      expect.objectContaining({
+        deviceId: 'dev-silent',
+        type: 'restart_agent',
+        payload: {},
+        status: 'pending',
+        targetRole: 'watchdog',
+      }),
+    );
+    // Same delivery clock as executeCommand's reject rows (no deliver_by).
+    expect(insertValues.mock.calls[0]![0]).toMatchObject({ deliverBy: null });
+    // No WS push, and no poll. Had it polled, every read returns the device
+    // row (no terminal status), so the call would spin until its 30s timeout
+    // (past this test's) and then write the timeout marker below.
+    expect(claimPendingCommandForDelivery).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+    expect(deviceLookup).toHaveBeenCalled();
+    // Never marks the row failed on a timeout it did not wait for.
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses before inserting when the watchdog is not reporting', async () => {
+    mockDevice({ ...silentDevice, watchdogLastSeen: new Date(Date.now() - 60 * 60 * 1000) });
+    const insertValues = vi.fn();
+    vi.mocked(db.insert).mockReturnValue({ values: insertValues } as any);
+
+    const result = await enqueueWatchdogCommand('dev-silent', 'start_agent', { userId: 'user-1' });
+
+    expect(result).toMatchObject({ status: 'failed', reason: 'refused' });
+    expect(result.status === 'failed' && result.error).toMatch(/watchdog is not reporting/i);
+    expect(insertValues).not.toHaveBeenCalled();
+  });
+
+  it('refuses a device parked in a holding org', async () => {
+    mockDevice(silentDevice);
+    parkedDeviceIds.add('dev-silent');
+    const insertValues = vi.fn();
+    vi.mocked(db.insert).mockReturnValue({ values: insertValues } as any);
+
+    const result = await enqueueWatchdogCommand('dev-silent', 'restart_agent', { userId: 'user-1' });
+
+    expect(result).toMatchObject({ status: 'failed', reason: 'refused' });
+    expect(insertValues).not.toHaveBeenCalled();
+  });
+
+  it('reports insert_failed when the INSERT returns no row', async () => {
+    mockDevice(silentDevice);
+    vi.mocked(db.insert).mockReturnValue({
+      values: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([]) }),
+    } as any);
+
+    const result = await enqueueWatchdogCommand('dev-silent', 'restart_agent', { userId: 'user-1' });
+
+    expect(result).toEqual({ status: 'failed', reason: 'insert_failed', error: 'Failed to create command' });
+  });
+
+  it('refuses a device that left the deciding organization', async () => {
+    mockDevice({ ...silentDevice, orgId: 'org-other' });
+    const insertValues = vi.fn();
+    vi.mocked(db.insert).mockReturnValue({ values: insertValues } as any);
+
+    const result = await enqueueWatchdogCommand('dev-silent', 'restart_agent', {
+      userId: 'user-1',
+      expectedOrgId: 'org-1',
+    });
+
+    expect(result).toEqual({ status: 'failed', reason: 'not_found', error: 'Device not found' });
+    expect(insertValues).not.toHaveBeenCalled();
+  });
+
+  it('carries a partner-trust denial back to the caller', async () => {
+    mockDevice(silentDevice);
+    partnerTrustCommandMocks.assertDeviceExecuteAllowed.mockRejectedValue(
+      new TrustDeniedError('TRUST_PROBATION', 'probation_default_deny', 'dev-silent', 'start_agent'),
+    );
+    const insertValues = vi.fn();
+    vi.mocked(db.insert).mockReturnValue({ values: insertValues } as any);
+
+    const result = await enqueueWatchdogCommand('dev-silent', 'start_agent', { userId: 'user-1' });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      reason: 'trust_denied',
+      error: 'TRUST_PROBATION',
+      trust: { capability: 'device_execute' },
+    });
+    expect(insertValues).not.toHaveBeenCalled();
   });
 });

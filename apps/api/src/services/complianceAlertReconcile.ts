@@ -1,3 +1,4 @@
+import { isDeviceOwned } from './alertOwner';
 /**
  * Closes compliance alerts whose rule no longer applies.
  *
@@ -44,7 +45,7 @@ import { resolveAlert, RESOLVABLE_ALERT_STATUSES } from './alertService';
 import { CONFIG_COMPLIANCE_ALERT_SOURCE, CONFIG_COMPLIANCE_RULE_PREFIX } from './configComplianceAlertBridge';
 import { resolveComplianceAssignmentForDevice, type ResolvedDeviceComplianceRules } from './featureConfigResolver';
 import { POLICY_ALERT_SOURCE, POLICY_RULE_PREFIX } from './policyAlertBridge';
-import { automationPolicyTargetedDeviceIds } from './policyEvaluationService';
+import { automationPolicyIsObserveOnly, automationPolicyTargetedDeviceIds } from './policyEvaluationService';
 import { captureException } from './sentry';
 import type { ComplianceAlertReconcileScope } from './complianceAlertReconcileTrigger';
 
@@ -89,7 +90,11 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-function toOpenAlert(row: { id: string; deviceId: string; context: unknown; overrideSettings: unknown }): OpenAlert {
+function toOpenAlert(row: { id: string; deviceId: string | null; context: unknown; overrideSettings: unknown }, scope: string): OpenAlert | null {
+  if (!isDeviceOwned(row)) {
+    reportFailure(`reading alert ${row.id} in ${scope}`, new Error(`alert_has_no_device: alert ${row.id} in ${scope}`));
+    return null;
+  }
   return { id: row.id, deviceId: row.deviceId, context: asRecord(row.context), overrideSettings: asRecord(row.overrideSettings) };
 }
 
@@ -208,15 +213,18 @@ async function reconcileConfigPolicyAlerts(
       .orderBy(asc(alerts.deviceId))
       .limit(pageSize));
 
-    for (const { deviceId } of page) {
+    for (const row of page) {
       try {
+        if (!isDeviceOwned(row)) throw new Error(`alert_has_no_device: configuration compliance page in scope ${JSON.stringify(scope)}`);
+        const { deviceId } = row;
         alertsResolved += await withSystemDbAccessContext(() => reconcileConfigDevice(deviceId, condition));
       } catch (error) {
-        reportFailure(`reconciling compliance alerts on device ${deviceId}`, error);
+        reportFailure(`reconciling compliance alerts on device ${row.deviceId} in scope ${JSON.stringify(scope)}`, error);
       }
     }
     devicesChecked += page.length;
-    if (page.length < pageSize) return { devicesChecked, alertsResolved, nextDeviceCursor: null };
+    // NULL devices sort last. Once seen, do not reset the keyset cursor and replay the page.
+    if (page.length < pageSize || page.some(row => row.deviceId === null)) return { devicesChecked, alertsResolved, nextDeviceCursor: null };
     cursor = page[page.length - 1]!.deviceId;
   }
   return { devicesChecked, alertsResolved, nextDeviceCursor: cursor };
@@ -228,7 +236,9 @@ async function reconcileConfigDevice(deviceId: string, condition: SQL): Promise<
     .select(openAlertColumns())
     .from(alerts)
     .innerJoin(alertRules, eq(alertRules.id, alerts.ruleId))
-    .where(and(condition, eq(alerts.deviceId, deviceId)))).map(toOpenAlert);
+    .where(and(condition, eq(alerts.deviceId, deviceId))))
+    .map(row => toOpenAlert(row, `configuration compliance device ${deviceId}`))
+    .filter((row): row is OpenAlert => row !== null);
   if (open.length === 0) return 0;
 
   const assignment = await resolveComplianceAssignmentForDevice(deviceId);
@@ -323,7 +333,9 @@ async function reconcileAutomationPolicy(policyId: string, condition: SQL): Prom
     .select(openAlertColumns())
     .from(alerts)
     .innerJoin(alertRules, eq(alertRules.id, alerts.ruleId))
-    .where(and(condition, sql`${alertRules.overrideSettings}->>'policyId' = ${policyId}`))).map(toOpenAlert);
+    .where(and(condition, sql`${alertRules.overrideSettings}->>'policyId' = ${policyId}`)))
+    .map(row => toOpenAlert(row, `automation policy ${policyId}`))
+    .filter((row): row is OpenAlert => row !== null);
   if (open.length === 0) return 0;
 
   const [policy] = await db.select().from(automationPolicies).where(eq(automationPolicies.id, policyId)).limit(1);
@@ -334,6 +346,9 @@ async function reconcileAutomationPolicy(policyId: string, condition: SQL): Prom
       ?? stringField(alert.overrideSettings, 'policyName') ?? 'unknown'}" was deleted`;
   } else if (!policy.enabled) {
     reasonFor = () => `automation policy "${policy.name}" is disabled`;
+  } else if (automationPolicyIsObserveOnly(policy)) {
+    // Observe-only (#8857): no policy.compliant will ever close these.
+    reasonFor = () => `automation policy "${policy.name}" targets tags, so its results raise no alerts`;
   } else {
     const targeted = await automationPolicyTargetedDeviceIds(policy, [...new Set(open.map((a) => a.deviceId))]);
     reasonFor = (alert) => (targeted.has(alert.deviceId)

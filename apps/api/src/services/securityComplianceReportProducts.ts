@@ -23,6 +23,8 @@ const PROVIDER_NAMES: Record<string, string> = {
   emsisoft: 'Emsisoft',
   webroot: 'Webroot',
   withsecure: 'WithSecure',
+  cylance: 'Aurora Endpoint Defense (CylancePROTECT)',
+  trend_micro: 'Trend Micro',
 };
 
 const EDR_PROVIDERS = new Set(['sentinelone', 'crowdstrike', 'elastic_defend']);

@@ -1,5 +1,5 @@
 import { and, eq, inArray, isNotNull, isNull, ne, or, sql, type SQL } from 'drizzle-orm';
-import { db, withSystemDbAccessContext } from '../db';
+import { db, hasDbAccessContext, withDbTransaction, withSystemDbAccessContext } from '../db';
 import {
   automationPolicies,
   automationPolicyCompliance,
@@ -24,6 +24,9 @@ import {
 import { isManagedAutomation } from './aiAgents/managedAutomation';
 import { canReadPartnerWideRows, type PartnerWideReadAuth } from './partnerWideAccess';
 import { resolveExecutionSafeGroupIds, auditRefusedExecutionGroups } from './executionTargetGating';
+import { writeAuditEvent, requestLikeFromSnapshot } from './auditEvents';
+import { sqlTextArray } from '../db/sqlValues';
+import { pgErrorCode } from '../utils/pgErrors';
 import { notHoldingOrgCondition, notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 
 export type EvaluationStatus = 'compliant' | 'non_compliant' | 'error';
@@ -401,6 +404,22 @@ function normalizeTargetConfig(targets: unknown): TargetConfig {
     groupIds: groupIds.length > 0 ? groupIds : targetType === 'groups' ? targetIds : [],
     tags: tags.length > 0 ? tags : targetType === 'tags' ? targetIds : [],
   };
+}
+
+/**
+ * Which branch of resolveTargetDevices picks the devices. The first non-empty
+ * list wins, so `{ deviceIds, tags }` targets the devices, not the tags.
+ * evaluatePolicy keys the observe-only rule for tag targets off this same
+ * function, so the two cannot disagree about what a policy targets.
+ */
+type TargetKind = 'devices' | 'sites' | 'groups' | 'tags' | 'all';
+
+function targetKindOf(targets: TargetConfig): TargetKind {
+  if (targets.deviceIds && targets.deviceIds.length > 0) return 'devices';
+  if (targets.siteIds && targets.siteIds.length > 0) return 'sites';
+  if (targets.groupIds && targets.groupIds.length > 0) return 'groups';
+  if (targets.tags && targets.tags.length > 0) return 'tags';
+  return 'all';
 }
 
 function parsePolicyRules(rules: unknown): ParsedRulesResult {
@@ -1136,6 +1155,69 @@ function extractScriptIdFromAction(action: unknown): string | null {
   return null;
 }
 
+/** The script ids a Job's actions run — the rule both remediation consumers match on. */
+export function remediationScriptIdsOf(actions: unknown): string[] {
+  if (!Array.isArray(actions)) return [];
+  const out: string[] = [];
+  for (const action of actions) {
+    const id = extractScriptIdFromAction(action);
+    if (id && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+/**
+ * Tool Catalog W06 (#5221), plan Decision 16 — whether a standalone Job is a
+ * compliance-remediation target ("S+R"), and so never converts in W06:
+ *
+ *  - an automation policy rule names it (`remediationAutomationId` /
+ *    `remediation.automationId`, as `extractRemediationAutomationId` reads), or
+ *  - it runs a script that is the remediation script of an automation policy
+ *    (consumer 1, `resolvePolicyRemediationAutomationIdForOrg`) or of a
+ *    config-policy compliance rule (consumer 2, `triggerConfigPolicyRemediation`)
+ *    anywhere in the Job's partner — both pick ANY enabled Job that runs the
+ *    script, so script match is the rule (`remediationScriptIdsOf`, the same
+ *    extraction they use).
+ *
+ * Conservative by construction: scoped to the partner, not to the exact
+ * device org a consumer would resolve for, so a false positive only keeps a
+ * Job on the legacy engine. System context; `database` is the caller's.
+ */
+export async function isComplianceRemediationTarget(
+  database: Pick<typeof db, 'execute'>,
+  automation: { id: string; orgId: string | null; partnerId: string | null; actions: unknown },
+  partnerId: string,
+): Promise<boolean> {
+  const hit = (rows: unknown) => Array.isArray(rows) && rows.length > 0;
+  const explicit = await database.execute(sql`
+    SELECT 1 AS hit FROM automation_policies p
+    WHERE (p.rules @> ${JSON.stringify([{ remediationAutomationId: automation.id }])}::jsonb
+        OR p.rules @> ${JSON.stringify([{ remediation: { automationId: automation.id } }])}::jsonb)
+    LIMIT 1`);
+  if (hit(explicit)) return true;
+
+  const scriptIds = remediationScriptIdsOf(automation.actions);
+  if (scriptIds.length === 0) return false;
+
+  const byPolicy = await database.execute(sql`
+    SELECT 1 AS hit FROM automation_policies p
+    LEFT JOIN organizations o ON o.id = p.org_id
+    WHERE p.remediation_script_id::text = ANY(${sqlTextArray(scriptIds)})
+      AND (p.partner_id = ${partnerId}::uuid OR o.partner_id = ${partnerId}::uuid)
+    LIMIT 1`);
+  if (hit(byPolicy)) return true;
+
+  const byConfigRule = await database.execute(sql`
+    SELECT 1 AS hit FROM config_policy_compliance_rules r
+    JOIN config_policy_feature_links l ON l.id = r.feature_link_id
+    JOIN configuration_policies cp ON cp.id = l.config_policy_id
+    LEFT JOIN organizations o ON o.id = cp.org_id
+    WHERE r.remediation_script_id::text = ANY(${sqlTextArray(scriptIds)})
+      AND (cp.partner_id = ${partnerId}::uuid OR o.partner_id = ${partnerId}::uuid)
+    LIMIT 1`);
+  return hit(byConfigRule);
+}
+
 export async function resolvePolicyRemediationAutomationId(
   policy: PolicyRow,
   auth?: PartnerWideReadAuth | null
@@ -1299,8 +1381,9 @@ async function resolveTargetDevices(policy: PolicyRow, options: ResolveTargetDev
     return [];
   }
   const scopeCondition = options.deviceIds ? and(ownerScope, inArray(devices.id, options.deviceIds))! : ownerScope;
+  const kind = targetKindOf(targets);
 
-  if (targets.deviceIds && targets.deviceIds.length > 0) {
+  if (kind === 'devices' && targets.deviceIds) {
     return db
       .select(TARGET_DEVICE_COLUMNS)
       .from(devices)
@@ -1312,7 +1395,7 @@ async function resolveTargetDevices(policy: PolicyRow, options: ResolveTargetDev
       );
   }
 
-  if (targets.siteIds && targets.siteIds.length > 0) {
+  if (kind === 'sites' && targets.siteIds) {
     return db
       .select(TARGET_DEVICE_COLUMNS)
       .from(devices)
@@ -1324,7 +1407,7 @@ async function resolveTargetDevices(policy: PolicyRow, options: ResolveTargetDev
       );
   }
 
-  if (targets.groupIds && targets.groupIds.length > 0) {
+  if (kind === 'groups' && targets.groupIds) {
     // Field-provenance tiering — this resolver feeds
     // `triggerRemediationAutomation` (dispatches an automation run for every
     // non-compliant device in the target set), always execution-bearing. A
@@ -1352,14 +1435,18 @@ async function resolveTargetDevices(policy: PolicyRow, options: ResolveTargetDev
       );
   }
 
-  if (targets.tags && targets.tags.length > 0) {
+  if (kind === 'tags' && targets.tags) {
+    // A bare `${targets.tags}` rendered as `&& ($1)` / `&& ($1, $2)`, which
+    // Postgres rejects ("malformed array literal" / "operator does not exist:
+    // text[] && record"), so every tag-targeted policy threw (#8857). The
+    // results this branch feeds are observe-only — see evaluatePolicy.
     return db
       .select(TARGET_DEVICE_COLUMNS)
       .from(devices)
       .where(
         and(
           scopeCondition,
-          sql<boolean>`${devices.tags} && ${targets.tags}`
+          sql<boolean>`${devices.tags} && ${sqlTextArray(targets.tags)}`
         )
       );
   }
@@ -1376,6 +1463,17 @@ async function resolveTargetDevices(policy: PolicyRow, options: ResolveTargetDev
  * reconcile uses it: a device the policy no longer targets is never evaluated
  * again, so nothing else would close the alert it raised there.
  */
+/**
+ * Tag-targeted automation policies are observe-only (#8857): their evaluation
+ * dispatches no remediation and publishes no policy.* event — see evaluatePolicy.
+ * The compliance-alert reconcile uses it too: such a policy publishes no
+ * policy.compliant, so an alert raised before it was retargeted to tags would
+ * otherwise never close.
+ */
+export function automationPolicyIsObserveOnly(policy: Pick<PolicyRow, 'targets'>): boolean {
+  return targetKindOf(normalizeTargetConfig(policy.targets)) === 'tags';
+}
+
 export async function automationPolicyTargetedDeviceIds(policy: PolicyRow, deviceIds: string[]): Promise<Set<string>> {
   const targeted = await resolveTargetDevices(policy, { deviceIds, auditRefusedGroups: false });
   return new Set(targeted.map((device) => device.id));
@@ -1511,7 +1609,16 @@ export async function evaluatePolicy(
   const source = options.source ?? 'policy-evaluation-service';
   const deferred: DeferredRemediationEnqueues | undefined = options.deferEnqueue ? [] : undefined;
   const deferredEvents: DeferredPolicyEvent[] | undefined = options.deferEnqueue ? [] : undefined;
-  const requestRemediation = options.requestRemediation ?? true;
+  // Tag-targeted results are observe-only (#8857). Tags are writable by
+  // `devices:write` API keys, which a script on the device can hold, so a
+  // device can tag itself into the target set — the reason tags are refused as
+  // execution-target group rules (executionTargetGating.ts). The evaluation
+  // still runs and its compliance rows are written, but no remediation is
+  // dispatched and no policy.* event is published: an event-triggered
+  // automation runs on the event's device, and the alert the policy alert
+  // bridge raises from policy.violation can trigger automations and AI agents.
+  const observeOnly = automationPolicyIsObserveOnly(policy);
+  const requestRemediation = !observeOnly && (options.requestRemediation ?? true);
   const wantsRemediation = requestRemediation && policy.enforcement === 'enforce';
 
   // Remediation automations are anchored per DEVICE org (org-owned rows plus
@@ -1695,12 +1802,38 @@ export async function evaluatePolicy(
       remediationRunId,
     });
 
+    if (observeOnly) {
+      continue;
+    }
     const events = policyEventsFor(policy, device, status, existing?.status ?? null, remediationRunId, source, checkedAt);
     if (deferredEvents) {
       deferredEvents.push(...events);
     } else {
       await publishPolicyEventsInOrder(events);
     }
+  }
+
+  const nonCompliantDevices = evaluationResults.filter((result) => result.status === 'non_compliant').length;
+  if (observeOnly && nonCompliantDevices > 0) {
+    // Same action string as the group gate, so one audit query finds every
+    // execution refused for a device-writable target field.
+    writeAuditEvent(requestLikeFromSnapshot({}), {
+      orgId: policy.orgId,
+      // A partner-wide policy (orgId NULL) audits to its partner; with no
+      // request auth to derive it from, the row would otherwise be platform-wide.
+      partnerId: policy.orgId ? undefined : (policy.partnerId ?? null),
+      action: 'policy_evaluation.execution_target_refused_agent_reported_fields',
+      resourceType: 'automation_policy',
+      resourceId: policy.id,
+      resourceName: policy.name,
+      result: 'success',
+      actorType: 'system',
+      details: {
+        refusedFields: ['tags'],
+        nonCompliantDevices,
+        suppressed: ['remediation', 'policy_events'],
+      },
+    });
   }
 
   await db
@@ -1718,7 +1851,7 @@ export async function evaluatePolicy(
     results: evaluationResults,
     summary: {
       compliant: evaluationResults.filter((result) => result.status === 'compliant').length,
-      non_compliant: evaluationResults.filter((result) => result.status === 'non_compliant').length,
+      non_compliant: nonCompliantDevices,
     },
     evaluatedAt: new Date().toISOString(),
     ...afterCommitOf(deferred, deferredEvents),
@@ -1744,6 +1877,15 @@ type EvaluateConfigPolicyComplianceOptions = {
   deferred?: DeferredRemediationEnqueues;
   /** Collects the policy.* events for the caller's `afterCommit` instead of publishing them (see `DeferredPolicyEvent`). */
   deferredEvents?: DeferredPolicyEvent[];
+  /**
+   * #10401 — when set, each rule set runs in its own savepoint: a rule set that
+   * throws rolls back alone, is reported here, and the device's other rule
+   * sets still commit. Without it a rule-set error propagates to the caller.
+   */
+  onRuleSetError?: (
+    complianceRule: typeof configPolicyComplianceRules.$inferSelect,
+    error: unknown,
+  ) => void;
 };
 
 export function __isComplianceCheckDue(
@@ -1919,7 +2061,14 @@ export async function evaluateDeviceComplianceFromConfigPolicy(
 
   const results: ConfigPolicyEvaluationResult[] = [];
 
-  for (const complianceRule of complianceRules) {
+  // One rule set: its upsert, its remediation and its policy.* events. A
+  // closure rather than a helper so the remediation reader stays inside this
+  // entry point (retiredSourceReaders.contract.test.ts).
+  const evaluateRuleSet = async (
+    complianceRule: (typeof complianceRules)[number],
+    deferred: DeferredRemediationEnqueues | undefined,
+    deferredEvents: DeferredPolicyEvent[] | undefined,
+  ): Promise<ConfigPolicyEvaluationResult> => {
     const { status, details: ruleDetails } = evaluateConfigPolicyComplianceRule(
       complianceRule,
       deviceId,
@@ -1974,7 +2123,7 @@ export async function evaluateDeviceComplianceFromConfigPolicy(
         if (rem.type === 'script' && typeof rem.scriptId === 'string') {
           // Bridge: pass scriptId via legacy field until triggerConfigPolicyRemediation is refactored
           const tempRule = { ...complianceRule, remediationScriptId: rem.scriptId };
-          const triggered = await triggerConfigPolicyRemediation(tempRule, targetDevice, options.deferred);
+          const triggered = await triggerConfigPolicyRemediation(tempRule, targetDevice, deferred);
           if (triggered) remediationTriggered = true;
         } else if (rem.type === 'software_deploy' && typeof rem.catalogId === 'string') {
           console.warn(`[ConfigPolicyCompliance] Software deploy remediation for rule="${complianceRule.name}" catalogId=${rem.catalogId} on device=${targetDevice.id} — not yet implemented`);
@@ -1983,18 +2132,9 @@ export async function evaluateDeviceComplianceFromConfigPolicy(
 
       // Fallback: check legacy remediationScriptId on the rule set
       if (!remediationTriggered && complianceRule.remediationScriptId) {
-        remediationTriggered = await triggerConfigPolicyRemediation(complianceRule, targetDevice, options.deferred);
+        remediationTriggered = await triggerConfigPolicyRemediation(complianceRule, targetDevice, deferred);
       }
     }
-
-    results.push({
-      deviceId,
-      complianceRuleId: complianceRule.id,
-      complianceRuleName: complianceRule.name,
-      status,
-      enforcementLevel: complianceRule.enforcementLevel,
-      remediationTriggered,
-    });
 
     const eventPayload = {
       configPolicyComplianceRuleId: complianceRule.id,
@@ -2016,10 +2156,51 @@ export async function evaluateDeviceComplianceFromConfigPolicy(
         source,
       },
     ];
-    if (options.deferredEvents) {
-      options.deferredEvents.push(...events);
+    if (deferredEvents) {
+      deferredEvents.push(...events);
     } else {
       await publishPolicyEventsInOrder(events);
+    }
+
+    return {
+      deviceId,
+      complianceRuleId: complianceRule.id,
+      complianceRuleName: complianceRule.name,
+      status,
+      enforcementLevel: complianceRule.enforcementLevel,
+      remediationTriggered,
+    };
+  };
+
+  const { onRuleSetError } = options;
+  for (const complianceRule of complianceRules) {
+    if (!onRuleSetError) {
+      results.push(await evaluateRuleSet(complianceRule, options.deferred, options.deferredEvents));
+      continue;
+    }
+
+    // #10401 — isolated: the rule set runs in its own savepoint and keeps its
+    // remediation runs and events in its own buffers until the savepoint is
+    // released, so a rule set that fails rolls back alone and hands on nothing.
+    const ruleDeferred: DeferredRemediationEnqueues = [];
+    const ruleEvents: DeferredPolicyEvent[] = [];
+    let result: ConfigPolicyEvaluationResult;
+    try {
+      result = await inSavepoint(() => evaluateRuleSet(complianceRule, ruleDeferred, ruleEvents));
+    } catch (error) {
+      onRuleSetError(complianceRule, error);
+      continue;
+    }
+    results.push(result);
+    if (options.deferred) {
+      options.deferred.push(...ruleDeferred);
+    } else {
+      for (const run of ruleDeferred) await enqueueRemediationRun(run.runId, run.deviceId);
+    }
+    if (options.deferredEvents) {
+      options.deferredEvents.push(...ruleEvents);
+    } else {
+      await publishPolicyEventsInOrder(ruleEvents);
     }
   }
 
@@ -2235,14 +2416,23 @@ export async function scanAndEvaluateConfigPolicyCompliance(
   options: { deferEnqueue?: boolean } = {}
 ): Promise<{
   rulesScanned: number;
+  /** Devices the scan attempted, including any in `devicesFailed`. */
   devicesEvaluated: number;
+  /**
+   * Devices that produced no result because of a failure: the device's own
+   * evaluation threw and rolled back, or every rule set it attempted failed
+   * (#10401).
+   */
+  devicesFailed: number;
+  /** Rule sets whose evaluation failed and rolled back alone (#10401). */
+  ruleSetsFailed: number;
   results: ConfigPolicyEvaluationResult[];
 } & RemediationAfterCommit> {
   const deferred: DeferredRemediationEnqueues | undefined = options.deferEnqueue ? [] : undefined;
   const deferredEvents: DeferredPolicyEvent[] | undefined = options.deferEnqueue ? [] : undefined;
   const dueChecks = await scanDueComplianceChecks();
   if (dueChecks.length === 0) {
-    return { rulesScanned: 0, devicesEvaluated: 0, results: [] };
+    return { rulesScanned: 0, devicesEvaluated: 0, devicesFailed: 0, ruleSetsFailed: 0, results: [] };
   }
 
   const nowMs = Date.now();
@@ -2295,23 +2485,119 @@ export async function scanAndEvaluateConfigPolicyCompliance(
 
   const allDeviceIds = Array.from(dueRuleIdsByDeviceId.keys());
   const allResults: ConfigPolicyEvaluationResult[] = [];
+  const failures: unknown[] = [];
+  let devicesFailed = 0;
+  let ruleSetsFailed = 0;
 
   for (const deviceId of allDeviceIds) {
+    // #10401 — the worker runs this whole scan in ONE system transaction. A
+    // statement error in one evaluation aborts that transaction, and
+    // postgres.js re-throws it at COMMIT even though a catch swallowed it:
+    // nothing the scan wrote persists, no policy.* event goes out, and the next
+    // scan hits the same error. Each device runs in its own savepoint, and each
+    // of its rule sets in a savepoint nested inside that one
+    // (`onRuleSetError`). A failed rule set rolls back alone and the device's
+    // other rule sets commit; a failure outside any rule set (loading the
+    // device or its telemetry) rolls back the device alone. Each level keeps
+    // its remediation runs and events in its own buffers until its savepoint
+    // is released, so a failure hands on nothing. The device buffers exist
+    // even without deferEnqueue: a later rule set's failure can still roll
+    // back the device, so nothing goes out before the device's savepoint is
+    // released.
+    const deviceDeferred: DeferredRemediationEnqueues = [];
+    const deviceEvents: DeferredPolicyEvent[] = [];
+    let deviceRuleSetFailures = 0;
+    let handOnNow: (() => Promise<void>) | undefined;
     try {
       const dueRuleIds = Array.from(dueRuleIdsByDeviceId.get(deviceId) ?? []);
-      const deviceResults = await evaluateDeviceComplianceFromConfigPolicy(deviceId, { ruleIds: dueRuleIds, deferred, deferredEvents });
+      const deviceResults = await inSavepoint(() => evaluateDeviceComplianceFromConfigPolicy(
+        deviceId,
+        {
+          ruleIds: dueRuleIds,
+          deferred: deviceDeferred,
+          deferredEvents: deviceEvents,
+          onRuleSetError: (complianceRule, error) => {
+            deviceRuleSetFailures++;
+            failures.push(error);
+            console.error(
+              `[ConfigPolicyCompliance] Failed to evaluate rule set ${complianceRule.id} on device ${deviceId}:`,
+              error,
+            );
+            reportScanFailure(error, 'rule_set');
+          },
+        },
+      ));
       allResults.push(...deviceResults);
+      if (deferred && deferredEvents) {
+        deferred.push(...deviceDeferred);
+        deferredEvents.push(...deviceEvents);
+      } else {
+        handOnNow = policyEvaluationAfterCommit(deviceDeferred, deviceEvents);
+      }
+      ruleSetsFailed += deviceRuleSetFailures;
+      // Every rule set it attempted failed: nothing about this device moved.
+      if (deviceRuleSetFailures > 0 && deviceResults.length === 0) devicesFailed++;
     } catch (error) {
+      // The device's savepoint rolled back, rule sets that succeeded inside it
+      // included; any rule-set failures it recorded are still failures.
+      ruleSetsFailed += deviceRuleSetFailures;
+      devicesFailed++;
+      failures.push(error);
       console.error(`[ConfigPolicyCompliance] Failed to evaluate device ${deviceId}:`, error);
+      reportScanFailure(error, 'device');
+    }
+    // Without deferEnqueue: the device's savepoint has been released, so its
+    // runs and events go out now. Outside the try, and it never rejects, so a
+    // failed enqueue cannot mark a device whose writes stand as failed.
+    if (handOnNow) await handOnNow();
+  }
+
+  if (failures.length > 0) {
+    console.error(
+      `[ConfigPolicyCompliance] ${devicesFailed} of ${allDeviceIds.length} device(s) and ${ruleSetsFailed} rule set(s) failed this scan`,
+    );
+    // Every evaluation failing is not one bad device or rule set: it is a fault
+    // the whole scan shares (schema drift, a broken query). Fail the job, as it
+    // did before the savepoints, instead of committing an empty scan that looks
+    // healthy. A device counts as failed when it threw outright or when every
+    // rule set it attempted failed.
+    if (devicesFailed === allDeviceIds.length) {
+      throw new AggregateError(
+        failures,
+        `[ConfigPolicyCompliance] every compliance evaluation failed (${devicesFailed} device(s), ${ruleSetsFailed} rule set(s))`,
+      );
     }
   }
 
   return {
     rulesScanned: dueChecks.length,
     devicesEvaluated: allDeviceIds.length,
+    devicesFailed,
+    ruleSetsFailed,
     results: allResults,
     ...afterCommitOf(deferred, deferredEvents),
   };
+}
+
+/**
+ * A failed evaluation is retried on every scan, so its Sentry events group
+ * under a bounded fingerprint (SQLSTATE, never an id) rather than one per
+ * device or rule set. `stage` is a tag, not part of the fingerprint.
+ */
+function reportScanFailure(error: unknown, stage: 'device' | 'rule_set'): void {
+  captureException(error, undefined, { job: 'config-policy-compliance-scan', stage }, {
+    fingerprint: ['config-policy-compliance-device', pgErrorCode(error) ?? 'unknown'],
+  });
+}
+
+/**
+ * Runs `fn` in a driver-owned savepoint when a transaction is open (the
+ * compliance scan nests one per device and one per rule set inside it). With
+ * no DB context each statement autocommits on its own, so a failure cannot
+ * reach any other evaluation and there is nothing to isolate.
+ */
+function inSavepoint<T>(fn: () => Promise<T>): Promise<T> {
+  return hasDbAccessContext() ? withDbTransaction(fn) : fn();
 }
 
 /** `{ afterCommit }` for an evaluation run under `deferEnqueue`, or `{}`. */

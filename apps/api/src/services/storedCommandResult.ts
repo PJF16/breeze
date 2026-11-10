@@ -1,8 +1,9 @@
 import type { z } from 'zod';
-import type { commandResultSchema } from '../routes/agents/schemas';
+import { parseRestorePointOutcome, type commandResultSchema } from '../routes/agents/schemas';
 import { redactSecretsFromOutput } from './secretRedaction';
 import { isRawStdoutArtifactCommand } from './commandAudit';
 import { collapseAgentReportedTimeoutStatus } from './commandResultAcceptance';
+import { installerSecretsFromPayload, scrubInstallerSecrets } from './installerSecretScrub';
 
 /**
  * The object persisted into `device_commands.result` for an agent command
@@ -20,7 +21,12 @@ export function buildStoredCommandResult(
   commandType: string,
   result: z.infer<typeof commandResultSchema>,
   stdout: string | undefined,
+  /** The command's persisted payload: a framework-provider install scrubs its link and file name (#8170). */
+  commandPayload?: unknown,
 ) {
+  const installerSecrets = installerSecretsFromPayload(commandPayload);
+  const stored = <T extends string | null | undefined>(text: T): T | string =>
+    installerSecrets && text != null ? scrubInstallerSecrets(text, installerSecrets) : text;
   // Defense-in-depth: strip full PEM private-key blocks from agent output
   // BEFORE it is persisted and later shown to scripts:read users. Pre-update
   // agents don't redact server-side-visible output, so we redact here.
@@ -37,14 +43,25 @@ export function buildStoredCommandResult(
     // server's own reopen marker.
     status: collapseAgentReportedTimeoutStatus(result.status),
     exitCode: result.exitCode,
-    stdout: stdout != null && !skipStdoutRedaction ? redactSecretsFromOutput(stdout) : stdout,
-    stderr: result.stderr != null ? redactSecretsFromOutput(result.stderr) : result.stderr,
+    stdout: stored(stdout != null && !skipStdoutRedaction ? redactSecretsFromOutput(stdout) : stdout),
+    stderr: stored(result.stderr != null ? redactSecretsFromOutput(result.stderr) : result.stderr),
     durationMs: result.durationMs,
-    error: result.error != null
+    error: stored(result.error != null
       ? redactSecretsFromOutput(result.error)
-      : result.status === 'timeout' ? 'Agent reported a timeout' : result.error,
+      : result.status === 'timeout' ? 'Agent reported a timeout' : result.error),
     // A machine code from a closed vocabulary, not free text: nothing to
     // redact. Absent for agents that predate it.
     errorCode: result.errorCode,
+    // #4609 W06: the validated checkpoint outcome, only when the agent sent
+    // one and it parsed (unknown keys stripped; an invalid outcome is not
+    // persisted). Its free-text message/description are redacted by the parse
+    // (classifyRestorePointOutcome). Absent key -> nothing added, so results from every
+    // agent shipped to date store exactly what they did before.
+    ...(result.restorePoint !== undefined ? restorePointStoredField(result.restorePoint) : {}),
   };
+}
+
+function restorePointStoredField(raw: unknown) {
+  const outcome = parseRestorePointOutcome(raw);
+  return outcome ? { restorePoint: outcome } : {};
 }

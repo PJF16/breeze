@@ -25,6 +25,20 @@ describe('policyBaselineDefaults', () => {
     expect(entry.inlineSettings).toEqual({ uacInterceptionEnabled: false });
   });
 
+  it('describes containment fixed defaults without claiming policy enforcement', () => {
+    expect(getPolicyBaselineDefaults().find(entry => entry.featureType === 'containment')).toEqual({
+      featureType: 'containment', label: 'Containment', applied: false, inlineSettings: null,
+      behavior: 'Not enforced — isolation uses the fixed defaults: 72 h TTL, remote relay on, no extra permits, no dead-man.',
+    });
+  });
+
+  it('describes vendor updates as never running without a policy (#11065)', () => {
+    expect(getPolicyBaselineDefaults().find(entry => entry.featureType === 'oem_updates')).toEqual({
+      featureType: 'oem_updates', label: 'Vendor Updates', applied: false, inlineSettings: null,
+      behavior: 'Not enforced — no vendor (Dell, Surface, HP, Lenovo) updates are scheduled for these devices.',
+    });
+  });
+
   it('marks patch (and other unenforced features) as not applied', () => {
     const entry = getPolicyBaselineDefaults().find((e) => e.featureType === 'patch')!;
     expect(entry.applied).toBe(false);
@@ -36,7 +50,8 @@ describe('policyBaselineDefaults', () => {
     const s = getRemoteAccessBaseline();
     expect(s.webrtcDesktop).toBe(true);
     expect(s.maxConcurrentTunnels).toBe(5);
-    expect(s.idleTimeoutMinutes).toBe(5);
+    // #10422: 5 min tore down MSP sessions that were watching an install.
+    expect(s.idleTimeoutMinutes).toBe(30);
     expect(s.maxSessionDurationHours).toBe(8);
   });
 
@@ -110,6 +125,11 @@ describe('CONFIG_FEATURE_TYPES parity with DB enum (W05d: canonical ∪ retired)
   it('canonical plus retired matches configFeatureTypeEnum.enumValues exactly', () => {
     expect([...CONFIG_FEATURE_TYPES, ...RETIRED_CONFIG_FEATURE_TYPES].sort())
       .toEqual([...configFeatureTypeEnum.enumValues].sort());
+  });
+  it('security_agents (#6960) is in the DB enum and has a not-enforced baseline', () => {
+    expect([...configFeatureTypeEnum.enumValues]).toContain('security_agents');
+    const entry = getPolicyBaselineDefaults().find((e) => e.featureType === 'security_agents');
+    expect(entry).toMatchObject({ applied: false, inlineSettings: null });
   });
   it('the two lists are disjoint and retired types have no baseline entry', () => {
     const baseline = getPolicyBaselineDefaults().map((e) => e.featureType);

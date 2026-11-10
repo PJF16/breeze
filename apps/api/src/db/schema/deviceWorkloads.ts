@@ -15,9 +15,11 @@ import type {
   WorkloadCollection,
   WorkloadDetection,
   WorkloadEnumeratedRuntime,
+  WorkloadImageProvenance,
   WorkloadKind,
   WorkloadRuntime,
   WorkloadState,
+  WorkloadUpstreamStatus,
 } from '@breeze/shared';
 import { devices } from './devices';
 import { organizations } from './orgs';
@@ -49,6 +51,10 @@ export const deviceWorkloads = pgTable(
     imageTag: varchar('image_tag', { length: 128 }),
     imageDigest: varchar('image_digest', { length: 80 }),
     imageId: varchar('image_id', { length: 80 }),
+    // #9067: the agent's evidence for where the image came from. NULL = an
+    // agent that predates it (behaviour unchanged); `unknown` is never looked
+    // up in any registry (upstream_status `provenance_unknown`).
+    imageProvenance: varchar('image_provenance', { length: 20 }).$type<WorkloadImageProvenance>(),
     guestOs: varchar('guest_os', { length: 128 }),
     composeProject: varchar('compose_project', { length: 128 }),
     composeService: varchar('compose_service', { length: 128 }),
@@ -61,12 +67,23 @@ export const deviceWorkloads = pgTable(
     firstSeenAt: timestamp('first_seen_at').defaultNow().notNull(),
     lastSeenAt: timestamp('last_seen_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
+    // Image currency (W05, spec §9). Written by the imageCurrencyWorker; ingest
+    // resets them to pending when the row's image reference or digest changes.
+    upstreamStatus: varchar('upstream_status', { length: 20 }).$type<WorkloadUpstreamStatus>().default('pending').notNull(),
+    upstreamDigest: varchar('upstream_digest', { length: 80 }),
+    upstreamCheckedAt: timestamp('upstream_checked_at'),
+    // W06 (spec §10.2): when upstream_status first became `behind` for the
+    // current local image. Transition logic lives in services/workloads/behindSince.ts.
+    behindSince: timestamp('behind_since'),
   },
   (t) => [
     uniqueIndex('device_workloads_device_runtime_workload_uniq').on(t.deviceId, t.runtime, t.workloadId),
     index('device_workloads_org_id_idx').on(t.orgId),
     index('device_workloads_org_image_idx')
       .on(t.orgId, t.imageRepository, t.imageTag)
+      .where(sql`${t.kind} = 'container'`),
+    index('device_workloads_upstream_due_idx')
+      .on(t.upstreamCheckedAt.asc().nullsFirst())
       .where(sql`${t.kind} = 'container'`),
     foreignKey({
       columns: [t.deviceId, t.orgId],
@@ -80,6 +97,14 @@ export const deviceWorkloads = pgTable(
     check(
       'device_workloads_state_chk',
       sql`${t.state} IN ('running', 'stopped', 'paused', 'restarting', 'other')`,
+    ),
+    check(
+      'device_workloads_upstream_status_chk',
+      sql`${t.upstreamStatus} IN ('pending', 'current', 'behind', 'pinned', 'local', 'private', 'unsupported_registry', 'not_found', 'error', 'provenance_unknown')`,
+    ),
+    check(
+      'device_workloads_image_provenance_chk',
+      sql`${t.imageProvenance} IS NULL OR ${t.imageProvenance} IN ('confirmed', 'local', 'unknown')`,
     ),
   ],
 );

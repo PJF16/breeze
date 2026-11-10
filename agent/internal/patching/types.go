@@ -8,6 +8,7 @@ type AvailablePatch struct {
 	Description    string
 	Version        string
 	Severity       string // critical, important, moderate, low, unknown
+	SeveritySource string // SeveritySourceVendor, SeveritySourceDerived, or "" (no provenance; #9387)
 	Category       string // security, system, application, driver, definitions, feature
 	KBNumber       string // e.g. "KB5034441"
 	Size           int64  // bytes
@@ -15,7 +16,14 @@ type AvailablePatch struct {
 	RebootRequired bool
 	ReleaseDate    string // ISO 8601 date
 	UpdateType     string // "software", "driver", or "feature"
-	EulaAccepted   bool
+	// ReportedUpdateType is one of the ReportedUpdateType* constants, set only by
+	// the Windows Update provider and reported to the API per device (#11073).
+	// Empty means the provider has no such concept.
+	ReportedUpdateType string
+	// ReportedUpdateOwner is the vendor lane whose own update this is ("dell",
+	// "surface", "hp", "lenovo"), or empty when no lane takes it (#11073).
+	ReportedUpdateOwner string
+	EulaAccepted        bool
 	// Scope records the install scope the patch was discovered at, for
 	// providers that can distinguish one (currently winget:
 	// PatchScopeMachine vs PatchScopeUser). Empty means the provider has no

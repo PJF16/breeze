@@ -6,6 +6,8 @@ import {
   FileSearch,
   HardDrive,
   Clock,
+  Container,
+  History,
   Layers,
   LifeBuoy,
   PackageCheck,
@@ -15,11 +17,13 @@ import {
   Shield,
   ShieldCheck,
   ShieldAlert,
+  ShieldBan,
   Usb,
   Wrench,
   Trash2,
   Zap,
   type LucideIcon,
+  Cpu,
 } from "lucide-react";
 
 import type { ConfigFeatureType } from "@breeze/shared";
@@ -29,6 +33,9 @@ import { fetchWithAuth } from "../../stores/auth";
 import { useTranslation } from "react-i18next";
 import "../../lib/i18n";
 import { i18n } from "../../lib/i18n";
+import EffectiveContainmentSummary from "./EffectiveContainmentSummary";
+import { OEM_VENDOR_NAMES } from "./vendorUpdatesApi";
+import type { OemLane } from "@breeze/shared";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -47,8 +54,6 @@ import { i18n } from "../../lib/i18n";
 export const EFFECTIVE_CONFIG_EXCLUDED_FEATURE_TYPES = [
   "remote_access",
   "pam",
-  // W04 (#3834) adds the workload_inventory row.
-  "workload_inventory",
 ] as const;
 type FeatureType = Exclude<
   ConfigFeatureType,
@@ -141,6 +146,31 @@ const FEATURE_META: Record<FeatureType, { label: string; Icon: LucideIcon }> = {
     },
     Icon: Clock,
   },
+  workload_inventory: {
+    get label() {
+      return i18n.t("devices:workloads.policy.title");
+    },
+    Icon: Container,
+  },
+  system_protection: {
+    get label() {
+      return i18n.t("policies:configurationPolicies.featureTabs.systemProtectionTab.title");
+    },
+    Icon: History,
+  },
+  security_agents: { label: "Security Agents", Icon: ShieldCheck },
+  containment: {
+    get label() {
+      return i18n.t("policies:configurationPolicies.featureTabs.containmentTab.title");
+    },
+    Icon: ShieldBan,
+  },
+  oem_updates: {
+    get label() {
+      return i18n.t("policies:configurationPolicies.featureTabs.vendorUpdatesTab.title");
+    },
+    Icon: Cpu,
+  },
 };
 
 // Display order = FEATURE_META insertion order. Derived (not hand-listed) so the
@@ -161,12 +191,41 @@ const LEVEL_LABELS: Record<AssignmentLevel, string> = {
 
 type SettingsSummaryItem = { label: string; value: string };
 
+// #9565: the fields that describe each feature at a glance, in display order.
+// Without a pick list the summary followed JSONB key order, so the Maintenance
+// card led with "Timezone / Recurrence / Notify On End" and never showed the
+// duration. Picked keys that are absent are skipped and the remaining slots
+// fall back to key order; a feature with no entry keeps key order entirely.
+const FEATURE_SUMMARY_KEYS: Partial<Record<FeatureType, readonly string[]>> = {
+  maintenance: ["windowStart", "durationHours", "recurrence", "timezone"],
+  patch: ["scheduleFrequency", "scheduleTime", "rebootPolicy", "sources"],
+  warranty: ["enabled", "warnDays", "criticalDays"],
+  event_log: ["minimumLevel", "retentionDays", "collectCategories", "collectionIntervalMinutes"],
+  backup: ["backupMode", "destinationConfigId", "paths"],
+  sensitive_data: ["detectionClasses", "scheduleType", "intervalMinutes", "cron"],
+};
+
+/** Reorders `settings` so the picked keys come first; the rest keep key order. */
+function orderSummaryEntries(
+  settings: Record<string, unknown>,
+  pickedKeys: readonly string[] | undefined,
+): Array<[string, unknown]> {
+  const entries = Object.entries(settings);
+  if (!pickedKeys || pickedKeys.length === 0) return entries;
+  const picked = pickedKeys
+    .filter((key) => Object.prototype.hasOwnProperty.call(settings, key))
+    .map((key): [string, unknown] => [key, settings[key]]);
+  const pickedSet = new Set(pickedKeys);
+  return [...picked, ...entries.filter(([key]) => !pickedSet.has(key))];
+}
+
 function summarizeSettings(
   settings: Record<string, unknown> | null,
+  pickedKeys?: readonly string[],
 ): SettingsSummaryItem[] {
   if (!settings || Object.keys(settings).length === 0) return [];
   const items: SettingsSummaryItem[] = [];
-  for (const [key, value] of Object.entries(settings)) {
+  for (const [key, value] of orderSummaryEntries(settings, pickedKeys)) {
     if (value === null || value === undefined) continue;
     // Format key from camelCase/snake_case to readable
     const label = key
@@ -196,26 +255,79 @@ function summarizeSettings(
 // shown, but the approval evaluator never consults them — with an update ring
 // linked the ring decides, and without one only manual approvals apply. Showing
 // "Auto approve: no" read as the effective setting, so the patch card drops
-// them and states where approval actually comes from instead.
+// them and states where approval actually comes from instead. #8187: the same
+// holds for the legacy per-app `apps` list, which the linked ring now owns.
 const PATCH_UNUSED_APPROVAL_KEYS = new Set([
   "autoApprove",
   "autoApproveSeverities",
   "autoApproveDeferralDays",
+  "apps",
 ]);
+
+// #11281: the generic dump showed the schema "version" and no schedule or vendors.
+// State what the policy does: whether it is on, when it runs, and for which vendors.
+function summarizeOemUpdates(settings: Record<string, unknown> | null): SettingsSummaryItem[] {
+  if (!settings) return [];
+  const items: SettingsSummaryItem[] = [];
+  if (typeof settings.enabled === "boolean") {
+    items.push({ label: "enabled", value: settings.enabled ? "yes" : "no" });
+  }
+  const schedule = settings.schedule;
+  if (schedule && typeof schedule === "object") {
+    const { weekOfMonth, dayOfWeek, windowStart, windowHours } = schedule as Record<string, unknown>;
+    if (typeof weekOfMonth === "string" && typeof dayOfWeek === "string") {
+      const when = `${weekOfMonth} ${dayOfWeek}`;
+      const window =
+        typeof windowStart === "string" && typeof windowHours === "number"
+          ? `, ${windowStart}, ${windowHours} h window`
+          : "";
+      items.push({ label: "schedule", value: `${when}${window}` });
+    }
+  }
+  const vendors = settings.vendors;
+  if (vendors && typeof vendors === "object") {
+    const enabled = Object.entries(vendors as Record<string, unknown>)
+      .filter(([, v]) => !!v && typeof v === "object" && (v as { enabled?: unknown }).enabled === true)
+      .map(([lane]) => OEM_VENDOR_NAMES[lane as OemLane] ?? lane);
+    items.push({ label: "vendors", value: enabled.length > 0 ? enabled.join(", ") : "none enabled" });
+  }
+  return items;
+}
 
 function summarizeFeatureSettings(
   featureType: FeatureType,
   feature: ResolvedFeature,
   approvalItem: (ringLinked: boolean) => SettingsSummaryItem,
 ): SettingsSummaryItem[] {
-  if (featureType !== "patch") return summarizeSettings(feature.inlineSettings);
+  if (featureType === "oem_updates") return summarizeOemUpdates(feature.inlineSettings);
+  const pickedKeys = FEATURE_SUMMARY_KEYS[featureType];
+  if (featureType !== "patch") return summarizeSettings(feature.inlineSettings, pickedKeys);
   const settings = feature.inlineSettings;
   const hasSettings = !!settings && Object.keys(settings).length > 0;
   if (!hasSettings && !feature.featurePolicyId) return [];
   const remaining = Object.fromEntries(
     Object.entries(settings ?? {}).filter(([key]) => !PATCH_UNUSED_APPROVAL_KEYS.has(key)),
   );
-  return [approvalItem(!!feature.featurePolicyId), ...summarizeSettings(remaining)].slice(0, 4);
+  return [approvalItem(!!feature.featurePolicyId), ...summarizeSettings(remaining, pickedKeys)].slice(0, 4);
+}
+
+/**
+ * #9565: does this chain row supply the device's effective value for `ft`?
+ * A row lists every feature its policy links, but only the closest winner
+ * (see the resolver's level → priority → age ordering) actually applies.
+ */
+function chainEntryContributes(
+  entry: InheritanceEntry,
+  ft: FeatureType,
+  features: Record<string, ResolvedFeature>,
+): boolean {
+  const winner = features[ft];
+  return (
+    !!winner &&
+    winner.sourcePolicyId === entry.policyId &&
+    winner.sourceLevel === entry.level &&
+    winner.sourceTargetId === entry.targetId
+  );
 }
 
 // ── Component ────────────────────────────────────────────────────────
@@ -375,15 +487,23 @@ export default function DeviceEffectiveConfigTab({
           {enforcedTypes.map((ft) => {
             const feature = features[ft]!;
             const { label, Icon } = FEATURE_META[ft];
-            const settings = summarizeFeatureSettings(ft, feature, (ringLinked) => ({
-              label: t("deviceEffectiveConfigTab.patchApproval.label"),
-              value: ringLinked
-                ? t("deviceEffectiveConfigTab.patchApproval.byRing")
-                : t("deviceEffectiveConfigTab.patchApproval.manualOnly"),
-            }));
+            const isContainment = ft === "containment";
+            // Containment renders its destination list instead of the generic key/value summary.
+            const settings = isContainment
+              ? []
+              : summarizeFeatureSettings(ft, feature, (ringLinked) => ({
+                  label: t("deviceEffectiveConfigTab.patchApproval.label"),
+                  value: ringLinked
+                    ? t("deviceEffectiveConfigTab.patchApproval.byRing")
+                    : t("deviceEffectiveConfigTab.patchApproval.manualOnly"),
+                }));
 
             return (
-              <div key={ft} className="rounded-lg border bg-card p-5 shadow-xs">
+              <div
+                key={ft}
+                data-testid={isContainment ? "effective-config-containment-card" : undefined}
+                className="rounded-lg border bg-card p-5 shadow-xs"
+              >
                 <div className="flex items-start gap-3">
                   <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
                     <Icon className="h-5 w-5" />
@@ -427,6 +547,10 @@ export default function DeviceEffectiveConfigTab({
                   </div>
                 )}
 
+                {isContainment && (
+                  <EffectiveContainmentSummary inlineSettings={feature.inlineSettings} />
+                )}
+
                 {/* Feature policy reference */}
                 {feature.featurePolicyId && (
                   <p className="mt-2 text-xs text-muted-foreground">
@@ -445,7 +569,7 @@ export default function DeviceEffectiveConfigTab({
       {/* Not-enforced baseline features — collapsed into one compact strip so the
           page highlights what's actually applied instead of a wall of grey cards. */}
       {baselineTypes.length > 0 && (
-        <div className="rounded-lg border bg-card p-5 shadow-xs">
+        <div data-testid="effective-config-not-enforced" className="rounded-lg border bg-card p-5 shadow-xs">
           <div className="flex items-center gap-2">
             <h4 className="text-sm font-semibold text-muted-foreground">
               {t("deviceEffectiveConfigTab.notEnforced")}
@@ -478,10 +602,16 @@ export default function DeviceEffectiveConfigTab({
           <h4 className="font-semibold mb-3">
             {t("deviceEffectiveConfigTab.inheritanceChain")}
           </h4>
-          <p className="text-xs text-muted-foreground mb-4">
+          <p className="text-xs text-muted-foreground">
             {t(
               "deviceEffectiveConfigTab.policiesAreResolvedUsingClosestWins",
             )}{" "}
+          </p>
+          <p
+            data-testid="inheritance-chain-rule"
+            className="mt-1 mb-4 text-xs text-muted-foreground"
+          >
+            {t("deviceEffectiveConfigTab.chainResolutionRule")}
           </p>
           <div className="overflow-hidden rounded-md border">
             <table className="min-w-full divide-y">
@@ -525,14 +655,35 @@ export default function DeviceEffectiveConfigTab({
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex flex-wrap gap-1">
-                        {entry.featureTypes.map((ft) => (
-                          <span
-                            key={ft}
-                            className="inline-flex items-center rounded-full border bg-muted/50 px-2 py-0.5 text-xs text-muted-foreground"
-                          >
-                            {FEATURE_META[ft]?.label ?? ft}
-                          </span>
-                        ))}
+                        {entry.featureTypes.map((ft) => {
+                          const label = FEATURE_META[ft]?.label ?? ft;
+                          if (chainEntryContributes(entry, ft, features)) {
+                            return (
+                              <span
+                                key={ft}
+                                data-testid="chain-feature-contributed"
+                                className="inline-flex items-center rounded-full border bg-muted/50 px-2 py-0.5 text-xs text-foreground"
+                              >
+                                {label}
+                              </span>
+                            );
+                          }
+                          // A closer policy won this feature: keep the chip so
+                          // the row still shows what the policy links, but grey
+                          // it out and name the winner.
+                          return (
+                            <span
+                              key={ft}
+                              data-testid="chain-feature-overridden"
+                              title={t("deviceEffectiveConfigTab.featureOverriddenBy", {
+                                policy: features[ft]?.sourcePolicyName ?? "",
+                              })}
+                              className="inline-flex items-center rounded-full border border-dashed px-2 py-0.5 text-xs text-muted-foreground/70 line-through"
+                            >
+                              {label}
+                            </span>
+                          );
+                        })}
                       </div>
                     </td>
                   </tr>

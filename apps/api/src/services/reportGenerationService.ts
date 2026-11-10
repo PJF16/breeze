@@ -1,6 +1,6 @@
 import { and, eq, sql, desc, gte, lte, inArray, isNull, type SQL } from 'drizzle-orm';
 import type { AnyPgColumn } from 'drizzle-orm/pg-core';
-import { db } from '../db';
+import { db, withDbTransactionIfHeld } from '../db';
 import {
   devices,
   manualAssets,
@@ -25,6 +25,10 @@ import {
   emptyArAgingSummary,
   emptyTechnicianTimeSummary,
   emptyTicketSlaSummary,
+  emptyMrrRenewalsSummary,
+  emptyQuoteWinRateSummary,
+  emptyClientProfitabilitySummary,
+  emptyTicketSlaPerformanceSummary,
 } from '@breeze/shared';
 import {
   systemReportAuthorityFor,
@@ -36,6 +40,7 @@ import {
 } from './siteScope';
 import { isManagedEvidenceType, type ManagedEvidenceType } from './managedEvidenceRegistry';
 import { reportTypeDef } from './reportRegistry';
+import { resolveReportDateRange } from './reportDateRange';
 import { endpointManagementConfigSchema } from './reportConfigSchemas';
 import { organizationScope, reportOwnerOfScope, type ReportScope } from './reportScope';
 import { alertSiteScopeByDeviceIds } from '../routes/alerts/helpers';
@@ -99,7 +104,7 @@ export async function previousBaselineFor(
   scopeFingerprint: string,
 ): Promise<ReportResult['previous']> {
   try {
-    const [prior] = await db
+    const [prior] = await withDbTransactionIfHeld(() => db
       .select({
         summary: sql<Record<string, unknown> | null>`${reportRuns.result}->'summary'`,
         generatedAt: sql<string | null>`${reportRuns.result}->>'generatedAt'`,
@@ -112,7 +117,7 @@ export async function previousBaselineFor(
         eq(reportRuns.executionScopeFingerprint, scopeFingerprint),
       ))
       .orderBy(desc(reportRuns.completedAt))
-      .limit(1);
+      .limit(1));
     if (!prior?.summary || typeof prior.summary !== 'object') return undefined;
     return {
       generatedAt: prior.generatedAt ?? prior.completedAt?.toISOString() ?? null,
@@ -386,6 +391,7 @@ type DeviceInventoryRow = {
   ramTotalMb: number | null;
   diskTotalGb: number | null;
   serialNumber: string | null;
+  productSku: string | null;
 };
 
 /** Shared row query; callers retain their own authority checks and narrowing. */
@@ -404,7 +410,8 @@ export async function readDeviceInventoryRows(orgId: string, conditions: SQL[]) 
       cpuModel: deviceHardware.cpuModel,
       ramTotalMb: deviceHardware.ramTotalMb,
       diskTotalGb: deviceHardware.diskTotalGb,
-      serialNumber: deviceHardware.serialNumber
+      serialNumber: deviceHardware.serialNumber,
+      productSku: deviceHardware.productSku
     })
     .from(devices)
     .leftJoin(deviceHardware, eq(devices.id, deviceHardware.deviceId))
@@ -507,6 +514,7 @@ export async function generateDeviceInventoryReport(
         ramTotalMb: null,
         diskTotalGb: null,
         serialNumber: asset.serialNumber,
+        productSku: null,
       });
     }
 
@@ -562,13 +570,9 @@ export async function generateAlertSummaryReport(
   assertReportExecutionPreflight(orgId, config, authority, 'alert_summary');
   const conditions: SQL[] = [eq(alerts.orgId, orgId)];
 
-  const dateRange = config.dateRange as Record<string, string> | undefined;
-  if (dateRange?.start) {
-    conditions.push(gte(alerts.triggeredAt, new Date(dateRange.start)));
-  }
-  if (dateRange?.end) {
-    conditions.push(lte(alerts.triggeredAt, new Date(dateRange.end)));
-  }
+  const reportWindow = resolveReportDateRange(config.dateRange);
+  if (reportWindow.start) conditions.push(gte(alerts.triggeredAt, reportWindow.start));
+  if (reportWindow.end) conditions.push(lte(alerts.triggeredAt, reportWindow.end));
 
   const filters = config.filters as Record<string, unknown> | undefined;
   if (filters?.severity && Array.isArray(filters.severity) && filters.severity.length > 0) {
@@ -716,13 +720,9 @@ export async function generatePerformanceReport(
 
   const conditions: SQL[] = [inArray(deviceMetrics.deviceId, deviceIds)];
 
-  const dateRange = config.dateRange as Record<string, string> | undefined;
-  if (dateRange?.start) {
-    conditions.push(gte(deviceMetrics.timestamp, new Date(dateRange.start)));
-  }
-  if (dateRange?.end) {
-    conditions.push(lte(deviceMetrics.timestamp, new Date(dateRange.end)));
-  }
+  const reportWindow = resolveReportDateRange(config.dateRange);
+  if (reportWindow.start) conditions.push(gte(deviceMetrics.timestamp, reportWindow.start));
+  if (reportWindow.end) conditions.push(lte(deviceMetrics.timestamp, reportWindow.end));
 
   const whereCondition = and(...conditions);
 
@@ -772,7 +772,11 @@ export async function generateExecutiveSummaryReport(
     .where(eq(organizations.id, orgId))
     .limit(1);
 
-  const dateRange = config.dateRange as Record<string, string> | undefined;
+  // #9562: the alert figures (alerts in window, severity counts, resolution
+  // rate) are the report's time-scoped section and MUST be bounded by the
+  // configured window, preset or explicit. The device figures are a
+  // point-in-time snapshot of the fleet and are deliberately not windowed.
+  const reportWindow = resolveReportDateRange(config.dateRange);
   const deviceConditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition()];
   const emptyDeviceScope = addAllowedSiteCondition(deviceConditions, authority);
   const deviceWhereCondition = and(...deviceConditions);
@@ -791,12 +795,8 @@ export async function generateExecutiveSummaryReport(
 
   // Alert stats
   const alertConditions: SQL[] = [eq(alerts.orgId, orgId)];
-  if (dateRange?.start) {
-    alertConditions.push(gte(alerts.triggeredAt, new Date(dateRange.start)));
-  }
-  if (dateRange?.end) {
-    alertConditions.push(lte(alerts.triggeredAt, new Date(dateRange.end)));
-  }
+  if (reportWindow.start) alertConditions.push(gte(alerts.triggeredAt, reportWindow.start));
+  if (reportWindow.end) alertConditions.push(lte(alerts.triggeredAt, reportWindow.end));
 
   const allowedDeviceIds = await resolveSiteAllowedDeviceIds(orgId, authority);
   const restrictedSiteIds = allowedDeviceIds && authority.scope.kind === 'restricted' ? authority.scope.siteIds : null;
@@ -1104,6 +1104,18 @@ function zeroSafeReport(type: ReportType, orgId: string): ReportResult {
     // AI chargeback W10 (#7608): the AI ledger has no site axis either.
     case 'ai_usage_by_client':
       return { rows: [], rowCount: 0, summary: emptyAiUsageByClientSummary(SITE_RESTRICTED_NOTE) as unknown as Record<string, unknown> };
+    // Business reports phase 2 W1 (#9828): contracts have no site column.
+    case 'mrr_renewals':
+      return { rows: [], rowCount: 0, summary: emptyMrrRenewalsSummary(SITE_RESTRICTED_NOTE) as unknown as Record<string, unknown> };
+    // Business reports phase 2 W2 (#9828): no site filter exists for quote lineages.
+    case 'quote_win_rate':
+      return { rows: [], rowCount: 0, summary: emptyQuoteWinRateSummary(SITE_RESTRICTED_NOTE) as unknown as Record<string, unknown> };
+    // Business reports phase 2 W3 (#9828): invoices and time entries have no site column.
+    case 'client_profitability':
+      return { rows: [], rowCount: 0, summary: emptyClientProfitabilitySummary(SITE_RESTRICTED_NOTE) as unknown as Record<string, unknown> };
+    // #11018: tickets have no site axis either, and this one reaches customers.
+    case 'ticket_sla_performance':
+      return { rows: [], rowCount: 0, summary: emptyTicketSlaPerformanceSummary(SITE_RESTRICTED_NOTE) as unknown as Record<string, unknown> };
     default: {
       const exhaustive: never = type;
       throw new Error(`Invalid report type: ${String(exhaustive)}`);

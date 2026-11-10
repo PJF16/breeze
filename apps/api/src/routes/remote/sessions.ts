@@ -4,7 +4,7 @@ import { ERROR_CODES } from '@breeze/shared';
 import { jsonError } from '../../lib/jsonError';
 import { z } from 'zod';
 import { and, eq, sql, desc, gte, lte, inArray, type SQL } from 'drizzle-orm';
-import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
+import { db, runOutsideDbContext, withSystemDbAccessContext, withDbTransaction } from '../../db';
 import {
   remoteSessions,
   devices,
@@ -14,7 +14,8 @@ import {
   partners
 } from '../../db/schema';
 import { requireScope, requirePermission } from '../../middleware/auth';
-import { sendCommandToAgent } from '../agentWs';
+import { sendCommandToAgent, sendDesktopIceCandidateToAgent } from '../agentWs';
+import { submitViewerIceCandidate } from '../../services/remoteDesktopIceTrickle';
 import { dispatchCommandToAgent } from '../../services/agentCommandRelay';
 import { checkRemoteAccess, resolveDesktopSessionPolicy } from '../../services/remoteAccessPolicy';
 import { createDesktopConnectCode, createWsTicket } from '../../services/remoteSessionAuth';
@@ -28,7 +29,6 @@ import {
 } from './schemas';
 import {
   getPagination,
-  getIceServers,
   getDeviceWithOrgCheck,
   getSessionWithOrgCheck,
   hasSessionOwnership,
@@ -55,11 +55,14 @@ import {
   commitDesktopStartIntent,
   formatDesktopGeneration,
   startIntentDenialCode,
+  startIntentDenialMessage,
 } from '../../services/remoteDesktopStartIntent';
+import { releaseDesktopStartInFlight } from '../../services/desktopStartInFlight';
 import { revokeViewerSession } from '../../services/viewerTokenRevocation';
 import { captureException, captureMessage } from '../../services/sentry';
 import { ACTIVE_REMOTE_SESSION_STATUSES, teardownDisconnectedSessions } from '../../services/remoteSessionTeardown';
 import { normalizeRecordingUrl } from './recordingUrl';
+import { resolveDesktopIcePlan } from './desktopRelayPolicy';
 import { createRemoteSession, RemoteSessionDeniedError } from '../../services/remoteSessionCreate';
 import {
   AGENT_UPGRADE_REQUIRED_CODE,
@@ -310,39 +313,43 @@ sessionRoutes.post(
     // hard-refresh may not fire the WS onClose, leaving stale rows that
     // block new connections or confuse the agent's session broker.
     try {
-      const staleUpdate = db
-        .update(remoteSessions)
-        .set(terminalIntentSet({ status: 'disconnected', endedAt: new Date() }, 'pending'))
-        .where(
-          and(
-            eq(remoteSessions.deviceId, data.deviceId),
-            eq(remoteSessions.type, data.type),
-            // Caller-owned only: this is a same-caller reconnect cleanup (a
-            // browser hard-refresh dropping the old tab's WS), not a
-            // cross-user termination primitive. Without this predicate any
-            // caller with org access to the device could disconnect and
-            // agent-stop a colleague's in-progress session just by starting
-            // a same-type session of their own.
-            eq(remoteSessions.userId, auth.user.id),
-            inArray(remoteSessions.status, ['pending', 'connecting', 'active'])
-          )
-        ) as unknown as Promise<unknown> & {
-          returning?: (fields: ReturnType<typeof terminalSessionReturning>) => Promise<Array<Parameters<typeof toTerminalSessionRow>[0]>>;
-        };
+      // Savepoint around the UPDATE so a failed statement rolls back and the
+      // request transaction survives the catch below (#11203). Teardown runs
+      // outside it in its own system context.
+      const revoked = await withDbTransaction(async () => {
+        const staleUpdate = db
+          .update(remoteSessions)
+          .set(terminalIntentSet({ status: 'disconnected', endedAt: new Date() }, 'pending'))
+          .where(
+            and(
+              eq(remoteSessions.deviceId, data.deviceId),
+              eq(remoteSessions.type, data.type),
+              // Caller-owned only: this is a same-caller reconnect cleanup (a
+              // browser hard-refresh dropping the old tab's WS), not a
+              // cross-user termination primitive. Without this predicate any
+              // caller with org access to the device could disconnect and
+              // agent-stop a colleague's in-progress session just by starting
+              // a same-type session of their own.
+              eq(remoteSessions.userId, auth.user.id),
+              inArray(remoteSessions.status, ['pending', 'connecting', 'active'])
+            )
+          ) as unknown as Promise<unknown> & {
+            returning?: (fields: ReturnType<typeof terminalSessionReturning>) => Promise<Array<Parameters<typeof toTerminalSessionRow>[0]>>;
+          };
 
-      if (typeof staleUpdate.returning === 'function') {
-        const revoked = (await staleUpdate.returning(terminalSessionReturning())).map(toTerminalSessionRow);
-        // Revoke viewer tokens AND push the agent stop so a stale row for a
-        // still-live desktop/terminal doesn't leave the stream running.
-        await teardownDisconnectedSessions(revoked);
-      } else {
+        if (typeof staleUpdate.returning === 'function') {
+          return (await staleUpdate.returning(terminalSessionReturning())).map(toTerminalSessionRow);
+        }
         await staleUpdate;
-      }
+        return null;
+      });
+      // Revoke viewer tokens AND push the agent stop so a stale row for a
+      // still-live desktop/terminal doesn't leave the stream running.
+      if (revoked) await teardownDisconnectedSessions(revoked);
     } catch (err) {
-      // The UPDATE may already have committed when this fires (a row-shape
-      // error in the post-UPDATE mapping, for instance), which would leave
-      // rows terminal with no viewer revocation and no stop — so it is
-      // escalated, not just logged.
+      // The UPDATE may already have been applied when this fires (a teardown
+      // failure, for instance), which would leave rows terminal with no viewer
+      // revocation and no stop — so it is escalated, not just logged.
       console.error('[remote] Failed to terminate stale sessions for device', data.deviceId, err);
       captureException(err instanceof Error ? err : new Error(String(err)));
     }
@@ -499,6 +506,7 @@ sessionRoutes.get(
         type: remoteSessions.type,
         status: remoteSessions.status,
         terminationPhase: remoteSessions.terminationPhase,
+        endReason: remoteSessions.endReason,
         startedAt: remoteSessions.startedAt,
         endedAt: remoteSessions.endedAt,
         durationSeconds: remoteSessions.durationSeconds,
@@ -525,6 +533,8 @@ sessionRoutes.get(
         type: s.type,
         status: s.status,
         terminationPhase: s.terminationPhase ?? 'none',
+        // #10190 W06: why it ended, when known ('ended_by_user'); else null.
+        endReason: s.endReason ?? null,
         startedAt: s.startedAt,
         endedAt: s.endedAt,
         durationSeconds: s.durationSeconds,
@@ -659,6 +669,7 @@ sessionRoutes.get(
         type: remoteSessions.type,
         status: remoteSessions.status,
         terminationPhase: remoteSessions.terminationPhase,
+        endReason: remoteSessions.endReason,
         startedAt: remoteSessions.startedAt,
         endedAt: remoteSessions.endedAt,
         durationSeconds: remoteSessions.durationSeconds,
@@ -686,6 +697,8 @@ sessionRoutes.get(
         type: s.type,
         status: s.status,
         terminationPhase: s.terminationPhase ?? 'none',
+        // #10190 W06: why it ended, when known ('ended_by_user'); else null.
+        endReason: s.endReason ?? null,
         startedAt: s.startedAt,
         endedAt: s.endedAt,
         durationSeconds: s.durationSeconds,
@@ -764,6 +777,8 @@ sessionRoutes.get(
       // the agent has not yet acknowledged the stop. The web UI must not
       // render such a session as connected.
       terminationPhase: session.terminationPhase ?? 'none',
+      // #10190 W06: 'ended_by_user' when the person at the keyboard ended it.
+      endReason: session.endReason ?? null,
       webrtcOffer: session.webrtcOffer,
       webrtcAnswer: session.webrtcAnswer,
       iceCandidates: session.iceCandidates,
@@ -927,12 +942,15 @@ sessionRoutes.get(
       return jsonError(c, 429, ERROR_CODES.RATE_LIMITED, 'Too many ICE server requests. Please try again later.');
     }
 
+    const icePlan = await resolveDesktopIcePlan(device.id, {
+      sessionId: session.id,
+      userId: session.userId,
+      deviceId: session.deviceId,
+    });
+    if (!icePlan.ok) return c.json({ error: icePlan.error, code: icePlan.code }, 409);
     return c.json({
-      iceServers: getIceServers({
-        sessionId: session.id,
-        userId: session.userId,
-        deviceId: session.deviceId,
-      })
+      iceServers: icePlan.iceServers,
+      ...(icePlan.relayOnly ? { relayOnly: true } : {}),
     });
   }
 );
@@ -1026,10 +1044,11 @@ sessionRoutes.post(
     // Look up GPU vendor from device hardware inventory
     let gpuVendor: string | undefined;
     try {
-      const [hw] = await db.select({ gpuModel: deviceHardware.gpuModel })
+      // Savepoint so a failed read does not abort the request transaction (#11203).
+      const [hw] = await withDbTransaction(async () => db.select({ gpuModel: deviceHardware.gpuModel })
         .from(deviceHardware)
         .where(eq(deviceHardware.deviceId, device.id))
-        .limit(1);
+        .limit(1));
       if (hw?.gpuModel) {
         const g = hw.gpuModel.toLowerCase();
         if (g.includes('nvidia') || g.includes('geforce') || g.includes('quadro') || g.includes('rtx')) {
@@ -1077,6 +1096,15 @@ sessionRoutes.post(
         code: CONSENT_UPGRADE_REQUIRED_CODE,
       }, 409);
     }
+    // Refuse an isolated session before committing a start intent or minting a lease.
+    // This route already runs inside the request's DB access context.
+    const icePlan = await resolveDesktopIcePlan(device.id, {
+      sessionId,
+      userId: session.userId,
+      deviceId: session.deviceId,
+    });
+    if (!icePlan.ok) return c.json({ error: icePlan.error, code: icePlan.code }, 409);
+
     const promptMode = prompt?.mode === 'consent' || prompt?.mode === 'notify' ? prompt.mode : 'off';
     const startCommandId = createDesktopStartCommandId(sessionId);
 
@@ -1105,85 +1133,104 @@ sessionRoutes.post(
           code: 'SESSION_TERMINAL',
         }, 409);
       }
+      if (startIntent.reason === 'start_in_flight') {
+        // #8947: a concurrent second offer for a start still waiting on its
+        // answer — refused, not superseded (see the viewer-token twin).
+        return c.json({
+          error: startIntentDenialMessage(startIntent.reason),
+          code: startIntentDenialCode(startIntent.reason),
+        }, 409);
+      }
       return jsonError(c, 409, ERROR_CODES.CONFLICT, 'Session state changed while submitting offer');
     }
 
-    const startGeneration = startIntent.generation;
+    // Every exit below that does not hand the start to the agent — a refusal,
+    // an unreachable agent, or a throw — drops this start's in-flight marker,
+    // so the viewer's retry is not refused as a duplicate of a start the
+    // agent never received (#8947).
+    let dispatched = false;
+    try {
+      const startGeneration = startIntent.generation;
 
-    await logSessionAudit(
-      'session_offer_submitted',
-      auth.user.id,
-      device.orgId,
-      {
-        sessionId,
-        type: session.type,
-        startCommandId,
-        promptMode,
-        startGeneration: formatDesktopGeneration(startGeneration),
-      },
-      getTrustedClientIpOrUndefined(c)
-    );
+      await logSessionAudit(
+        'session_offer_submitted',
+        auth.user.id,
+        device.orgId,
+        {
+          sessionId,
+          type: session.type,
+          startCommandId,
+          promptMode,
+          startGeneration: formatDesktopGeneration(startGeneration),
+        },
+        getTrustedClientIpOrUndefined(c)
+      );
 
-    // Fail-closed revocation lease. Without a lease-capable agent there is no
-    // way to end this peer-to-peer session once authorization changes, so the
-    // start is refused rather than run unrevokable.
-    const leaseResult = await prepareRevocationLeaseForStart(sessionId);
-    if (!leaseResult.ok) {
-      if (leaseResult.reason === 'agent_upgrade_required') {
+      // Fail-closed revocation lease. Without a lease-capable agent there is no
+      // way to end this peer-to-peer session once authorization changes, so the
+      // start is refused rather than run unrevokable.
+      const leaseResult = await prepareRevocationLeaseForStart(sessionId);
+      if (!leaseResult.ok) {
+        if (leaseResult.reason === 'agent_upgrade_required') {
+          return c.json({
+            error: AGENT_UPGRADE_REQUIRED_MESSAGE,
+            code: AGENT_UPGRADE_REQUIRED_CODE,
+          }, 503);
+        }
         return c.json({
-          error: AGENT_UPGRADE_REQUIRED_MESSAGE,
-          code: AGENT_UPGRADE_REQUIRED_CODE,
+          error: 'Unable to authorize this remote session right now. Please try again.',
+          code: 'lease_unavailable',
         }, 503);
       }
-      return c.json({
-        error: 'Unable to authorize this remote session right now. Please try again.',
-        code: 'lease_unavailable',
-      }, 503);
-    }
 
-    // Re-read generation + phase immediately before publication. An End that
-    // committed while the lease was being minted supersedes this start, and the
-    // command must not go out at all. This narrows the window to microseconds;
-    // the endpoint fence (W04/W05) is what closes it.
-    const stillCurrent = await assertDesktopStartIntentCurrent(sessionId, startGeneration);
-    if (!stillCurrent.ok) {
-      return c.json({
-        error: 'This session was ended while the stream was starting',
-        code: startIntentDenialCode(stillCurrent.reason),
-      }, 409);
-    }
-
-    const agentReachable = sendCommandToAgent(device.agentId, {
-      id: startCommandId,
-      type: 'start_desktop',
-      payload: {
-        sessionId,
-        startGeneration: formatDesktopGeneration(startGeneration),
-        offer: data.offer,
-        iceServers: getIceServers({ sessionId, userId: session.userId, deviceId: session.deviceId }),
-        clipboard: desktopPolicy.clipboard,
-        idleTimeoutMinutes: desktopPolicy.idleTimeoutMinutes,
-        maxSessionDurationHours: desktopPolicy.maxSessionDurationHours,
-        revocationLease: leaseResult.lease,
-        ...(data.displayIndex != null ? { displayIndex: data.displayIndex } : {}),
-        ...(data.targetSessionId != null ? { targetSessionId: data.targetSessionId } : {}),
-        ...(gpuVendor ? { gpuVendor } : {}),
-        ...(prompt ? { prompt } : {})
+      // Re-read generation + phase immediately before publication. An End that
+      // committed while the lease was being minted supersedes this start, and the
+      // command must not go out at all. This narrows the window to microseconds;
+      // the endpoint fence (W04/W05) is what closes it.
+      const stillCurrent = await assertDesktopStartIntentCurrent(sessionId, startGeneration);
+      if (!stillCurrent.ok) {
+        return c.json({
+          error: 'This session was ended while the stream was starting',
+          code: startIntentDenialCode(stillCurrent.reason),
+        }, 409);
       }
-    });
 
-    if (!agentReachable) {
-      console.warn(`[Remote] Agent ${device.agentId} not connected, cannot send start_desktop for session ${sessionId}`);
-      // 503, not 502: the device is temporarily unreachable, which is exactly
-      // what 503 means — and unlike 502 the body survives Cloudflare.
-      return jsonError(c, 503, ERROR_CODES.DEVICE_UNREACHABLE, 'Agent is not currently connected. Please verify the device is online and try again.');
+      const agentReachable = sendCommandToAgent(device.agentId, {
+        id: startCommandId,
+        type: 'start_desktop',
+        payload: {
+          sessionId,
+          startGeneration: formatDesktopGeneration(startGeneration),
+          offer: data.offer,
+          iceServers: icePlan.iceServers,
+          ...(icePlan.relayOnly ? { relayOnly: true } : {}),
+          clipboard: desktopPolicy.clipboard,
+          idleTimeoutMinutes: desktopPolicy.idleTimeoutMinutes,
+          maxSessionDurationHours: desktopPolicy.maxSessionDurationHours,
+          revocationLease: leaseResult.lease,
+          ...(data.displayIndex != null ? { displayIndex: data.displayIndex } : {}),
+          ...(data.targetSessionId != null ? { targetSessionId: data.targetSessionId } : {}),
+          ...(gpuVendor ? { gpuVendor } : {}),
+          ...(prompt ? { prompt } : {})
+        }
+      });
+
+      if (!agentReachable) {
+        console.warn(`[Remote] Agent ${device.agentId} not connected, cannot send start_desktop for session ${sessionId}`);
+        // 503, not 502: the device is temporarily unreachable, which is exactly
+        // what 503 means — and unlike 502 the body survives Cloudflare.
+        return jsonError(c, 503, ERROR_CODES.DEVICE_UNREACHABLE, 'Agent is not currently connected. Please verify the device is online and try again.');
+      }
+      dispatched = true;
+
+      return c.json({
+        id: sessionId,
+        status: 'connecting',
+        webrtcOffer: data.offer,
+      });
+    } finally {
+      if (!dispatched) await releaseDesktopStartInFlight(sessionId, startCommandId);
     }
-
-    return c.json({
-      id: sessionId,
-      status: 'connecting',
-      webrtcOffer: data.offer,
-    });
   }
 );
 
@@ -1262,33 +1309,25 @@ sessionRoutes.post(
     const capabilityDenial = await currentSessionCapabilityDenial(c, session, device);
     if (capabilityDenial) return capabilityDenial;
 
-    // Only allow ICE candidates in connecting or active state
-    if (!['connecting', 'active'].includes(session.status)) {
+    // Same trickle path as the viewer-token route (#9182): stored against the
+    // session's current start and relayed to the agent hosting it.
+    const submitted = await submitViewerIceCandidate({
+      session,
+      agentId: device.agentId ?? null,
+      candidate: data.candidate,
+      send: sendDesktopIceCandidateToAgent,
+    });
+    if (!submitted.ok) {
       return c.json({
         error: 'Cannot add ICE candidate for session in current state',
         status: session.status
       }, 400);
     }
 
-    // Append ICE candidate to array
-    const currentCandidates = (session.iceCandidates as unknown[]) || [];
-    const updatedCandidates = [...currentCandidates, data.candidate];
-
-    const [updated] = await db
-      .update(remoteSessions)
-      .set({
-        iceCandidates: updatedCandidates
-      })
-      .where(eq(remoteSessions.id, sessionId))
-      .returning();
-
-    if (!updated) {
-      return c.json({ error: 'Failed to update session' }, 500);
-    }
-
     return c.json({
-      id: updated.id,
-      iceCandidatesCount: (updated.iceCandidates as unknown[]).length
+      id: sessionId,
+      iceCandidatesCount: submitted.iceCandidatesCount,
+      forwarded: submitted.forwarded,
     });
   }
 );
@@ -1447,10 +1486,15 @@ sessionRoutes.post(
       // a failed delivery (see DispatchOutcome in services/agentCommandRelay).
       // A bare catch would therefore have been silent for every real
       // non-delivery, so branch on the status explicitly.
-      void dispatchCommandToAgent(
-        device.agentId,
+      //
+      // Outside the request's DB context: the relay refuses to run inside a
+      // held one (#4142), and this send does not wait on the commit (the row
+      // update is already final). Nothing here touches the database.
+      const stopAgentId = device.agentId;
+      void runOutsideDbContext(() => dispatchCommandToAgent(
+        stopAgentId,
         buildStopDesktopCommand(sessionId, terminalGeneration),
-      ).then((outcome) => {
+      )).then((outcome) => {
         if (outcome.status === 'sent') return;
         const detail = outcome.status === 'infrastructure_error' ? ` (${outcome.message})` : '';
         console.warn(

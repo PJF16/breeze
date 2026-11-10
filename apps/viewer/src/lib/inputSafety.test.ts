@@ -12,6 +12,7 @@ import {
   viewerShortcut,
   shortcutLabel,
   isPasteChord,
+  modifiersReleasedByKeyPress,
 } from './inputSafety';
 
 describe('detectViewerOs', () => {
@@ -59,6 +60,13 @@ describe('mouseButtonName', () => {
   it('returns null for back/forward so a thumb button never clicks on the remote', () => {
     expect(mouseButtonName(3)).toBeNull();
     expect(mouseButtonName(4)).toBeNull();
+    expect(mouseButtonName(3, { extraButtons: false })).toBeNull();
+  });
+  it('maps back/forward only when the agent supports them (W2c)', () => {
+    expect(mouseButtonName(3, { extraButtons: true })).toBe('back');
+    expect(mouseButtonName(4, { extraButtons: true })).toBe('forward');
+    expect(mouseButtonName(5, { extraButtons: true })).toBeNull();
+    expect(mouseButtonName(0, { extraButtons: true })).toBe('left');
   });
 });
 
@@ -256,5 +264,18 @@ describe('isPasteChord', () => {
   it('is not a plain V or an Alt chord', () => {
     expect(isPasteChord(ev('KeyV', {}))).toBe(false);
     expect(isPasteChord(ev('KeyV', { ctrlKey: true, altKey: true }))).toBe(false);
+  });
+});
+
+describe('modifiersReleasedByKeyPress (#9595)', () => {
+  it('an agent that keeps held modifiers through a chord released none of them', () => {
+    // Mac viewer -> Windows, Cmd+R remapped: Ctrl is held, the chord goes as
+    // key_press r [ctrl], and the agent leaves Ctrl down. Forgetting it here
+    // meant Cmd's key_up was never sent and Ctrl stayed down on the remote.
+    expect(modifiersReleasedByKeyPress(['ctrl'], true)).toEqual([]);
+  });
+
+  it('an agent that predates it pressed and released every chord modifier', () => {
+    expect(modifiersReleasedByKeyPress(['ctrl', 'shift'], false)).toEqual(['ctrl', 'shift']);
   });
 });

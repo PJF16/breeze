@@ -1,5 +1,7 @@
 import { CONFIG_FEATURE_TYPES } from '../constants/configFeatureTypes';
 import { z } from 'zod';
+import { utf16Max } from './unitLength';
+import { applicationProvidersSchema } from './eventLogProviders';
 import {
   ACTOR_TYPES,
   AUDIT_RESULTS,
@@ -26,17 +28,27 @@ export * from './businessEmail';
 export * from './sendingDomains';
 export * from './remoteAccessLauncherScheme';
 export * from './httpUrl';
+export * from './securityLimits';
 export * from './currency';
 export * from './remoteAccessInlineSettings';
+export * from './ringFeatureUpdates';
 export * from './warrantyInlineSettings';
+export * from './systemProtectionInlineSettings';
+export * from './containmentPolicy';
+export * from './oemUpdatesPolicy';
+export * from './securityAgents';
+export * from './securityScanSweep';
 export * from './safeRelativePath';
 export * from './authenticator';
+export * from './mfaRecoveryCode';
 export * from './catalog';
 export * from './invoices';
 export * from './contracts';
+export * from './relatedContracts';
 export * from './workTypes';
 export * from './mlFeedback';
 export * from './quotes';
+export * from './agreementRequests';
 export * from './contractTemplates';
 export * from './scriptProposals';
 export * from './maintenanceWindow';
@@ -46,14 +58,17 @@ export * from './aiApprovalSettings';
 export * from './softwareDetection';
 export * from './softwareExitCodes';
 export * from './softwareDownloadPolicy';
+export * from './softwareVersionInstallSpec';
 export * from './systemCleanup';
 export * from './psa';
+export * from './psaAlertTicketing';
 export * from './deviceRoles';
 export * from './deviceFunctions';
 export * from './customFieldImport';
 export * from './alertRuleConditions';
 export * from './eventLogProviders';
 export * from './complianceInlineSettings';
+export * from './mcpDomains';
 
 // ============================================
 // Device Roles
@@ -366,6 +381,7 @@ export const agentEnrollSchema = z.object({
     cpuCores: z.number().optional(),
     ramTotalMb: z.number().optional(),
     serialNumber: z.string().optional(),
+    productSku: z.string().optional(),
     manufacturer: z.string().optional(),
     model: z.string().optional(),
     motherboardManufacturer: z.string().optional(),
@@ -430,6 +446,14 @@ export const vpnProviderSchema = z.enum([
   'zerotier',
   'openvpn',
   'cloudflare-warp',
+  // Enterprise VPN / SSE clients (#8763). Closed enum: an API older than the
+  // agent drops entries with a provider it doesn't know (per-entry salvage in
+  // routes/agents/inventory.ts), so ship the API before promoting the agent.
+  'zscaler',
+  'globalprotect',
+  'cisco-secure-client',
+  'forticlient',
+  'netskope',
   'generic'
 ]);
 
@@ -600,12 +624,25 @@ const patchSourceValueSchema = z.enum([
  */
 const PROVIDERLESS_PATCH_SOURCES = new Set<string>(['firmware', 'drivers']);
 
+/**
+ * Patch sources an app rule may target. 'linux' (#9370) names an apt/dnf
+ * package; the agent installs Linux updates one package at a time
+ * (`apt-get install --only-upgrade <pkg>`, `dnf update <pkg>`), so a package
+ * the approval evaluator drops is never handed to the package manager.
+ */
+export const APP_RULE_SOURCES = ['third_party', 'custom', 'linux'] as const;
+
+// Lengths below are UTF-16 code units (an astral char counts twice), via the
+// shared `utf16Max` check. zod <=4.5 measured `.max()` this way; zod >=4.6
+// counts code points. The ring app-rules backfill migration (2026-12-26-230000)
+// emulates the UTF-16 rule in SQL, so it is pinned explicitly rather than left
+// to the zod version (#9976).
 export const policyAppRuleSchema = z.object({
-  source: z.enum(['third_party', 'custom']),
-  packageId: z.string().min(1).max(256),
-  displayName: z.string().max(255).optional(),
+  source: z.enum(APP_RULE_SOURCES),
+  packageId: z.string().min(1).check(utf16Max(256, 'Too long: expected <=256 characters')),
+  displayName: z.string().check(utf16Max(255, 'Too long: expected <=255 characters')).optional(),
   action: z.enum(['block', 'pin']),
-  pinnedVersion: z.string().min(1).max(64).optional(),
+  pinnedVersion: z.string().min(1).check(utf16Max(64, 'Too long: expected <=64 characters')).optional(),
 }).superRefine((data, ctx) => {
   if (data.action === 'pin' && !data.pinnedVersion) {
     ctx.addIssue({
@@ -622,20 +659,36 @@ export type PolicyAppRule = z.infer<typeof policyAppRuleSchema>;
 const APP_RULE_THIRD_PARTY_BUCKET: readonly string[] = ['third_party', 'custom'];
 
 /**
+ * Package-manager prefixes the agent puts on Linux patch ids: the patch
+ * manager reports `apt:<name>` / `yum:<name>` (dnf hosts use the yum
+ * provider; 'dnf:' is accepted for hand-typed rules).
+ */
+const LINUX_PROVIDER_PREFIX = /^(?:apt|yum|dnf):/i;
+
+/** A Linux patch's package name without the agent's `apt:`/`yum:` prefix (#9370). */
+export function linuxPackageName(packageId: string): string {
+  return packageId.replace(LINUX_PROVIDER_PREFIX, '');
+}
+
+/**
  * Canonical app-rule identity: 'third_party' and 'custom' collapse to one
- * 'third_party' bucket, packageId is lowercased. The single implementation —
- * apps/api patchApprovalEvaluator.appRuleKey delegates here so the validator's
- * uniqueness check and the evaluator's lookup cannot disagree.
+ * 'third_party' bucket, packageId is lowercased. In the 'linux' bucket the
+ * package-manager prefix is dropped, so a rule for `docker-ce` matches the
+ * `apt:docker-ce` / `yum:docker-ce` id a Linux patch carries (#9370). The
+ * single implementation — apps/api patchApprovalEvaluator.appRuleKey and the
+ * web rule editor delegate here so the validator's uniqueness check and the
+ * evaluator's lookup cannot disagree.
  */
 export function canonicalAppRuleKey(source: string, packageId: string): string {
   const bucket = APP_RULE_THIRD_PARTY_BUCKET.includes(source) ? 'third_party' : source;
-  return `${bucket}|${packageId.toLowerCase()}`;
+  const id = packageId.toLowerCase();
+  return `${bucket}|${bucket === 'linux' ? linuxPackageName(id) : id}`;
 }
 
 /**
  * Update Ring per-app block/pin rules — `patch_policies.app_rules` (#8184).
- * Same element type as the policy-level `apps` list, max 200, unique by
- * `canonicalAppRuleKey`.
+ * Element type `policyAppRuleSchema` (the retired policy-level `apps` list
+ * used the same one), max 200, unique by `canonicalAppRuleKey`.
  */
 export const ringAppRulesSchema = z.array(policyAppRuleSchema).max(200).superRefine((rules, ctx) => {
   const seen = new Set<string>();
@@ -824,12 +877,13 @@ export const rebootPromptTextSchemas = {
   button: restartPromptTextSchema(REBOOT_PROMPT_BUTTON_MAX, false),
 } as const;
 
+// #8188 (#1317 W04): auto-approval and per-app block/pin rules are owned by
+// the Update Ring (patch_policies.auto_approve / app_rules). The retired
+// policy-level keys (autoApprove, autoApproveSeverities,
+// autoApproveDeferralDays, apps) are no longer defined here, so a payload that
+// still carries them has them stripped rather than validated or stored.
 export const patchInlineSettingsSchema = z.object({
   sources: z.array(patchSourceValueSchema).min(1).default(['os']),
-  autoApprove: z.boolean().default(false),
-  autoApproveSeverities: z.array(z.enum(['critical', 'important', 'moderate', 'low'])).default([]),
-  autoApproveDeferralDays: z.number().int().min(0).max(60).default(0),
-  apps: z.array(policyAppRuleSchema).max(200).default([]),
   scheduleFrequency: z.enum(['daily', 'weekly', 'monthly']).default('weekly'),
   scheduleTime: z.string().regex(/^([01]\d|2[0-3]):([0-5]\d)$/).default('02:00'),
   scheduleDayOfWeek: z.enum(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']).default('sun'),
@@ -861,14 +915,6 @@ export const patchInlineSettingsSchema = z.object({
   // channel (NoAutoUpdate=1); Breeze's own WUA-driven installs are unaffected.
   exclusiveWindowsUpdate: z.boolean().default(false),
 }).superRefine((data, ctx) => {
-  if (data.autoApprove && data.autoApproveSeverities.length === 0) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['autoApproveSeverities'],
-      message: 'Select at least one severity for auto-approval.',
-    });
-  }
-
   if (data.sources.length > 0 && data.sources.every((s) => PROVIDERLESS_PATCH_SOURCES.has(s))) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -905,22 +951,6 @@ export const patchInlineSettingsSchema = z.object({
       message: 'rebootDelayMinutes + rebootMaxDeferrals x rebootDeferralMinutes must not exceed 10080 minutes (7 days).',
     });
   }
-
-  const seen = new Set<string>();
-  for (const [i, app] of data.apps.entries()) {
-    // The approval evaluator matches 'third_party' and 'custom' as a single
-    // bucket, so canonicalize the source when deduping to mirror that.
-    const canonicalSource = app.source === 'custom' ? 'third_party' : app.source;
-    const key = `${canonicalSource}|${app.packageId.toLowerCase()}`;
-    if (seen.has(key)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['apps', i],
-        message: 'Duplicate app rule for the same source and package.',
-      });
-    }
-    seen.add(key);
-  }
 });
 
 export * from './hardwareHealth';
@@ -928,6 +958,7 @@ export * from './timeSync';
 export * from './workloads';
 
 export const eventLogInlineSettingsSchema = z.object({
+  applicationProviders: applicationProvidersSchema,
   retentionDays: z.number().int().min(7).max(365).default(30),
   maxEventsPerCycle: z.number().int().min(10).max(500).default(100),
   collectCategories: z.array(z.enum(['security', 'hardware', 'application', 'system'])).min(1).default(['security', 'hardware', 'application', 'system']),
@@ -1063,6 +1094,8 @@ export * from './aiAgents';
 export * from './aiAgentGraduation';
 export * from './aiAgentSchedules';
 export * from './aiOperator';
+export * from './aiOperatorIdentity';
+export * from './aiOperatorOnboarding';
 export * from './orgNarrative';
 export * from './fleetDesign';
 export * from './fleetDesignApply';
@@ -1086,10 +1119,14 @@ export * from './scriptParameterDefinitions';
 // ============================================
 
 export * from './tickets';
+export * from './alertExternalRefs';
 export * from './ticketForms';
+export * from './serviceCatalog';
 export * from './queryParams';
 export * from './timeEntries';
 export * from './portal';
+// Portal registration W3 (#11380): access policy patch/view + access-request decide body.
+export * from './portalAccessPolicy';
 export * from './ticketConfig';
 export * from './retiredLabourPricing';
 export * from './retiredAiModelFields';
@@ -1129,6 +1166,7 @@ export {
   type CreateBackupProfileInput,
   type UpdateBackupProfileInput,
 } from './backupTargets';
+export * from './backupDestinationPrefix';
 export {
   deliverableCadenceSchema,
   deliverableCompletionModeSchema,
@@ -1137,17 +1175,22 @@ export {
   listDeliverablesQuerySchema,
   reportRunEvidenceRefSchema,
   documentEvidenceRefSchema,
+  contractDocumentEvidenceRefSchema,
   evidenceRefSchema,
   addEvidenceSchema,
   deliverOccurrenceSchema,
   waiveOccurrenceSchema,
   rescheduleOccurrenceSchema,
+  bulkRescheduleOccurrencesSchema,
   listOccurrencesQuerySchema,
+  moveDeliverablesSchema,
+  type MoveDeliverablesInput,
   type CreateDeliverableInput,
   type UpdateDeliverableInput,
   type DeliverOccurrenceInput,
   type WaiveOccurrenceInput,
   type RescheduleOccurrenceInput,
+  type BulkRescheduleOccurrencesInput,
   type AddEvidenceInput,
   type EvidenceRef,
 } from './serviceDeliverables';
@@ -1169,6 +1212,10 @@ export {
   checklistTemplateItemReorderSchema,
   listChecklistTemplatesQuerySchema,
   applyChecklistTemplateSchema,
+  saveChecklistAsTemplateSchema,
+  duplicateChecklistTemplateSchema,
+  type SaveChecklistAsTemplateInput,
+  type DuplicateChecklistTemplateInput,
   type ChecklistTemplateOwnerScope,
   type CreateChecklistTemplateInput,
   type UpdateChecklistTemplateInput,
@@ -1187,6 +1234,7 @@ export {
   listTemplateSetsQuerySchema,
   applyTemplateSetSchema,
   MANAGED_EVIDENCE_REPORT_TYPES,
+  defaultPortalVisibleForCadence,
   type ManagedEvidenceReportType,
   type CreateTemplateItemInput,
   type UpdateTemplateItemInput,
@@ -1220,6 +1268,9 @@ export {
 // carries no initialisation-order hazard.
 export * from './monitors';
 
+// Alert lifecycle defaults (partner → org → monitor; spec 2026-10-29-alert-rearm-lifecycle §6).
+export * from './alertLifecycle';
+
 // Tool sources (BYO MCP/OpenAPI, spec 2026-09-07)
 export * from './toolSources';
 
@@ -1230,6 +1281,8 @@ export * from './topologyCollection';
 
 export * from './topologyConfiguration';
 
+export * from './topologyPresence';
+
 export * from './topologyDiagnostics';
 
 export { canonicalizeTopologyContext, canonicalizeTopologySection } from './topologyCollectionCanonical';
@@ -1238,6 +1291,9 @@ export { canonicalizeTopologyContext, canonicalizeTopologySection } from './topo
 export * from './topologyPhysical';
 export * from './topologyPhysicalNormalized';
 export * from './topologyUnifiNormalized';
+export * from './topologyUnifiV2';
+export * from './topologyUnifiV2Normalized';
+export { canonicalizeUnifiResourceV2 } from './topologyUnifiV2Canonical';
 export { canonicalizeAdjacencyReport, canonicalizeAdjacencyScope, canonicalizeUnifiResource } from './topologyPhysicalCanonical';
 export type { AdjacencyDigestIdentity, UnifiDigestIdentity } from './topologyPhysicalCanonical';
 
@@ -1384,6 +1440,8 @@ export const maintenanceInlineSettingsSchema = z
 
 export type MaintenanceInlineSettings = z.infer<typeof maintenanceInlineSettingsSchema>;
 export * from './callerVerification';
+export * from './endpointMessage';
+export * from './endpointChat';
 
 // Business reports (#3198 W02)
 export * from './businessReports';
@@ -1396,3 +1454,27 @@ export * from './aiModelOptions';
 export * from './aiModelChoice';
 export * from './aiModelRegistryApi';
 export * from './autopay';
+export * from './flows';
+export * from './businessCalendars';
+export * from './ticketRouting';
+export * from './trustCenter';
+export * from './trustCenterDeclarations';
+export * from './trustCenterAccess';
+export * from './trustCenterContent';
+export * from './trustCenterTemplate';
+export * from './trustCenterEmbed';
+export * from './launchPurchaseSelection';
+export * from './signupIntent';
+export * from './wispConcerns';
+export * from './wispCheckIns';
+export * from './wispNudgePreferences';
+export * from './wispSpecialists';
+export * from './wispStandingInstruction';
+export * from './wisp';
+export * from './flowRuns';
+export * from './flowBudgets';
+export * from './flowWebhooks';
+export * from './flowConversions';
+export * from './networkIsolation';
+export * from './oemUpdates';
+export * from './unitLength';

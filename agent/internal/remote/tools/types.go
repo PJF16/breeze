@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/breeze-rmm/agent/internal/systemrestore"
 	"github.com/breeze-rmm/agent/internal/wire"
 )
 
@@ -54,7 +55,19 @@ const (
 	CmdShutdown       = "shutdown"
 	CmdLock           = "lock"
 	CmdRebootSafeMode = "reboot_safe_mode"
-	CmdWakeOnLan      = "wake_on_lan"
+	// CmdForceReboot (#8729) is an immediate reboot that force-closes running
+	// apps (`/f` on Windows). A separate type, not a flag on `reboot`: older
+	// agents keep reading `reboot`'s wire shape, and an agent that predates this
+	// type fails it visibly as "unknown command type" instead of rebooting unforced.
+	CmdForceReboot = "force_reboot"
+	CmdWakeOnLan   = "wake_on_lan"
+	// CmdOemUpdateRun (#11065) runs one hardware vendor's own update tool
+	// (Dell Command Update first). The API is its only sender, through one gated
+	// dispatch seam; the agent decides alone which tools and hosts it trusts.
+	CmdOemUpdateRun = "oem_update_run"
+	// CmdOemUpdateRelease (#11065 W06) hands a vendor tool's own update
+	// schedule back: the agent restores only what its takeover changed.
+	CmdOemUpdateRelease = "oem_update_release"
 	// On-demand re-run of all inventory collectors. Triggers the same set of
 	// send*Inventory submissions the heartbeat fires periodically, so the API
 	// sees fresh hardware/software/network/etc. without waiting for the next
@@ -269,6 +282,7 @@ const (
 	// Incident response
 	CmdCollectEvidence    = "collect_evidence"
 	CmdExecuteContainment = "execute_containment"
+	CmdReleaseContainment = "release_containment"
 
 	// TCP tunnel relay (VNC + network proxy)
 	CmdTunnelOpen  = "tunnel_open"
@@ -285,6 +299,12 @@ const (
 	CmdActuateElevation = "actuate_elevation"
 	CmdPamApplyV2       = "pam_apply_v2"
 	CmdPamCleanupV2     = "pam_cleanup_v2"
+	CmdPamReconcileV2   = "pam_reconcile_v2"
+
+	// #8928: fire-and-forget outcome notice (denied / expired) for an
+	// elevation request the user handed to IT. Claimable only by agents that
+	// report pamUserNotifyProtocolVersion 1.
+	CmdPamRequestNotify = "pam_request_notify"
 )
 
 // CommandResult represents the result of a command execution
@@ -331,6 +351,13 @@ type CommandResult struct {
 	// primary work began. Set by command handlers that care about the server-
 	// side reconstruction (e.g. software_install). Empty when not applicable.
 	StartedAt string `json:"startedAt,omitempty"`
+	// RestorePoint is the Windows System Restore checkpoint outcome for this
+	// command, when the server asked for one (#4609). A DEDICATED top-level
+	// field rather than a key inside Result/Stdout: script and software-install
+	// results already use Stdout for their own payloads with type-specific
+	// server-side parsers. The REST transport marshals this struct directly;
+	// toWSCommandResult (heartbeat.go) must copy it onto the WebSocket frame.
+	RestorePoint *systemrestore.Outcome `json:"restorePoint,omitempty"`
 }
 
 // NewSuccessResult creates a successful command result with data

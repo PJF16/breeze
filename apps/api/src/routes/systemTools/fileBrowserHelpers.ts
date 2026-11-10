@@ -130,6 +130,8 @@ const REFUSAL_PATTERNS: readonly RegExp[] = [
   /^trash metadata exceeds maximum size/i,
   /^unsupported encoding:/i,
   /^(path|destPath|newPath|oldPath|sourcePath|trashId) is required/i,
+  // filesystem_analysis_gate.go (#8509): a second scan refused while one runs.
+  /^filesystem analysis already in progress/i,
 ];
 
 /** Refusals that are specifically a state conflict the user can reconcile. */
@@ -184,6 +186,20 @@ const AGENT_ERROR_CODE_KIND: Record<AgentCommandErrorCode, AgentRefusalKind> = {
   trash_metadata_too_large: ERROR_CODES.AGENT_COMMAND_REJECTED,
   unsupported_encoding: ERROR_CODES.AGENT_COMMAND_REJECTED,
   invalid_argument: ERROR_CODES.AGENT_COMMAND_REJECTED,
+  scan_in_progress: ERROR_CODES.AGENT_COMMAND_REJECTED,
+  // Network-isolation codes (#10088) only ever ride isolate/release results,
+  // never a file-browser command; they are refusals if one ever did.
+  isolation_unsupported_platform: ERROR_CODES.AGENT_COMMAND_REJECTED,
+  isolation_mechanism_unavailable: ERROR_CODES.AGENT_COMMAND_REJECTED,
+  isolation_apply_error: ERROR_CODES.AGENT_COMMAND_REJECTED,
+  isolation_control_plane_unreachable: ERROR_CODES.AGENT_COMMAND_REJECTED,
+  isolation_enforcement_not_observed: ERROR_CODES.AGENT_COMMAND_REJECTED,
+  isolation_not_delivered: ERROR_CODES.AGENT_COMMAND_REJECTED,
+  isolation_agent_unsupported: ERROR_CODES.AGENT_COMMAND_REJECTED,
+  isolation_episode_mismatch: ERROR_CODES.AGENT_COMMAND_REJECTED,
+  isolation_stale_generation: ERROR_CODES.AGENT_COMMAND_REJECTED,
+  isolation_invalid_spec: ERROR_CODES.AGENT_COMMAND_REJECTED,
+  isolation_busy: ERROR_CODES.AGENT_COMMAND_REJECTED,
 };
 
 function failureForKind(kind: AgentRefusalKind, raw: string): CommandFailure {

@@ -314,13 +314,29 @@ export const backupJobs = pgTable(
     //    unchanged counters) and by the async started/queued ack. NULL means
     //    the agent never sent a lifecycle signal (legacy agent). Also the
     //    "has the helper spoken yet" marker for the queue lifecycle guards.
-    //  - last_progress_at: PROGRESS. Advanced only when transferred_size or
-    //    file_count actually increases. The stale reaper's no-transfer rule
-    //    keys on it; before #2798 it was bumped by the keepalive too, which
-    //    made the stall rule unreachable for a live-but-wedged agent.
+    //  - last_progress_at: PROGRESS. Advanced only when transferred_size,
+    //    file_count, verified_size or verified_files actually increases. The
+    //    stale reaper's no-transfer rule keys on it; before #2798 it was
+    //    bumped by the keepalive too, which made the stall rule unreachable
+    //    for a live-but-wedged agent.
     lastProgressAt: timestamp('last_progress_at', { withTimezone: true }),
     lastKeepaliveAt: timestamp('last_keepalive_at', { withTimezone: true }),
+    // #11013: until when a scheduled job that found its device offline may still
+    // run on the next agent connect. Set only while the job waits; see
+    // jobs/backupCatchUp.ts for its lifecycle.
+    catchUpUntil: timestamp('catch_up_until', { withTimezone: true }),
+    // #11013: backup_configs.approval_generation the waiting job was queued
+    // against (site-ceiling gate contract §3). NULL for a job queued without one.
+    catchUpConfigGeneration: integer('catch_up_config_generation'),
     totalFiles: integer('total_files'),
+    // In flight only (#11014): files, and their source bytes, the agent has
+    // finished CHECKING before deciding whether to upload them — the resume
+    // pass over the checkpoint journal and the dedupe pre-pass re-hash.
+    // Their increase advances last_progress_at, so a multi-hour resume of a
+    // large interrupted snapshot is not reaped as wedged. NULL = the agent
+    // never reported them (older agent, or nothing needed checking).
+    verifiedSize: bigint('verified_size', { mode: 'number' }),
+    verifiedFiles: integer('verified_files'),
     // Incremental-backup dedup stats: files/bytes referenced from a prior
     // snapshot instead of re-transferred this run. NULL = agent didn't report
     // dedup (legacy agent, or nothing was referenced).
@@ -342,6 +358,10 @@ export const backupJobs = pgTable(
     // at publication so GC groups by write-time identity, not the config's
     // possibly-since-edited current one.
     storageIdentity: text('storage_identity'),
+    // #11027: why dispatch gave this file/system_image run no incremental base,
+    // one of BACKUP_FULL_RUN_REASONS (@breeze/shared). NULL = the run had a base,
+    // the mode has no base concept (hyperv/mssql), or it predates this column.
+    fullBackupReason: varchar('full_backup_reason', { length: 64 }),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
   },
@@ -364,6 +384,10 @@ export const backupJobs = pgTable(
     baseSnapshotIdIdx: index('backup_jobs_base_snapshot_id_idx')
       .on(table.baseSnapshotId)
       .where(sql`base_snapshot_id IS NOT NULL`),
+    // #11013: probed on every agent connect; holds deferred rows only.
+    catchUpDeviceIdx: index('backup_jobs_catch_up_device_idx')
+      .on(table.deviceId)
+      .where(sql`status = 'pending' AND catch_up_until IS NOT NULL`),
   })
 );
 
@@ -417,10 +441,13 @@ export const backupSnapshots = pgTable(
     // — the W02 sweep self-heals a NULL row from the storage listing; there
     // is no follow-up NOT NULL migration.
     storageIdentity: text('storage_identity'),
-    // Object-key layout the snapshot was written with. Every writer produces
-    // 'legacy_flat' (snapshots/<snapshotId>/...); readers refuse any other
-    // value (services/backupKeyLayout.ts).
+    // Key root the snapshot's objects live under (#7081): 'legacy_flat' +
+    // NULL prefix (snapshots/<snapshotId>/...) or 'prefixed_flat' + the
+    // normalized destination prefix (<prefix>/snapshots/<snapshotId>/...).
+    // Copied from the id's reservation at publish and immutable (DB
+    // triggers). Readers refuse any other value (services/backupKeyLayout.ts).
     keyLayout: text('key_layout').notNull().default('legacy_flat'),
+    keyPrefix: text('key_prefix'),
     // Bare-metal recovery (W01): disk layout captured at run time and the
     // guard verdict. NULL verdict = not assessed (file-only run / old agent).
     layoutManifest: jsonb('layout_manifest'),
@@ -474,6 +501,9 @@ export const backupSnapshots = pgTable(
   })
 );
 
+/** What a content-less `backup_snapshot_files` row is (#11235). */
+export type SnapshotEntryKind = 'dir' | 'symlink';
+
 export const backupSnapshotFiles = pgTable(
   'backup_snapshot_files',
   {
@@ -485,6 +515,11 @@ export const backupSnapshotFiles = pgTable(
     backupPath: text('backup_path').notNull(),
     size: bigint('size', { mode: 'number' }),
     modifiedAt: timestamp('modified_at'),
+    // #11235: 'dir' / 'symlink' for a content-less entry (backupPath ''),
+    // NULL for a regular file or a content-less row written before the
+    // column existed. Written via contentlessEntryKind
+    // (services/backupSnapshotEntryKind.ts).
+    kind: text('kind').$type<SnapshotEntryKind>(),
     createdAt: timestamp('created_at').defaultNow().notNull(),
   },
   (table) => ({
@@ -558,6 +593,9 @@ export const backupSnapshotRetirements = pgTable(
     // Set by the GC sweep (W02) once the prefix is confirmed empty. NULL =
     // not yet swept. Rows are pruned 30d after this is set.
     sweptAt: timestamp('swept_at', { withTimezone: true }),
+    // Key root of the retired snapshot's objects (#7081); immutable.
+    keyLayout: text('key_layout').notNull().default('legacy_flat'),
+    keyPrefix: text('key_prefix'),
   },
   (table) => ({
     orgIdIdx: index('backup_snapshot_retirements_org_id_idx').on(table.orgId),

@@ -94,11 +94,13 @@ describe('RESERVED_ROUTE_NAMESPACES', () => {
     //   invoiceSettingsRoutes         → orgs, partner
     //   ticketResponseTemplateRoutes  → ticket-response-templates
     //   ticketFormRoutes              → ticket-forms
+    //   ticketApprovalRoutes          → tickets, ticket-approval-requests, time-entries
     //   ticketApprovalSettingsRoutes  → orgs, ticketing
     //   lifecycleRoutes               → me
     //   lifecycleAdminRoutes          → admin
     //   m365CallbackRoute             → c2c
     //   tenantVariableRoutes          → tenant-variables
+    //   serviceCatalogRoutes          → service-catalog
     // If this list changes, open the new sub-router, resolve its top-level
     // segments by hand, and add them to RESERVED_ROUTE_NAMESPACES.
     const rootMounts = [...source.matchAll(ROOT_MOUNT_RE)].map((m) => m[1]!).sort();
@@ -112,7 +114,9 @@ describe('RESERVED_ROUTE_NAMESPACES', () => {
       'lifecycleAdminRoutes',
       'lifecycleRoutes',
       'm365CallbackRoute',
+      'serviceCatalogRoutes',
       'tenantVariableRoutes',
+      'ticketApprovalRoutes',
       'ticketApprovalSettingsRoutes',
       'ticketFormRoutes',
       'ticketResponseTemplateRoutes',
@@ -123,6 +127,7 @@ describe('RESERVED_ROUTE_NAMESPACES', () => {
     'billing',
     'support',
     'tenant-variables',
+    'ticket-approval-requests',
     'ticket-forms',
     'ticket-response-templates',
     'ticketing',

@@ -4,7 +4,7 @@ import { zValidator } from '../lib/validation';
 import { z } from "zod";
 import { and, eq, sql, desc, inArray, lt, gt, isNull, isNotNull, or, asc, getTableColumns } from "drizzle-orm";
 import { customAlphabet } from "nanoid";
-import { db, withSystemDbAccessContext } from "../db";
+import { db, withSystemDbAccessContext, withDbTransaction } from "../db";
 import { enrollmentKeys, organizations } from "../db/schema";
 import { sites } from "../db/schema/orgs";
 import {
@@ -56,7 +56,11 @@ import {
 } from "../services/installerBootstrapTokenIssuance";
 import { MAX_BOOTSTRAP_TOKEN_TTL_MINUTES } from "@breeze/shared";
 import { clampBootstrapTokenTtlMinutes } from "../services/installerBootstrapToken";
-import { assertTtlWithinCap, clampTtlToCap } from "../services/enrollmentDefaults";
+import {
+  assertTtlWithinCap,
+  clampTtlToCap,
+  getEnrollmentDefaultsForOrg,
+} from "../services/enrollmentDefaults";
 import { getDefaultEnrollmentKeyTtlMinutes } from "../services/enrollmentKeyTtlDefault";
 import {
   hasLiveUnexhaustedCapacityToken,
@@ -589,9 +593,10 @@ export async function redeemShortCode(
       .returning({ id: enrollmentKeys.id });
 
     if (claimed.length === 0) {
-      await db
+      // Savepoint so a failed delete cannot poison the surrounding transaction (#11203).
+      await withDbTransaction(async () => db
         .delete(enrollmentKeys)
-        .where(eq(enrollmentKeys.id, child.id))
+        .where(eq(enrollmentKeys.id, child.id)))
         .catch(() => {});
       return null;
     }
@@ -1388,14 +1393,41 @@ enrollmentKeyRoutes.post(
 
     const rawKey = generateEnrollmentKey();
     const keyHash = hashEnrollmentKey(rawKey);
+    // #9616: an omitted expiry / device budget uses the partner→org enrollment
+    // default ONLY when one is explicitly configured. Otherwise the previous
+    // API behaviour holds (1 use; ENROLLMENT_KEY_DEFAULT_TTL_MINUTES expiry) —
+    // enrollment keys are a security surface, so an API client that never set a
+    // count must not silently get the 50-device product default. The web form
+    // sends its resolved values explicitly. Read only when a field is omitted;
+    // a configured TTL is already clamped to the partner cap.
+    const needsDefaults =
+      data.maxUsage === undefined ||
+      (data.ttlMinutes === undefined && data.expiresAt === undefined);
+    const resolvedDefaults = needsDefaults
+      ? await getEnrollmentDefaultsForOrg(orgId)
+      : null;
+    const configuredTtlMinutes = resolvedDefaults?.ttlConfigured
+      ? resolvedDefaults.ttlMinutes
+      : undefined;
+    const configuredDeviceCount = resolvedDefaults?.deviceCountConfigured
+      ? resolvedDefaults.deviceCount
+      : undefined;
     // ttlMinutes preferred wire format (timezone math stays server-side);
     // explicit expiresAt remains accepted for callers that need it.
     const expiresAt = data.ttlMinutes !== undefined
       ? new Date(Date.now() + data.ttlMinutes * 60 * 1000)
       : data.expiresAt
         ? new Date(data.expiresAt)
-        : new Date(Date.now() + DEFAULT_ENROLLMENT_KEY_TTL_MINUTES * 60 * 1000);
-    const maxUsage = data.maxUsage ?? 1;
+        : new Date(
+            Date.now() +
+              (configuredTtlMinutes ??
+                // Deployment fallback is still bound by the partner cap.
+                Math.min(
+                  DEFAULT_ENROLLMENT_KEY_TTL_MINUTES,
+                  resolvedDefaults?.maxTtlMinutes ?? DEFAULT_ENROLLMENT_KEY_TTL_MINUTES,
+                )) * 60 * 1000,
+          );
+    const maxUsage = data.maxUsage ?? configuredDeviceCount ?? 1;
 
     const [enrollmentKey] = await db
       .insert(enrollmentKeys)
@@ -3349,8 +3381,9 @@ publicShortLinkRoutes.get("/:code", async (c) => {
  * Undo a /s/:code redemption that produced no installer (#7217): delete the
  * transport download key it minted (cascading any bootstrap token issued from
  * it) and give the claimed use back to the link. Runs inside the route's
- * system DB context. Failures are logged and reported, never thrown — the
- * visitor still gets the original error response.
+ * system DB context. Failures are logged and reported, never thrown. Deliberately
+ * no savepoint (#11225): a failed statement fails the route's commit, which rolls
+ * back the mint and the claim, so no live download key outlives a failed redemption.
  */
 async function releaseFailedShortLinkClaim(
   c: Context,

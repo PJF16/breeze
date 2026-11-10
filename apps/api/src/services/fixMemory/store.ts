@@ -25,6 +25,7 @@ import {
   type CountedAttempt, type FixOwner,
 } from './aggregate';
 import { signatureForSource, sourceRefFor } from './signatureLoader';
+import { EVIDENCE_HOLD_SCOPED_ERASURE_KEY } from '../orgEvidenceHold';
 
 export type TerminalTransition = { to: 'verified' | 'failed' | 'recurred' | 'inconclusive' | 'cancelled'; reason: string };
 export type OutcomeTransition =
@@ -263,8 +264,19 @@ function noPendingErasureRequest(): SQL {
  * already GONE. The tenant cascade deletes `organizations` last, after the org's
  * fix_outcomes deletions have committed. So an org found absent here has no
  * outcomes left in any snapshot taken after this statement, including the
- * contribution read that follows. Requests live on partner rows only (org rows
- * are deleted by the org cascade), so this needs no partnerScope subquery.
+ * contribution read that follows.
+ *
+ * A merged-away shell under a PAM evidence hold keeps its organizations row
+ * (#8746): its erasure is scoped and stamps
+ * settings.<EVIDENCE_HOLD_SCOPED_ERASURE_KEY> only after the walk, which
+ * deleted its fix_outcomes, has committed. That stamp is the same guarantee,
+ * so such an org counts as gone too; without it the request could not be
+ * satisfied until the hold is released. The stamp counts only while the hold
+ * row stands (it is an engine-owned key a client cannot write, but a stray
+ * copy on a live org must not satisfy anything).
+ *
+ * Requests live on partner rows only (org rows are deleted by the org
+ * cascade), so this needs no partnerScope subquery.
  * Table-qualified, unaliased: the Drizzle column references render as "fix_memory"."…".
  */
 async function erasedPendingOrgIds(identity: IdentityKey): Promise<string[]> {
@@ -276,7 +288,14 @@ async function erasedPendingOrgIds(identity: IdentityKey): Promise<string[]> {
       AND ${fixMemory.signatureKey} = ${identity.signatureKey}
       AND ${fixMemory.osType} = ${identity.osType}
       AND ${fixMemory.fixIdentity} = ${identity.fixIdentity}
-      AND NOT EXISTS (SELECT 1 FROM organizations o WHERE o.id = pending.org_id)`);
+      AND NOT EXISTS (
+        SELECT 1 FROM organizations o
+         WHERE o.id = pending.org_id
+           AND NOT (
+             COALESCE(o.settings, '{}'::jsonb) ? ${EVIDENCE_HOLD_SCOPED_ERASURE_KEY}::text
+             AND EXISTS (SELECT 1 FROM org_evidence_holds h WHERE h.loser_org_id = o.id)
+           )
+      )`);
   return [...rows].map((r) => r.org_id).filter((id): id is string => typeof id === 'string');
 }
 
@@ -689,17 +708,20 @@ export async function deleteDeviceFixOutcomes(
   assertSystemScope('deleteDeviceFixOutcomes');
   const deleted = await tx.execute(sql`
     DELETE FROM fix_outcomes WHERE device_id = ${deviceId}
-    RETURNING partner_id, signature_version, signature_key, os_type, fix_identity, counted_at`) as Iterable<{
+    RETURNING partner_id, signature_version, signature_key, os_type, fix_identity, counted_at, recount_requested_at`) as Iterable<{
       partner_id: string; signature_version: number | null; signature_key: string | null; os_type: string | null;
-      fix_identity: string | null; counted_at: Date | string | null;
+      fix_identity: string | null; counted_at: Date | string | null; recount_requested_at: Date | string | null;
     }>;
   const rows = [...deleted];
   const identities = new Map<string, IdentityKey>();
   for (const r of rows) {
-    // Uncounted rows never fed an aggregate. Counted-but-unsigned rows never did
-    // either: loadContributions only reads rows with a full identity, and such a
-    // row is still waiting on recomputeForOutcome. Neither leaves anything stale.
-    if (r.counted_at === null || r.signature_version === null || !r.signature_key || !r.os_type || !r.fix_identity) continue;
+    // Uncounted rows never fed an aggregate, unless a recount is still pending:
+    // a late agent result re-opens a counted attempt (#7279) and leaves its old
+    // count in the aggregate until that recount runs. Counted-but-unsigned rows
+    // never fed one either: loadContributions only reads rows with a full
+    // identity, and such a row is still waiting on recomputeForOutcome.
+    if (!r.counted_at && !r.recount_requested_at) continue;
+    if (r.signature_version === null || !r.signature_key || !r.os_type || !r.fix_identity) continue;
     const id: IdentityKey = {
       partnerId: r.partner_id, signatureVersion: r.signature_version, signatureKey: r.signature_key,
       osType: r.os_type, fixIdentity: r.fix_identity,
@@ -723,22 +745,32 @@ export async function deleteDeviceFixOutcomes(
   return { deleted: rows.length, identitiesMarked: keys.length };
 }
 
-/** Counted outcomes waiting for an aggregate recount (re-vote, or the inline script hook's terminal verdict). */
+/**
+ * Outcomes waiting for an aggregate recount: a re-vote, the inline script
+ * hook's terminal verdict, or a late agent result that re-opened a counted
+ * attempt (#7279, scriptTerminalHook lateResultWrites). The re-opened row is
+ * uncounted again, so uncounted rows are selected too: recomputeForOutcome
+ * recomputes their identity (dropping what they used to contribute) and clears
+ * the request, so they never spin.
+ */
 export async function recountRequestedOutcomeIds(limit: number): Promise<string[]> {
-  // Active (uncounted) rows are excluded: transitionOutcome recomputes when they
-  // go terminal, so selecting them would only spin every sweep.
   const rows = await db.select({ id: fixOutcomes.id }).from(fixOutcomes)
-    .where(and(isNotNull(fixOutcomes.recountRequestedAt), isNotNull(fixOutcomes.countedAt)))
+    .where(isNotNull(fixOutcomes.recountRequestedAt))
     .orderBy(asc(fixOutcomes.recountRequestedAt)).limit(limit);
   return rows.map((r) => r.id);
 }
 
 /**
- * Recount one counted outcome's identity. The outcome row is locked FIRST
+ * Recount one outcome's identity. The outcome row is locked FIRST
  * (global order: outcome row -> identity lock), so a concurrent re-vote's
  * UPDATE waits until this recount commits and then re-requests another; the
  * unconditional clear below can therefore never swallow a vote that landed
- * after our read. `hooks.afterRecompute` exists only for the interleaving test.
+ * after our read. The same lock orders it against a late-result reconcile
+ * (#7279): one that commits first is read here (uncounted, so its old count is
+ * dropped); one that waits re-checks its CAS on the row this commits and
+ * leaves a fresh request. An uncounted row is recomputed too, so a re-opened
+ * attempt's earlier count leaves the aggregate. `hooks.afterRecompute` exists
+ * only for the interleaving tests.
  */
 export async function recomputeForOutcome(
   outcomeId: string,
@@ -747,11 +779,11 @@ export async function recomputeForOutcome(
 ): Promise<void> {
   assertSystemScope('recomputeForOutcome');
   const [locked] = await db.select().from(fixOutcomes).where(eq(fixOutcomes.id, outcomeId)).limit(1).for('update');
-  if (!locked || !locked.countedAt) return;
+  if (!locked) return;
   const o = await fillOutcomeSignature(locked, now);
   if (o.signatureVersion !== null && o.signatureKey && o.osType && o.fixIdentity) {
     await recomputeIdentity({ partnerId: o.partnerId, signatureVersion: o.signatureVersion, signatureKey: o.signatureKey, osType: o.osType, fixIdentity: o.fixIdentity }, now);
-  } else {
+  } else if (locked.countedAt) {
     // The signature still couldn't be resolved (e.g. the source alert/anomaly
     // row is gone by the time the sweeper ran). There is nothing left to retry
     // against, so clearing the request below is the best available action —

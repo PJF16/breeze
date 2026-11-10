@@ -9,6 +9,7 @@
  * - safeParseJson(): utility for parsing tool output
  */
 
+import { summarizeToolInputForAudit } from './aiToolAuditInput';
 import {
   db,
   withDbAccessContext,
@@ -20,17 +21,20 @@ import { actionIntents } from '../db/schema/actionIntents';
 import { aiSessions, aiMessages, aiToolExecutions, aiActionPlans, devices, deviceSessions, approvalRequests } from '../db/schema';
 import { eq, and, isNull } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
-import type { AiPageContext, AiApprovalMode } from '@breeze/shared/types/ai';
+import type { AiPageContext, AiApprovalMode, AiApprovalOutcome } from '@breeze/shared/types/ai';
 import { DIAGNOSTIC_STATES } from '@breeze/shared/validators/topology';
-import { checkGuardrails, checkToolPermission, checkToolRateLimit, checkPermissionRequirements, type GuardrailContext } from './aiGuardrails';
-import { attachProposalToSession, loadProposalGuardrailContext } from './scriptProposals';
+import { checkGuardrails, checkToolPermission, checkToolRateLimit, checkPermissionRequirements, describeSpecialistRequest, type GuardrailContext } from './aiGuardrails';
+import {
+  attachProposalToSession, loadProposalGuardrailContext, loadProposalGuardrailContextInReach, resolveProposalOrgInReach,
+} from './scriptProposals';
 import {
   guardrailCheckForTenantTool,
   tenantToolPermissionRequirement,
   checkTenantToolRateLimit,
 } from './toolSources/guardrails';
 import { ensureLaneCheckpointBeforeRelease } from './actionIntents/laneCheckpoint';
-import { checkBudget, checkAiRateLimit } from './aiCostTracker';
+import { checkBudgetDetailed, checkAiRateLimit } from './aiCostTracker';
+import { aiDenialClientCode, type AiDenialClientCode } from './aiDenialCode';
 import { sanitizeUserMessage, sanitizePageContext } from './aiInputSanitizer';
 import { getSession, buildSystemPrompt, waitForApproval } from './aiAgent';
 import { TOOL_TIERS, type PreToolUseCallback, type PostToolUseCallback } from './aiAgentSdkTools';
@@ -44,7 +48,26 @@ import {
 import { loadProposalApprovalSummary } from './scriptProposals/approvalSummary';
 import { writeAuditEvent, requestLikeFromSnapshot, type RequestLike } from './auditEvents';
 import type { ActiveSession, AuditSnapshot } from './streamingSessionManager';
+import { recordWispToolOutcome } from './wisp/turnRecord';
+import type { TenantToolDescriptor } from './toolSources/resolver';
+// W5 PR C (#5220): the leaf name rule only; the flow gate and resolver are
+// loaded on first use so this module's import graph does not widen.
+import { isFlowToolName } from './flows/toolNames';
+import type { FlowToolCallInput, FlowToolDescriptor } from './flows/flowTools';
+import type { GrantCeiling } from './wisp/grantAuthority';
+import type { WispCeilingRefusal } from './wisp/chatCeiling';
+// Leaf data module (no imports): loading it never pulls in the Wisp graph.
+import { WISP_SELF_STATE_TOOLS } from './wisp/selfStateTools';
+import { classifyWispUnattendedRead } from './wisp/unattendedReads';
+import {
+  STANDING_CHECK_UNAVAILABLE_MESSAGE,
+  checkStandingInstructionsForCall,
+  standingConflictDescription,
+} from './wisp/standingInstructionGate';
 import { compactToolResultForChat, redactSensitiveToolInput } from './aiToolOutput';
+import { toolInputSchemas, validateToolInput } from './aiToolSchemas';
+import { aiTools as registeredAiTools } from './aiToolNames';
+import { applyHelperDeviceScope } from './helperToolFilter';
 import { dispatchApprovalPushToTokens, getUserPushTokens } from './expoPush';
 import { decideHelperToolAction } from './pamToolActionGovernance';
 import { loadSession, loadConnection } from './m365Helpers';
@@ -59,15 +82,25 @@ import {
 import { buildActionLabel } from './actionIntents/actionLabel';
 import { publishIntentTerminalOutbox } from './aiOperator/taskOutbox';
 import { revalidateApprovedIntentForRelease } from './actionIntents/revalidateRelease';
+import {
+  callerRefusal,
+  callerRefusalFromPayload,
+  CALLER_VERIFICATION_REQUIRED_CODE,
+  CALLER_VERIFICATION_REQUIRED_ERROR,
+  type CallerRefusalPayload,
+} from './callerVerification/refusal';
 import { requiresDurableRelease } from './actionIntents/durableRelease';
 import {
   APPROVED_FAILED_STATUS,
+  buildToolHandoffResult,
   describeIntentOutcome,
   handoffDenialForOutcome,
+  handoffLedgerStatus,
   type HandoffOutcome,
   type ToolHandoffStatus,
 } from './aiToolHandoff';
 import { computeEffectDigestForRelease, hasPinnedDigest } from './actionIntents/effectDigest';
+import { decideIntentOrg, resolveIntentTarget, type IntentTarget } from './actionIntents/intentTargetOrg';
 import { requiresPinnedEffectDigest } from './actionIntents/pinnedEffectPolicy';
 import type { ToolExecutionContext } from './toolExecutionContext';
 import {
@@ -85,8 +118,11 @@ import type { ResolveFailureReason } from './aiModels/eligibility';
 import type { ModelUnavailable, ResolvedModel } from './aiModels/resolveModel';
 import { resolveSessionTurn } from './aiModels/sessionModel';
 import { resolveLiveSessionToolAuthority } from './aiSessionLiveAuthority';
+import { PRE_HOOK_THREW_REFUSAL, recordPreHookRefusal, refusalLedgerText, takeLedgeredRefusal } from './aiChatRefusalLedger';
+import { approvalCardKey, publishPendingCard, resolveApprovalCard } from './sessionPendingCards';
 
 import { SESSION_IDLE_TIMEOUT_MS, SESSION_MAX_AGE_MS } from './aiAgentSessionLimits';
+import { expireIfStale, sessionExpiredError } from './aiSessionExpiry';
 
 export { SESSION_IDLE_TIMEOUT_MS, SESSION_MAX_AGE_MS };
 
@@ -143,10 +179,14 @@ export const TERMINAL_READBACK_BUDGET_MS = 3_000;
  * StreamingSessionManager.startTurnTimeout() at each message_start — the same
  * point the 6-minute turn timeout resets — preserving the invariant that a
  * cycle's approval waits always end before the turn timeout fires.
+ *
+ * `startedAt` (#10416) is when this wait began, so a caller can measure how
+ * long the step waited for its decision.
  */
 function beginApprovalWait(session: ActiveSession): {
   timeoutMs: number;
   signal: AbortSignal;
+  startedAt: number;
   end: () => void;
 } {
   const now = Date.now();
@@ -166,12 +206,42 @@ function beginApprovalWait(session: ActiveSession): {
   return {
     timeoutMs,
     signal,
+    startedAt: now,
     end: () => {
       if (ended) return;
       ended = true;
       session.pendingApprovalWaits = Math.max(0, (session.pendingApprovalWaits ?? 1) - 1);
     },
   };
+}
+
+/**
+ * #9431: a legacy `waitForApproval` result as a card outcome. `false` means
+ * denied or timed out — unless the wait was settled (new message, interrupt,
+ * teardown), in which case nothing was decided.
+ */
+function approvalWaitOutcome(approved: boolean, signal: AbortSignal): AiApprovalOutcome {
+  if (approved) return 'approved';
+  return signal.aborted ? 'ended' : 'not_approved';
+}
+
+/** #9431: an intent status read by `waitForIntentDecision` as a card outcome. */
+function intentDecisionOutcome(status: Awaited<ReturnType<typeof waitForIntentDecision>>): AiApprovalOutcome {
+  switch (status) {
+    case 'approved':
+    case 'executing':
+    case 'completed':
+    case 'failed':
+      return 'approved';
+    case 'rejected':
+    case 'expired':
+    case 'cancelled':
+      return 'not_approved';
+    default:
+      // pending_approval: the chat stopped waiting, but the intent can still
+      // be decided in Approvals.
+      return 'ended';
+  }
 }
 
 /**
@@ -271,7 +341,7 @@ export async function settleBlockedTurnForNewMessage(
  * match already makes), so a single pending id per session is sufficient.
  * WeakMap so an evicted/closed session's entry is GC'd with it.
  */
-const pendingIntentBySession = new WeakMap<ActiveSession, string>();
+const pendingIntentBySession = new WeakMap<ActiveSession, { intentId: string; orgId: string }>();
 
 /**
  * How the most recent tier>=2 call for a session was authorized, so the
@@ -291,8 +361,18 @@ type ApprovalMethod =
   | 'pam' // helper session — PAM elevation policy/approver decision
   | 'plan_step' // pre-authorized step of a human-approved action plan
   | 'auto_approve_mode' // session runs auto_approve; Tier 2 executes unprompted
-  | 'read_only_auto'; // #3130 read-only Tier-2 allowlist; auto-executes in any un-paused mode
+  | 'read_only_auto' // #3130 read-only Tier-2 allowlist; auto-executes in any un-paused mode
+  | 'wisp_self_state_auto' // #10392 Wisp bookkeeping write under a live grant (wisp/selfStateTools.ts)
+  | 'wisp_unattended_read'; // #10973 one of the four reads under the grant's unattended-reads switch
 const lastApprovalBySession = new WeakMap<ActiveSession, { toolName: string; method: ApprovalMethod }>();
+
+/**
+ * #10973: the input objects the gate let through as unattended reads, so the
+ * post hook resolves the same tier as the gate. Keyed by the call's own input
+ * rather than `lastApprovalBySession`, because a Security query's tier depends on
+ * it and the SDK may run sibling calls in parallel.
+ */
+const unattendedReadInputs = new WeakSet<object>();
 
 // Methods that represent an explicit decision on this specific call (a human
 // approver, or the PAM policy ceremony for helper sessions). Plan steps count:
@@ -306,6 +386,18 @@ const DECIDED_APPROVAL_METHODS: ReadonlySet<ApprovalMethod> = new Set([
   'pam',
   'plan_step',
 ]);
+
+/**
+ * The approval method a decided tier>=2 call records: the durable tier-3
+ * intent (requester self-decided a SUPERVISED intent, or a second approver
+ * decided a four_eyes one — an unscoped tier 3 never defaults to the weaker
+ * `supervised_self`) or the tier-2 lightweight card. Shared by the inline
+ * release and the #9530 worker hand-off so the two cannot drift.
+ */
+function decidedApprovalMethod(check: { tier: number; approvalScope?: string }): ApprovalMethod {
+  if (check.tier >= 3) return check.approvalScope === 'supervised' ? 'supervised_self' : 'action_intent';
+  return 'per_step_user';
+}
 
 /** Consume the recorded approval method for the audit event's details. */
 function approvalAuditDetails(
@@ -331,6 +423,13 @@ function approvalAuditDetails(
  */
 const INLINE_TOOL_EXECUTION_FAILED_ERROR_CODE = 'tool_execution_failed';
 
+/** The exact object `callerRefusal` emits for a thrown typed refusal. */
+function isCallerRefusalResult(result: Record<string, unknown>): boolean {
+  const payload = result.requiresCallerVerification;
+  return result.error === CALLER_VERIFICATION_REQUIRED_ERROR
+    && typeof payload === 'object' && payload !== null;
+}
+
 // SECRET_SEAL_INVARIANT_VIOLATED_ERROR_CODE and MAX_RESULT_BYTES (aliased
 // here as MAX_INLINE_RESULT_BYTES for readability at call sites below) are
 // shared with the durable release worker via secretBearingTools.ts, rather
@@ -338,13 +437,21 @@ const INLINE_TOOL_EXECUTION_FAILED_ERROR_CODE = 'tool_execution_failed';
 // see the doc comments at their declaration site.
 
 /**
- * Human-readable verbs for the two M365 mutation tools that hit per-step
+ * Human-readable verbs for the ten M365 mutation tools that hit per-step
  * approval. The three read tools are tier 1 and never create an approval card,
  * so they are intentionally absent.
  */
 const M365_VERB: Record<string, string> = {
   m365_reset_password: 'Reset M365 password for',
   m365_disable_user: 'Disable M365 sign-in for',
+  m365_revoke_sessions: 'Revoke all M365 sessions for',
+  m365_remove_license: 'Remove M365 licences from',
+  m365_assign_license: 'Assign M365 licences to',
+  m365_remove_from_group: 'Remove from M365 group',
+  m365_add_to_group: 'Add to M365 group',
+  m365_retire_intune_device: 'Retire Intune device for',
+  m365_create_user: 'Create M365 user',
+  m365_set_auto_reply: 'Set M365 auto-reply for',
 };
 
 /**
@@ -386,8 +493,14 @@ export type PreFlightResult = {
   ok: false;
   error: string;
   status?: number;
-  /** A recoverable model-resolution failure (the route answers 409 with it). */
-  code?: ResolveFailureReason;
+  /**
+   * A recoverable refusal the route answers 409 with: a model-resolution
+   * failure (choose another model), or `turn_limit_reached` (the session's
+   * turn budget is spent; start a new session — Wisp rolls one itself).
+   */
+  code?: ResolveFailureReason | 'turn_limit_reached';
+  /** The credit / plan gate refused the turn (status is 402): the code the client switches on. */
+  billingCode?: AiDenialClientCode;
 };
 
 /**
@@ -406,9 +519,33 @@ function unresolvedTurn(turn: ModelUnavailable): Extract<PreFlightResult, { ok: 
   return { ok: false, error: turn.message, status: 409, code: turn.reason };
 }
 
+
+/**
+ * Runs one DB phase of the pre-flight inside a short RLS context — the route's
+ * `inRequestDb` (a fresh caller-scoped `withAuthDbAccessContext`).
+ */
+export type PreFlightDbPhaseRunner = <T>(fn: () => Promise<T>) => Promise<T>;
+
+/** No runner: each phase runs in whatever context the caller already holds. */
+const runPreFlightPhaseInAmbientContext: PreFlightDbPhaseRunner = (fn) => fn();
+
+type PreFlightSession = NonNullable<Awaited<ReturnType<typeof getSession>>>;
+
 /**
  * Validates rate limits, budget, session status, expiration, and sanitizes input.
  * Returns all values needed to proceed with message processing, or an error.
+ *
+ * #10415 / #1105: the per-user and per-org message rate limits are Redis
+ * round-trips, so they must not run while a `withDbAccessContext` transaction
+ * is held — that pins a pooled connection idle-in-transaction for the
+ * round-trip, and for any event-loop stall that lands on it. With `inDb` the
+ * checks run as two DB phases with the rate limit BETWEEN them and no
+ * connection checked out. The order is unchanged: the session read and turn
+ * resolution still precede the rate limit (a missing session or an unresolved
+ * model consumes no capacity), and the rate limit still precedes the budget
+ * and session-state checks (a request those refuse still consumes capacity).
+ * Callers that pass `inDb` must NOT also wrap this call in a context, or the
+ * rate limit runs inside it again.
  */
 export async function runPreFlightChecks(
   sessionId: string,
@@ -418,7 +555,31 @@ export async function runPreFlightChecks(
   requestContext?: RequestLike,
   /** W05: the composer's model choice on this message (chat only; strict user resolution). */
   choice?: AiModelChoice,
+  inDb: PreFlightDbPhaseRunner = runPreFlightPhaseInAmbientContext,
 ): Promise<PreFlightResult> {
+  const loaded = await inDb(() => loadPreFlightTurn(sessionId, auth, choice));
+  if (!loaded.ok) return loaded;
+  const { session, model } = loaded;
+
+  // Rate limits — between the DB phases (see above). checkAiRateLimit
+  // self-contexts its effective-budget read when no context is held (#2190).
+  try {
+    const rateLimitError = await checkAiRateLimit(auth.user.id, session.orgId);
+    if (rateLimitError) return { ok: false, error: rateLimitError };
+  } catch (err) {
+    console.error('[AI-SDK] Rate limit check failed:', err);
+    return { ok: false, error: 'Unable to verify rate limits. Please try again.' };
+  }
+
+  return inDb(() => runPreFlightAdmission(sessionId, content, auth, session, model, pageContext, requestContext));
+}
+
+/** Pre-flight DB phase 1: the caller's session and this turn's resolved model. */
+async function loadPreFlightTurn(
+  sessionId: string,
+  auth: AuthContext,
+  choice: AiModelChoice | undefined,
+): Promise<{ ok: true; session: PreFlightSession; model: ResolvedModel } | Extract<PreFlightResult, { ok: false }>> {
   const session = await getSession(sessionId, auth);
   if (!session) {
     return { ok: false, error: 'Session not found' };
@@ -438,22 +599,32 @@ export async function runPreFlightChecks(
     return { ok: false, error: 'AI configuration could not be loaded. Try again.', status: 503 };
   }
   if (!turn.ok) return unresolvedTurn(turn);
-  const model: ResolvedModel = turn;
+  return { ok: true, session, model: turn };
+}
 
-  // Rate limits
-  try {
-    const rateLimitError = await checkAiRateLimit(auth.user.id, orgId);
-    if (rateLimitError) return { ok: false, error: rateLimitError };
-  } catch (err) {
-    console.error('[AI-SDK] Rate limit check failed:', err);
-    return { ok: false, error: 'Unable to verify rate limits. Please try again.' };
-  }
+/**
+ * Pre-flight DB phase 2, after the rate limit: budget, session state and
+ * expiry, input sanitisation and the system prompt.
+ */
+async function runPreFlightAdmission(
+  sessionId: string,
+  content: string,
+  auth: AuthContext,
+  session: PreFlightSession,
+  model: ResolvedModel,
+  pageContext: AiPageContext | undefined,
+  requestContext: RequestLike | undefined,
+): Promise<PreFlightResult> {
+  const orgId = session.orgId;
 
   // Budget
   try {
     // Funding from the RESOLVED offering (quorum #4).
-    const budgetError = await checkBudget(orgId, model.funding);
-    if (budgetError) return { ok: false, error: budgetError };
+    const denial = await checkBudgetDetailed(orgId, model.funding);
+    if (denial) {
+      const billingCode = aiDenialClientCode(denial.reason);
+      return { ok: false, error: denial.message, status: 402, ...(billingCode ? { billingCode } : {}) };
+    }
   } catch (err) {
     console.error('[AI-SDK] Budget check failed:', err);
     return { ok: false, error: 'Unable to verify budget. Please try again.' };
@@ -476,27 +647,15 @@ export async function runPreFlightChecks(
   }
 
   if (session.turnCount >= session.maxTurns) {
-    return { ok: false, error: `Session turn limit reached (${session.maxTurns})` };
+    // Coded 409: a client can roll to a fresh session (Wisp does, on its one
+    // thread) instead of showing a dead end. Nothing ran, so a re-send is safe.
+    return { ok: false, error: `Session turn limit reached (${session.maxTurns})`, status: 409, code: 'turn_limit_reached' };
   }
 
-  // Session expiration
-  const now = Date.now();
-  const sessionAge = now - new Date(session.createdAt).getTime();
-  const idleTime = now - new Date(session.lastActivityAt).getTime();
-
-  if (sessionAge > SESSION_MAX_AGE_MS) {
-    await db.update(aiSessions)
-      .set({ status: 'expired', updatedAt: new Date() })
-      .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.status, 'active')));
-    return { ok: false, error: 'Session has expired (24h max age). Please start a new session.' };
-  }
-
-  if (idleTime > SESSION_IDLE_TIMEOUT_MS) {
-    await db.update(aiSessions)
-      .set({ status: 'expired', updatedAt: new Date() })
-      .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.status, 'active')));
-    return { ok: false, error: 'Session has expired due to inactivity. Please start a new session.' };
-  }
+  // Session expiration (#11430: the one rule, shared with GET /sessions/:id and
+  // the idle sweep): stamps 'expired' and schedules the Wisp summary finalize.
+  const expiry = await expireIfStale(session);
+  if (expiry) return { ok: false, error: sessionExpiredError(expiry) };
 
   // Sanitize input
   const { sanitized: sanitizedContent, flags: sanitizeFlags } = sanitizeUserMessage(content);
@@ -542,9 +701,32 @@ export async function runPreFlightChecks(
       });
     }
   }
-  const systemPrompt = sanitizedPageContext
-    ? await buildSystemPrompt(auth, sanitizedPageContext)
-    : (session.systemPrompt ?? await buildSystemPrompt(auth));
+  let systemPrompt: string;
+  // Resolve the live ceiling BEFORE rebuilding a Wisp prompt: record context
+  // and the thread seed must both respect the grant, not just the caller.
+  if (sanitizedPageContext && session.wispGrantId) {
+    const { lookupWispGrant, wispSeedForSession, WispSessionUnavailableError } = await import('./wisp/chatCeiling');
+    const { resolveGrantCeiling, GrantInactiveError } = await import('./wisp/grantAuthority');
+    try {
+      const grant = await lookupWispGrant(sessionId);
+      if (!grant) throw new WispSessionUnavailableError('grant_unpinned', sessionId);
+      const ceiling = await resolveGrantCeiling(grant.grantId, grant.revisionId);
+      systemPrompt = [
+        await buildSystemPrompt(auth, sanitizedPageContext, undefined, ceiling),
+        await wispSeedForSession(grant, auth, ceiling, sanitizedPageContext, model.logicalModel),
+      ].filter(Boolean).join('\n');
+    } catch (err) {
+      if (err instanceof WispSessionUnavailableError) return { ok: false, error: err.message, status: 409 };
+      if (err instanceof GrantInactiveError && err.kind !== 'corrupt') {
+        return { ok: false, error: 'Your Wisp grant is no longer active. Start a new Wisp conversation to continue.', status: 409 };
+      }
+      throw err;
+    }
+  } else {
+    systemPrompt = sanitizedPageContext
+      ? await buildSystemPrompt(auth, sanitizedPageContext)
+      : (session.systemPrompt ?? await buildSystemPrompt(auth));
+  }
 
   // A durable reservation is acquired immediately before provider dispatch by
   // the route. Returning an advisory remaining-budget snapshot here would
@@ -582,7 +764,9 @@ async function transitionIntentAndPublish(
   return withSystemDbAccessContext(async () => {
     const won = await transitionIntent(intentId, 'executing', to, patch);
     if (won) {
-      await publishIntentTerminalOutbox(db, { id: intentId, orgId, taskId: null }, event);
+      // Chat intents are never flow-originated (this path only transitions
+      // intents its own session minted), so there is no run to wake.
+      await publishIntentTerminalOutbox(db, { id: intentId, orgId, taskId: null, requestingFlowRunId: null }, event);
     }
     return won;
   });
@@ -737,13 +921,37 @@ function reportLostTerminalCas(opts: {
  * governs its tier-2+ calls), or any non-user principal — passes the loaded
  * proposal context through untouched and keeps the base Tier 3. Used by BOTH
  * the gate and postToolUse so the two always resolve the same tier.
+ *
+ * #10973: `unattendedReads` adds the grant-level switch, for the same kind of
+ * principal only.
  */
 function chatGuardrailContext(
   session: ActiveSession,
   base: GuardrailContext | undefined,
+  opts: { unattendedReads?: boolean } = {},
 ): GuardrailContext | undefined {
   const interactiveChat = session.auth.principal?.kind === 'user_session' && !session.auth.helperDeviceId;
-  return interactiveChat ? { ...base, chatSession: true } : base;
+  if (!interactiveChat) return base;
+  return { ...base, chatSession: true, ...(opts.unattendedReads ? { wispUnattendedReads: true } : {}) };
+}
+
+/**
+ * #10973: can the grant's unattended-reads switch apply to this call at all?
+ * The live ceiling must say on, and the gate must be able to skip the card, under
+ * the same carve-outs as every other auto-execution (see the read-only branch in
+ * the gate). A call that fails this keeps its base tier: a paused session's
+ * Security query stays a durable Tier-3 intent instead of becoming a lighter card.
+ */
+function unattendedReadsApply(
+  session: ActiveSession,
+  wispState: WispCallState | null,
+  customTool: boolean,
+): boolean {
+  if (wispState?.ceiling.unattendedReads !== true || customTool || session.isPaused) return false;
+  if (session.auth.principal?.kind !== 'user_session' || session.auth.helperDeviceId) return false;
+  const planInFlight = Boolean(session.activePlanId)
+    && (session.approvalMode === 'action_plan' || session.approvalMode === 'hybrid_plan');
+  return !planInFlight;
 }
 
 /**
@@ -774,15 +982,422 @@ export function intentCreationRefusal(toolName: string, input: unknown, err: unk
       + 'Call get_script_proposal: its executions list each run\'s executionId, and get_script_execution reads '
       + 'that run\'s output. To run the script again, submit it as a new proposal with propose_script.';
   }
+  // #8600: a device-group refusal (too large, not found, empty, out of scope,
+  // malformed) says what to do instead. The messages are existence-neutral by
+  // construction (actionIntents/runScriptGroupTarget.ts), so they are safe to
+  // hand back to the model verbatim.
+  if (toolName === 'run_script' && typeof code === 'string' && code.startsWith('group_target_') && err instanceof Error) {
+    return `${code}: ${err.message}`;
+  }
+  // W16 PR B (#6786): nothing pins for a design outside the intent's org or one that
+  // is missing. One message for both, so it does not say whether the id exists.
+  if (toolName === 'manage_fleet_designs' && code === 'effect_digest_unresolvable') {
+    return 'fleet_design_not_found: Nothing was filed. No Fleet Design with this report id could be read in the '
+      + 'organization this request belongs to. Check the id with list_fleet_designs and try again.';
+  }
   return 'Failed to create approval record';
 }
 
+/**
+ * #9854: the refusal `executeTool` would return for this input, computed
+ * before approval so a call that can never run is not put to a human.
+ *
+ * Validates exactly what `executeTool` will validate: the helper-scoped input
+ * for a Helper session (`applyHelperDeviceScope`), the raw input otherwise.
+ * Only core tools with a `toolInputSchemas` entry are checked here — tenant
+ * (BYO MCP), extension and session-aware tools validate on their own path,
+ * and `validateToolInput` refuses a tool with no schema outright.
+ */
+function preApprovalInputRefusal(
+  session: ActiveSession,
+  toolName: string,
+  input: Record<string, unknown>,
+  isTenantTool: boolean,
+): string | null {
+  if (isTenantTool || !Object.hasOwn(toolInputSchemas, toolName)) return null;
+  let effectiveInput = input;
+  if (session.auth.helperDeviceId) {
+    const scoped = applyHelperDeviceScope(toolName, input, session.auth.helperDeviceId);
+    if ('error' in scoped) return scoped.error;
+    effectiveInput = scoped.input;
+  }
+  const validation = validateToolInput(toolName, effectiveInput);
+  return validation.success ? null : validation.error;
+}
+
+/**
+ * #11432: what `AiTool.validateBeforeFiling` refuses for this call, or null.
+ * Read from the shared registry map (`aiToolNames.ts`), which `aiTools.ts`
+ * fills, so this module never imports the registry hub itself. A tool without
+ * the hook is left to its handler, and its call's reach is never built here.
+ */
+function preFilingToolRefusal(toolName: string, input: Record<string, unknown>, auth: () => AuthContext): string | null {
+  const validate = registeredAiTools.get(toolName)?.validateBeforeFiling;
+  if (!validate) return null;
+  const verdict = validate(input, auth());
+  return verdict.ok ? null : verdict.error;
+}
+
+// ============================================
+// Wisp W04 Task 4 — the delegation ceiling on every chat tool call
+// ============================================
+
+/** A Wisp call's verified ceiling, kept until the call's allowed exit. */
+type WispCallState = {
+  ceiling: GrantCeiling;
+  permissionKeys: string[];
+  /** #11432: the thread-focus write default the gate resolved; every narrowing of this call passes it. */
+  writeDefaultOrgId: string | null;
+  narrow: typeof import('./wisp/chatCeiling').narrowAuthToCeiling;
+};
+
+/** The gate itself could not run (DB down, module failure): the call is denied, never ungated. */
+export const WISP_GATE_UNAVAILABLE_MESSAGE =
+  "Wisp couldn't verify your grant for this action, so it wasn't run. Try again in a moment.";
+
+function auditWispRefusal(
+  session: ActiveSession,
+  toolName: string,
+  refusal: WispCeilingRefusal,
+): void {
+  if (!session.auditSnapshot || !session.wispGrant) return;
+  writeAuditEvent(requestLikeFromSnapshot(session.auditSnapshot), {
+    orgId: session.orgId,
+    action: 'wisp.ceiling_refused',
+    resourceType: 'ai_session',
+    resourceId: session.breezeSessionId,
+    actorId: session.auth.user.id,
+    actorEmail: session.auth.user.email,
+    initiatedBy: 'ai',
+    result: 'failure',
+    errorMessage: refusal.message,
+    details: { toolName, code: refusal.code, detail: refusal.detail, grantId: session.wispGrant.grantId },
+  });
+}
+
+/**
+ * Run `enforceWispCeiling` for one call of a Wisp session against the
+ * session's CURRENT `toolAuth`. Never throws: a refusal is audited and returned
+ * as the user-visible denial; an unexpected error denies with
+ * WISP_GATE_UNAVAILABLE_MESSAGE (fail closed — there is no ungated fallback).
+ * The Wisp graph is imported lazily, as in createSession: an ordinary session
+ * never loads it.
+ */
+async function runWispCeilingGate(
+  session: ActiveSession,
+  toolName: string,
+  input: Record<string, unknown>,
+  tenant: TenantToolDescriptor | undefined,
+): Promise<{ ok: true; state: WispCallState } | { ok: false; denial: { allowed: false; error: string } }> {
+  const grant = session.wispGrant;
+  try {
+    if (!grant) throw new Error('runWispCeilingGate called for a session without a Wisp grant');
+    const { enforceWispCeiling, narrowAuthToCeiling } = await import('./wisp/chatCeiling');
+    const result = await enforceWispCeiling({
+      grant,
+      toolName,
+      // A tenant (BYO MCP) tool acts in the org its executor is handed
+      // (streamingSessionManager's getOrgId), whatever its own arguments say.
+      input: tenant ? {} : input,
+      sessionOrgId: tenant ? (session.toolAuth.orgId ?? session.orgId) : session.orgId,
+      sessionId: session.breezeSessionId,
+      toolAuth: session.toolAuth,
+      ...(tenant ? { permissionRequirement: tenantToolPermissionRequirement(tenant.tier) } : {}),
+    });
+    if (!result.ok) {
+      auditWispRefusal(session, toolName, result.refusal);
+      return { ok: false, denial: { allowed: false, error: result.refusal.message } };
+    }
+    return {
+      ok: true,
+      state: {
+        ceiling: result.ceiling,
+        permissionKeys: result.permissionKeys,
+        writeDefaultOrgId: result.writeDefaultOrgId ?? null,
+        narrow: narrowAuthToCeiling,
+      },
+    };
+  } catch (err) {
+    console.error(`[AI-SDK] Wisp ceiling gate failed for '${toolName}' (session ${session.breezeSessionId}); denying`, err);
+    captureException(err, undefined, { service: 'aiAgentSdk', orgId: session.orgId });
+    auditWispRefusal(session, toolName, { code: 'wisp_gate_unavailable', detail: 'unavailable', message: WISP_GATE_UNAVAILABLE_MESSAGE });
+    return { ok: false, denial: { allowed: false, error: WISP_GATE_UNAVAILABLE_MESSAGE } };
+  }
+}
+
+/**
+ * #10428 W06: the standing-instruction check for one Wisp call, under the
+ * ceiling this call passed. Never throws: any failure refuses the call (only
+ * a Wisp Tier >= 2 call reaches it).
+ */
+async function standingInstructionCheck(
+  session: ActiveSession,
+  wispState: WispCallState,
+  toolName: string,
+  input: Record<string, unknown>,
+): Promise<{ action: 'refuse'; error: string } | { action: 'warn'; text: string } | { action: 'none' }> {
+  try {
+    // The call's own reach expands a run_script group target to its devices.
+    return await checkStandingInstructionsForCall({ ceiling: wispState.ceiling, toolName, input, auth: callReach(session, wispState) });
+  } catch (err) {
+    console.error(`[AI-SDK] Standing-instruction check failed for '${toolName}'; refusing`, err);
+    captureException(err instanceof Error ? err : new Error(String(err)));
+    return { action: 'refuse', error: STANDING_CHECK_UNAVAILABLE_MESSAGE };
+  }
+}
+
+/**
+ * #10193 — who an approval raised from this chat session is attributed to on
+ * the approval row, the mobile push and the intent: Wisp under a grant (the
+ * grant-driven voice, #10131), Breeze AI otherwise.
+ */
+function chatApprovalClientLabel(session: ActiveSession): string {
+  return session.wispGrant ? 'Wisp' : 'Breeze AI';
+}
+
+/**
+ * The org reach of ONE tool call: the session's tool auth, cut to the Wisp
+ * ceiling when a grant governs the session (the same narrowing the allowed
+ * exit of `createSessionPreToolUse` hands the handler). Used to resolve a
+ * record the call names by id (#10384) without reaching further than the
+ * handler itself could.
+ */
+function callReach(session: ActiveSession, wispState: WispCallState | null): AuthContext {
+  const toolAuth = session.toolAuth ?? session.auth;
+  return wispState
+    ? wispState.narrow(toolAuth, wispState.ceiling, session.breezeSessionId, wispState.permissionKeys, wispState.writeDefaultOrgId)
+    : toolAuth;
+}
+
+/**
+ * #10144 — the coordinator's cheap, deterministic gates for one
+ * `launch_specialist` call, run after RBAC and the rate limit but before any
+ * approval card: a call the coordinator would refuse (`wisp_grant_required`,
+ * `unknown_kind`, `invalid_params`, `no_sweep_schedule`, `no_effective_agent`,
+ * `agent_disabled` (#10193), …) is refused here with the SAME code (and
+ * `message`) the tool's handler returns, and nobody is asked to approve a
+ * request that cannot run. Runs after the Wisp ceiling
+ * gate, so the target org is already inside the grant; on a pass it returns
+ * that org's name for the card.
+ *
+ * Advisory, never authority: `requestSpecialist` re-runs every gate when the
+ * approved call executes. So a precheck that cannot run (DB hiccup) is
+ * reported and the call proceeds to its normal approval — failing it closed
+ * would block a request the coordinator may well admit.
+ */
+async function specialistPreApprovalGate(
+  session: ActiveSession,
+  input: Record<string, unknown>,
+  wispState: WispCallState | null,
+): Promise<{ ok: true; orgName: string | null } | { ok: false; denial: { allowed: false; error: string; detail?: string; message?: string } }> {
+  // The tool is inert without a grant (aiToolsWisp: GRANT_REQUIRED) — a plain
+  // chat session must not ask for approval first.
+  if (!session.wispGrant || !wispState) {
+    return { ok: false, denial: { allowed: false, error: 'wisp_grant_required' } };
+  }
+  try {
+    // Lazy, as aiToolsWisp does: the coordinator's closure reaches the tool registry.
+    const { precheckSpecialistRequest } = await import('./wisp/coordinator');
+    const result = await precheckSpecialistRequest({
+      orgId: String(input.orgId),
+      partnerId: wispState.ceiling.partnerId,
+      kind: String(input.kind),
+      params: input.params && typeof input.params === 'object' ? input.params as Record<string, unknown> : {},
+    });
+    if (result.ok) return { ok: true, orgName: result.orgName };
+    return {
+      ok: false,
+      denial: {
+        allowed: false,
+        error: result.refused,
+        ...(result.detail ? { detail: result.detail } : {}),
+        // #10193: the sentence the model reads back (names a switched-off agent).
+        ...(result.message ? { message: result.message } : {}),
+      },
+    };
+  } catch (err) {
+    console.error(`[AI-SDK] launch_specialist precheck failed (session ${session.breezeSessionId}); asking for approval as before`, err);
+    captureException(err instanceof Error ? err : new Error(String(err)), undefined, { service: 'aiAgentSdk', orgId: session.orgId });
+    return { ok: true, orgName: null };
+  }
+}
+
+/**
+ * #10392 — may this Wisp bookkeeping call run without the per_step card? The
+ * per-tool scopes live in wisp/selfStateTools.ts. Any doubt keeps the card:
+ * a tool outside the map, a memory owner other than the grantor, a missing
+ * concernId, a concern this grant did not raise, or a lookup that fails.
+ */
+async function wispSelfStateSkipsCard(
+  session: ActiveSession,
+  toolName: string,
+  input: Record<string, unknown>,
+  wispState: WispCallState,
+): Promise<boolean> {
+  switch (WISP_SELF_STATE_TOOLS.get(toolName)) {
+    case 'adds_row':
+      return true;
+    // The handler pins the row to the call's grant (cancelCheckIn is keyed on
+    // grant_id), so the only rows it can touch are this grant's own.
+    case 'own_thread':
+      return true;
+    // W07 (#11496): only a notify check-in is a pure add. A `run` one spends
+    // grant budget unattended when it fires; an unrecognised mode asks too.
+    case 'notify_check_in':
+      return input.mode === undefined || input.mode === 'notify';
+    case 'own_memory':
+      return input.ownerKind === 'user';
+    case 'own_concern': {
+      if (typeof input.concernId !== 'string') return false;
+      try {
+        const { isLiveConcernRaisedByGrant } = await import('./wisp/concerns');
+        return await isLiveConcernRaisedByGrant(wispState.ceiling, input.concernId);
+      } catch (err) {
+        console.error(`[AI-SDK] Wisp own-concern lookup failed for '${toolName}' (session ${session.breezeSessionId}); asking for approval`, err);
+        captureException(err instanceof Error ? err : new Error(String(err)), undefined, { service: 'aiAgentSdk', orgId: session.orgId });
+        return false;
+      }
+    }
+    default:
+      return false;
+  }
+}
+
+/**
+ * The chat pre-tool gate. For a Wisp session (`session.wispGrant` set — always
+ * resolved by streamingSessionManager.getOrCreate from the ai_sessions row),
+ * every allowed exit carries `toolAuth`: the session's current tool auth cut
+ * to the ceiling for THIS call (its org and permissions). It is computed at
+ * the exit, so a tier-2 live refresh that replaced `session.toolAuth` is
+ * re-narrowed, and it is returned per call rather than written to the shared
+ * session because the SDK runs calls concurrently. An allowed exit of a Wisp
+ * session that never passed the gate is a wiring bug and is denied.
+ */
 export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallback {
-  return async (toolName, input, mcpToolName) => {
+  const gated = createGatedSessionPreToolUse(session);
+  const decide = async (
+    ledger: PreHookLedgerState,
+    toolName: string,
+    input: Record<string, unknown>,
+    mcpToolName: string | undefined,
+  ): ReturnType<PreToolUseCallback> => {
+    const wispCall: { current: WispCallState | null } = { current: null };
+    const result = await gated(wispCall, ledger, toolName, input, mcpToolName);
+    if (!result.allowed || !session.wispGrant) return result;
+    if (!wispCall.current) {
+      captureException(new Error(`Wisp session ${session.breezeSessionId} reached an allowed exit for '${toolName}' without the ceiling gate`));
+      return { allowed: false, error: WISP_GATE_UNAVAILABLE_MESSAGE };
+    }
+    const { ceiling, permissionKeys, writeDefaultOrgId, narrow } = wispCall.current;
+    const toolAuth = narrow(session.toolAuth, ceiling, session.breezeSessionId, permissionKeys, writeDefaultOrgId);
+    const autoLinkTags = {
+      op: 'wisp.auto_link', toolName, threadId: session.wispGrant.threadId,
+      grantId: ceiling.grantId, sessionId: session.breezeSessionId,
+    };
+    // Load while the gate is still awaited. The detached success hook must
+    // enter autoLinkFocalAct (and reserve its slots) synchronously, before the
+    // tool result can reach the SDK and settlement can reset the turn count.
+    let autoLinkFocalAct: typeof import('./wisp/autoLink').autoLinkFocalAct;
+    try {
+      ({ autoLinkFocalAct } = await import('./wisp/autoLink'));
+    } catch (err) {
+      console.error(`[AI-SDK] Auto-link module unavailable for ${toolName}:`, err);
+      captureException(err, undefined, autoLinkTags);
+      return { ...result, toolAuth };
+    }
+    return {
+      ...result,
+      toolAuth,
+      onSuccess: async (callInput) => {
+        try {
+          await autoLinkFocalAct({ session, toolName, input: callInput, auth: toolAuth, ceiling });
+        } catch (err) {
+          console.error(`[AI-SDK] Auto-link failed for ${toolName}:`, err);
+          captureException(err, undefined, autoLinkTags);
+        }
+      },
+    };
+  };
+  // #10411: every refusal leaves exactly one ai_tool_executions row. A gate
+  // that already wrote this call's row (an approval or audit record) owns it;
+  // otherwise the refusal is recorded here, and an approval HANDOFF is not a
+  // refusal at all (the release worker owns that row).
+  return async (toolName, input, mcpToolName, toolUseId) => {
+    const ledger: PreHookLedgerState = { rowWritten: false };
+    let result: Awaited<ReturnType<PreToolUseCallback>>;
+    try {
+      result = await decide(ledger, toolName, input, mcpToolName);
+    } catch (err) {
+      if (!ledger.rowWritten) {
+        await recordPreHookRefusal(session, toolName, input, { error: PRE_HOOK_THREW_REFUSAL }, toolUseId);
+      }
+      throw err;
+    }
+    if (!result.allowed && !result.handoff && !ledger.rowWritten) {
+      await recordPreHookRefusal(session, toolName, input, result, toolUseId);
+    }
+    return result;
+  };
+}
+
+/**
+ * #10411: a `pending` approval row whose call was refused before any intent
+ * or approval could decide it is closed `refused` with the refusal text, so
+ * it does not sit in `pending` with no reason. Guarded on `pending` (a racing
+ * writer that already terminal-marked it wins). Best-effort.
+ */
+async function closePendingLedgerRowAsRefused(session: ActiveSession, executionId: string, reason: string): Promise<void> {
+  try {
+    await withDbAccessContext(
+      { scope: 'organization', orgId: session.orgId, accessibleOrgIds: [session.orgId] },
+      () =>
+        db
+          .update(aiToolExecutions)
+          .set({ status: 'refused', errorMessage: refusalLedgerText({ error: reason }), completedAt: new Date() })
+          .where(and(eq(aiToolExecutions.id, executionId), eq(aiToolExecutions.status, 'pending'))),
+    );
+  } catch (err) {
+    captureException(err instanceof Error ? err : new Error(String(err)));
+    console.error('[AI-SDK] Failed to close a refused pending approval record:', executionId, err instanceof Error ? err.message : err);
+  }
+}
+
+/** Per call: set once a gate below has inserted this call's ai_tool_executions row (#10411). */
+interface PreHookLedgerState {
+  rowWritten: boolean;
+}
+
+/** #10400: a tool call after the stream stopped the turn at its work-turn limit. */
+export const WORK_TURN_LIMIT_REFUSAL = 'This turn reached the conversation turn limit.';
+
+function createGatedSessionPreToolUse(session: ActiveSession) {
+  return async (
+    wispCall: { current: WispCallState | null },
+    ledger: PreHookLedgerState,
+    toolName: string,
+    input: Record<string, unknown>,
+    mcpToolName?: string,
+  ): ReturnType<PreToolUseCallback> => {
     // Set only by the tier-3 branch below when it creates a durable intent;
     // carried on the terminal `return` so postToolUse can seal against the
     // right intent without relying solely on pendingIntentBySession.
     let createdIntentId: string | undefined;
+    // #10416: how long this call waited on its approval card (tier-2 or a
+    // tier-3 intent). Set whenever such a wait completes; returned only on a
+    // Wisp session's allowed exit (denials and timeouts discard it).
+    let approvalWaitMs: number | undefined;
+
+    // #10400: the stream stopped this turn at its work-turn limit; a call it
+    // emitted on the way out gets no gate, intent or approval card.
+    if (session.workTurnLimitStopped) return { allowed: false, error: WORK_TURN_LIMIT_REFUSAL };
+
+    // The org a Tier-3 action intent for this call lives in. The session org,
+    // except for a run_script whose reviewed proposal resolves to another org
+    // in reach (#10384): the intent must share the proposal's org, because
+    // consumeProposalForIntent, loadProposalForRelease and the release ceiling
+    // all key on `action_intents.org_id`. Every intent-scoped write below
+    // (terminal CAS + outbox, pinned card read) uses this, never session.orgId.
+    let intentOrgId = session.orgId;
 
     // Material the inline RELEASE below resolved and verified against the
     // intent's pinned effect digest (#3409 PR4c-1). It rides the same terminal
@@ -800,10 +1415,28 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
     // every REAL session (streamingSessionManager.ts) always sets it, but
     // pre-existing test fixtures across this file's sibling suites build a
     // hand-rolled `as any` session and predate this field.
-    const tenant = session.tenantTools?.get(toolName);
+    //
+    // W5 PR C (#5220): a FLOW tool (`flow__<slug>`) is checked FIRST — a
+    // tenant map entry of that name is never consulted
+    // (`splitQualifiedToolName('flow__x')` parses as slug `flow`). The flow is
+    // re-resolved LIVE here (gated at its current invocation tier, Decision 8)
+    // and its input validated against its declarations; the resolved
+    // descriptor rides `verifiedToolContext.flowToolGate` to the SDK handler.
+    let flowTool: FlowToolDescriptor | undefined;
+    let flowCall: FlowToolCallInput | undefined;
+    if (isFlowToolName(toolName)) {
+      const { gateFlowToolCall } = await import('./flows/flowToolGate');
+      const gate = await gateFlowToolCall(session, toolName, input);
+      if (!gate.ok) return { allowed: false, error: gate.error };
+      flowTool = gate.descriptor;
+      flowCall = gate.call;
+      verifiedToolContext = { flowToolGate: { descriptor: gate.descriptor, call: gate.call } };
+      (session.flowToolGatedTiers ??= new Map()).set(toolName, gate.descriptor.tier);
+    }
+    const tenant = flowTool || isFlowToolName(toolName) ? undefined : session.tenantTools?.get(toolName);
 
     // Reject unknown tools (defense-in-depth — SDK whitelist should already filter)
-    if (!TOOL_TIERS[toolName] && !tenant) {
+    if (!TOOL_TIERS[toolName] && !tenant && !flowTool) {
       return { allowed: false, error: `Unknown tool: ${toolName}` };
     }
 
@@ -848,21 +1481,129 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
       };
     }
 
+    // Wisp W04 Task 4 (w00 A14): a session under a delegation grant passes the
+    // live ceiling on EVERY call — Tier 1 included — before guardrails, so a
+    // refusal never reaches approval, RBAC or the tier-2 live-authority branch.
+    if (session.wispGrant) {
+      const gate = await runWispCeilingGate(session, toolName, input, tenant);
+      if (!gate.ok) return gate.denial;
+      wispCall.current = gate.state;
+    }
+
+    // #9854: validate the input against the tool's full schema BEFORE any
+    // guardrail, approval card, action intent or PAM elevation exists. The SDK
+    // tool shapes carry no refinements (e.g. the AI path deny-list on
+    // execute_command file_read/file_list), so a call the platform will always
+    // refuse used to reach a human for approval and fail only afterwards, in
+    // executeTool. Mirrors createMcpActionIntent (mcpIntentCreation.ts).
+    // executeTool keeps its own check as the backstop.
+    const inputRefusal = preApprovalInputRefusal(session, toolName, input, tenant !== undefined || flowTool !== undefined);
+    if (inputRefusal) return { allowed: false, error: inputRefusal };
+
     // Guardrails (tier check + action-based escalation). A proposal-backed
     // run_script needs the proposal's reviewed risk tier to pick supervised vs
     // four_eyes; every other tool call passes `undefined` and is unchanged. A
     // tenant (BYO MCP) tool has no proposal/action-escalation shape of its
     // own — it maps straight to guardrailCheckForTenantTool's tier.
-    const guardrailCheck = tenant
+    //
+    // #10384: a run_script proposal is resolved within THIS call's reach (the
+    // session's tool auth, cut to the Wisp ceiling under a grant), not pinned
+    // to the session org: propose_script files a proposal under its target
+    // device's org, which a partner-scope session can reach without being
+    // bound to it. Everything keyed on the proposal below (the card summary,
+    // the action intent, the intent's terminal writes) uses its org.
+    const proposalReach = !flowTool && !tenant && toolName === 'run_script' ? callReach(session, wispCall.current) : null;
+    const runScriptProposal = proposalReach
+      ? await loadProposalGuardrailContextInReach(input, (orgId) => proposalReach.canAccessOrg(orgId))
+      : null;
+    if (runScriptProposal?.proposalOrgId) intentOrgId = runScriptProposal.proposalOrgId;
+    // #11181 (generalising W16 PR A and PR B, #6786): a call that changes another org in
+    // reach files its intent in THAT org, as a proposal does above. The approvers, the
+    // stored reason and a durable release's rebuilt authority are all keyed on
+    // `action_intents.org_id`, so a session-org intent would have an approver of org A
+    // approving a change to org B, and a worker release would refuse. Which calls name
+    // their org, and how, is `actionIntents/intentTargetOrg.ts`: an org ARGUMENT or a ROW
+    // named by id (#11222) outside reach refuses below (Tier 3 only, so a read still reaches
+    // its handler), and so does a named row that is missing or could not be read; a design
+    // tool's row outside reach stays in the session org with nothing about it on the card,
+    // so a foreign id reveals nothing; a partner-wide effect stays in the session org. A
+    // design tool's failed row lookup is non-fatal: the intent stays in the session org and
+    // the card says it is short. A Fleet Design of another org then has no pin for that org,
+    // so no intent is filed; a schedule's handler answers not found or refuses at release.
+    let designCardDetail: string | undefined;
+    let intentOrgRefusal: string | undefined;
+    if (!flowTool && !tenant) {
+      // Only a design tool's row read can throw: an argument target is read from the input
+      // alone, and a row-identified write's failed read comes back refused, so the fail-open
+      // below never covers either, and neither does a reach failure.
+      const reach = callReach(session, wispCall.current);
+      let target: IntentTarget | null = null;
+      try {
+        target = await resolveIntentTarget(toolName, input);
+      } catch (err) {
+        captureException(err instanceof Error ? err : new Error(String(err)));
+        console.error('[AI-SDK] Failed to resolve a design tool\'s target org:', err);
+        designCardDetail = 'The details of this change could not be loaded, so this card may not show everything it affects.';
+      }
+      if (target) {
+        const decision = decideIntentOrg(target, reach);
+        if (decision.kind === 'target') intentOrgId = decision.orgId;
+        if (decision.kind === 'refuse') intentOrgRefusal = decision.error;
+        else designCardDetail = decision.cardDetail;
+      }
+    }
+    const unattendedReads = unattendedReadsApply(session, wispCall.current, Boolean(flowTool || tenant));
+    let guardrailCheck = flowTool
+      ? (await import('./flows/flowToolGate')).guardrailCheckForFlowTool(flowTool)
+      : tenant
       ? guardrailCheckForTenantTool(tenant)
       : checkGuardrails(
         toolName,
         input,
-        chatGuardrailContext(session, await loadProposalGuardrailContext(input, session.orgId)),
+        chatGuardrailContext(
+          session,
+          runScriptProposal ? runScriptProposal.context : await loadProposalGuardrailContext(input, session.orgId),
+          { unattendedReads },
+        ),
       );
+    // #10973: the classified call, for the card skip below. Tier 2 only, so a
+    // Tier-3 resolution (and anything outside the four) never takes that path.
+    const unattendedRead = unattendedReads && guardrailCheck.tier === 2
+      ? guardrailCheck.wispUnattendedRead ?? classifyWispUnattendedRead(toolName, input)
+      : null;
 
     if (!guardrailCheck.allowed) {
       return { allowed: false, error: guardrailCheck.reason ?? 'Blocked by guardrails' };
+    }
+
+    // W5 PR C (#5220, Decision 8): `run_flow` keeps static Tier 3 (contracts
+    // and listings read the upper bound), but the chat gate lowers it to the
+    // target flow's live invocation tier through the same resolver the flow
+    // tools use. Never raised above the static verdict; ANY failure keeps it.
+    // The lowered tier is PINNED to the publication it was computed for
+    // (`runFlowGate` on the call context): the handler starts the run on that
+    // publication only, so a re-enable during a Tier-2 confirmation wait can
+    // never run a higher-tier publication at the lowered tier.
+    if (toolName === 'run_flow' && guardrailCheck.tier === 3) {
+      let gate: Awaited<ReturnType<typeof import('./flows/flowTools').resolveRunFlowGate>> = { tier: 3 };
+      try {
+        const { resolveRunFlowGate } = await import('./flows/flowTools');
+        gate = await resolveRunFlowGate(session.toolAuth ?? session.auth, input, session.orgId);
+      } catch (err) {
+        console.error('[AI-SDK] run_flow tier resolution failed; keeping tier 3', err);
+        gate = { tier: 3 };
+      }
+      if (gate.tier !== 3) {
+        const { approvalScope: _scope, ...rest } = guardrailCheck;
+        guardrailCheck = { ...rest, tier: gate.tier, requiresApproval: gate.tier >= 2, readOnly: gate.tier === 1 };
+        verifiedToolContext = { ...verifiedToolContext, runFlowGate: { flowId: gate.flowId, publicationSeq: gate.publicationSeq } };
+      }
+    }
+
+    // #11181: an approval-class call naming an org it cannot reach is refused, never filed
+    // in the session org instead (see the target resolution above).
+    if (intentOrgRefusal && guardrailCheck.tier === 3) {
+      return { allowed: false, error: intentOrgRefusal };
     }
 
     // #7906: a read-only event_logs_query was classified on a strictly-parsed
@@ -873,7 +1614,13 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
 
     // RBAC permission check
     try {
-      const permError = tenant
+      const permError = flowTool
+        // W5 PR C: Tier 1 ⇒ automations.read, Tier ≥ 2 ⇒ automations.write;
+        // rule 7 per step is startToolRun's (and the approver's, at release).
+        ? await checkPermissionRequirements(session.auth, [
+          (await import('./flows/flowToolGate')).flowToolPermissionRequirement(flowTool.tier),
+        ])
+        : tenant
         ? await checkPermissionRequirements(session.auth, [tenantToolPermissionRequirement(tenant.tier)])
         : await checkToolPermission(toolName, input, session.auth);
       if (permError) {
@@ -889,8 +1636,10 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
       const rateLimitErr = tenant
         ? await checkTenantToolRateLimit(tenant, session.auth.user.id)
         // #6476: the session's org picks the toolRateLimitMultiplier; the
-        // counter itself stays per user per tool across orgs.
-        : await checkToolRateLimit(toolName, session.auth.user.id, {
+        // counter itself stays per user per tool across orgs. W5 PR C: every
+        // flow tool shares run_flow's counter (a dynamic name has no limit of
+        // its own, and starting a flow is the same capability either way).
+        : await checkToolRateLimit(flowTool ? 'run_flow' : toolName, session.auth.user.id, {
           orgId: session.orgId,
           partnerId: session.auth.partnerId ?? null,
         });
@@ -902,6 +1651,40 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
       return { allowed: false, error: 'Unable to verify rate limits. Please try again.' };
     }
 
+    // #11432: the tool's own deterministic refusal (`validateBeforeFiling`),
+    // judged under the auth its handler will run with (this call's reach),
+    // after RBAC and the rate limit (their refusals win) and before any
+    // approval card or intent. A create with no orgId on a partner-wide
+    // session used to be filed, approved with step-up, and only then refused
+    // as ambiguous. The handler keeps the same check.
+    if (!flowTool && !tenant) {
+      const filingRefusal = preFilingToolRefusal(toolName, input, () => callReach(session, wispCall.current));
+      if (filingRefusal) return { allowed: false, error: filingRefusal };
+    }
+
+    // #10144: a launch_specialist call the coordinator would refuse
+    // deterministically never reaches an approval card; an admitted one gets
+    // the org's name on its card. After RBAC and the rate limit (so its reads
+    // are permissioned and metered), before any approval below.
+    let specialistOrgName: string | null = null;
+    if (toolName === 'launch_specialist' && !tenant) {
+      const gate = await specialistPreApprovalGate(session, input, wispCall.current);
+      if (!gate.ok) return gate.denial;
+      specialistOrgName = gate.orgName;
+    }
+
+    // #10428 W06 (spec §5.3): a Wisp device-changing call meets the user's
+    // remembered standing instructions before any card. A confirmed,
+    // enforceable deny on an exact verb refuses it here; any other match
+    // forces a card (even under auto-approve) carrying a conflict banner.
+    // Narrowing only. Re-checked after a Tier-2 card's wait below.
+    let standingConflict: { text: string } | null = null;
+    if (guardrailCheck.tier >= 2 && wispCall.current && !flowTool && !tenant) {
+      const standing = await standingInstructionCheck(session, wispCall.current, toolName, input);
+      if (standing.action === 'refuse') return { allowed: false, error: standing.error };
+      if (standing.action === 'warn') standingConflict = { text: standing.text };
+    }
+
     // Tier 2+: Requires user approval (mutating and destructive tools)
     // NOTE: This callback runs inside the background processor which operates
     // outside the request's AsyncLocalStorage DB context (via runOutsideDbContext).
@@ -911,7 +1694,9 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
     if (guardrailCheck.tier >= 2) {
       const refreshTier2Authority = async (error: string) => {
         try {
-          const live = await resolveLiveSessionToolAuthority(session, toolName, input);
+          // W5 PR C: a flow tool has no RBAC mapping of its own; starting a
+          // Tier ≥ 2 flow is run_flow's capability (automations.write).
+          const live = await resolveLiveSessionToolAuthority(session, flowTool ? 'run_flow' : toolName, flowTool ? {} : input);
           if (!live.ok) {
             if (session.auditSnapshot) {
               writeAuditEvent(requestLikeFromSnapshot(session.auditSnapshot), {
@@ -931,6 +1716,14 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           }
           session.auth = live.auth;
           session.toolAuth = live.toolAuth;
+          if (session.wispGrant) {
+            // An approval wait can outlive the grant: re-read the ceiling
+            // against the refreshed auth. The allowed exit narrows the new
+            // `toolAuth` from this state (createSessionPreToolUse).
+            const recheck = await runWispCeilingGate(session, toolName, input, tenant);
+            if (!recheck.ok) return recheck.denial;
+            wispCall.current = recheck.state;
+          }
           return null;
         } catch (err) {
           console.error('[AI-SDK] Live Tier-2 authority revalidation failed:', toolName, err);
@@ -976,6 +1769,7 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
                 .returning()
           );
           helperExec = row;
+          if (row) ledger.rowWritten = true;
         } catch (err) {
           console.error('[AI-SDK] Failed to create helper approval record:', toolName, err);
           return { allowed: false, error: 'Failed to create approval record' };
@@ -984,7 +1778,9 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           return { allowed: false, error: 'Failed to create approval record' };
         }
 
-        session.eventBus.publish({
+        // #9427: tracked until the decision below ends, however it ends.
+        const helperCardKey = approvalCardKey(helperExec.id);
+        publishPendingCard(session, helperCardKey, {
           type: 'approval_required',
           executionId: helperExec.id,
           approvalWindowMs: session.approvalWaitBudgetMs,
@@ -992,37 +1788,47 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           input,
           description: guardrailCheck.description ?? `Execute ${toolName}`,
           requiresAdminApproval: true,
+          // #10416: PAM policy or an administrator decides, never the requester.
+          waitingOn: 'other_approvers',
         });
 
-        const decision = await decideHelperToolAction({
-          orgId: session.orgId,
-          deviceId: helperDeviceId,
-          executionId: helperExec.id,
-          toolName: stripMcpPrefix(toolName),
-          toolInput: input as Record<string, unknown>,
-          riskTier: guardrailCheck.tier,
-          subjectUsername: session.auth.user.name ?? 'helper',
-        });
-
-        if (decision === 'denied') {
-          return { allowed: false, error: 'This action was denied by organization policy' };
-        }
-
-        // Block until PAM decides (an auto-approved elevation has already
-        // flipped the row, so this returns on the first poll). Draws from the
-        // same shared per-cycle approval-wait budget as the tier-2/tier-3
-        // flows (#3089) so stacked helper approvals can't outlive the turn
-        // timeout, and settleApprovalWaits can conclude a blocked helper turn.
-        const helperApprovalWait = beginApprovalWait(session);
         let approved: boolean;
+        // #9431: how the card's wait ended, for every other listener.
+        let helperOutcome: AiApprovalOutcome = 'ended';
         try {
-          approved = await waitForApproval(
-            helperExec.id,
-            helperApprovalWait.timeoutMs,
-            helperApprovalWait.signal,
-          );
+          const decision = await decideHelperToolAction({
+            orgId: session.orgId,
+            deviceId: helperDeviceId,
+            executionId: helperExec.id,
+            toolName: stripMcpPrefix(toolName),
+            toolInput: input as Record<string, unknown>,
+            riskTier: guardrailCheck.tier,
+            subjectUsername: session.auth.user.name ?? 'helper',
+          });
+
+          if (decision === 'denied') {
+            helperOutcome = 'not_approved';
+            return { allowed: false, error: 'This action was denied by organization policy' };
+          }
+
+          // Block until PAM decides (an auto-approved elevation has already
+          // flipped the row, so this returns on the first poll). Draws from the
+          // same shared per-cycle approval-wait budget as the tier-2/tier-3
+          // flows (#3089) so stacked helper approvals can't outlive the turn
+          // timeout, and settleApprovalWaits can conclude a blocked helper turn.
+          const helperApprovalWait = beginApprovalWait(session);
+          try {
+            approved = await waitForApproval(
+              helperExec.id,
+              helperApprovalWait.timeoutMs,
+              helperApprovalWait.signal,
+            );
+            helperOutcome = approvalWaitOutcome(approved, helperApprovalWait.signal);
+          } finally {
+            helperApprovalWait.end();
+          }
         } finally {
-          helperApprovalWait.end();
+          resolveApprovalCard(session, helperExec.id, helperOutcome);
         }
         if (!approved) {
           // Mirrors the tier-2/tier-3 close-out below: on an early settle
@@ -1092,15 +1898,38 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
       //     auto-execute through the plan branch below anyway (tier < 3);
       //     an UNmatched read during a plan is a deviation and deliberately
       //     still prompts, same as before this change.
-      const readOnlyAutoExec =
-        guardrailCheck.readOnly === true &&
-        !session.isPaused &&
-        !(session.activePlanId && (effectiveMode === 'action_plan' || effectiveMode === 'hybrid_plan'));
-      if (guardrailCheck.tier === 2 && (effectiveMode === 'auto_approve' || readOnlyAutoExec)) {
+      const planInFlight = Boolean(session.activePlanId)
+        && (effectiveMode === 'action_plan' || effectiveMode === 'hybrid_plan');
+      const readOnlyAutoExec = guardrailCheck.readOnly === true && !session.isPaused && !planInFlight;
+      // #10392: Wisp's own bookkeeping writes (wisp/selfStateTools.ts —
+      // memory, concerns, thread links; never a device) skip the card the
+      // same way, with the same two carve-outs, but only for a call that
+      // passed the live Wisp ceiling gate this turn (`wispCall.current`) and
+      // only within the tool's scope (the grantor's own memory, a concern
+      // this grant raised, or a pure add). Tier 2 only, so a Tier-3
+      // resolution never takes this path. Evaluated last so the own-concern
+      // lookup runs only when nothing else already decided the call.
+      const wispSelfStateAutoExec = guardrailCheck.tier === 2
+        && effectiveMode !== 'auto_approve'
+        && !readOnlyAutoExec
+        && !unattendedRead
+        && wispCall.current !== null
+        && !tenant
+        && !flowTool
+        && !session.isPaused
+        && !planInFlight
+        && await wispSelfStateSkipsCard(session, toolName, input, wispCall.current);
+      // #10428 W06: a standing-instruction warning always reaches a human.
+      if (guardrailCheck.tier === 2 && !standingConflict && (effectiveMode === 'auto_approve' || readOnlyAutoExec || wispSelfStateAutoExec || unattendedRead)) {
         const liveDenial = await refreshTier2Authority(
           'Authorization changed before execution; the action was not executed.',
         );
         if (liveDenial) return liveDenial;
+        // #10973: the refresh re-read the ceiling. The switch turned off in
+        // between refuses the call rather than running it on the old answer.
+        if (unattendedRead && wispCall.current?.ceiling.unattendedReads !== true) {
+          return { allowed: false, error: 'Authorization changed before execution; the action was not executed.' };
+        }
         try {
           await withDbAccessContext(
             { scope: 'organization', orgId: session.orgId, accessibleOrgIds: [session.orgId] },
@@ -1112,14 +1941,23 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
                 status: 'executing',
               })
           );
+          ledger.rowWritten = true;
         } catch (err) {
           console.error('[AI-SDK] Failed to create auto-approve audit record:', toolName, err);
           return { allowed: false, error: 'Failed to create audit record. Please try again.' };
         }
         lastApprovalBySession.set(session, {
           toolName,
-          method: effectiveMode === 'auto_approve' ? 'auto_approve_mode' : 'read_only_auto',
+          method: unattendedRead
+            ? 'wisp_unattended_read'
+            : effectiveMode === 'auto_approve'
+              ? 'auto_approve_mode'
+              : readOnlyAutoExec ? 'read_only_auto' : 'wisp_self_state_auto',
         });
+        if (unattendedRead) {
+          unattendedReadInputs.add(input);
+          verifiedToolContext = { ...verifiedToolContext, pinnedWispUnattendedRead: unattendedRead };
+        }
         return { allowed: true, ...(verifiedToolContext ? { context: verifiedToolContext } : {}) };
       }
 
@@ -1191,6 +2029,7 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
        */
       const releaseHandoffDenial = async (
         intentId: string,
+        executionId: string,
       ): Promise<{ allowed: false; error: string; handoff: ToolHandoffStatus }> => {
         const readBack = beginApprovalWait(session);
         let outcome: HandoffOutcome;
@@ -1224,6 +2063,55 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           readBack.end();
         }
 
+        // #9530: the human DID approve this call — both callers sit behind the
+        // decision gate, which only lets approved/executing/completed/failed
+        // through — and only the executor differs. That stays true even if the
+        // intent later expired or was cancelled before the worker ran it; the
+        // audit row's `toolOutcome` (approved_failed) and error carry that
+        // half. Without this the postToolUse audit row read approved:false /
+        // approvalMethod:'unknown', contradicting `action_intent.approved`.
+        lastApprovalBySession.set(session, { toolName, method: decidedApprovalMethod(guardrailCheck) });
+
+        // #9530: close the execution-ledger row. Nothing else will — the worker
+        // never touches ai_tool_executions, and postToolUse's update is guarded
+        // on `executing`, which this branch never sets — so it stayed `pending`
+        // with no output forever. The stored output is the hand-off payload the
+        // model reads (already default-deny projected), NEVER the raw intent
+        // result, which can carry sealed secrets. Guarded on `pending` so it
+        // can never clobber a row another path already closed. Best-effort: a
+        // failed write leaves the old `pending` row, and must not change what
+        // the turn reports.
+        const ledgerStatus = handoffLedgerStatus(outcome.handoff);
+        try {
+          await withDbAccessContext(
+            { scope: 'organization', orgId: session.orgId, accessibleOrgIds: [session.orgId] },
+            () =>
+              db
+                .update(aiToolExecutions)
+                .set({
+                  status: ledgerStatus,
+                  toolOutput: { ...buildToolHandoffResult(outcome.handoff, outcome.message) },
+                  ...(ledgerStatus === 'failed'
+                    ? { errorMessage: (outcome.reason ?? outcome.message).slice(0, 1000) }
+                    : {}),
+                  ...(ledgerStatus === 'approved' ? {} : { completedAt: new Date() }),
+                })
+                .where(and(
+                  eq(aiToolExecutions.id, executionId),
+                  eq(aiToolExecutions.status, 'pending'),
+                )),
+          );
+        } catch (err) {
+          console.error(`[AI-SDK] Failed to close hand-off execution record ${executionId}:`, err);
+          captureException(err instanceof Error ? err : new Error(String(err)), undefined, {
+            area: 'ai_handoff_ledger_close',
+            intent_id: intentId,
+            execution_id: executionId,
+            session_id: session.breezeSessionId,
+            tool_name: toolName,
+          });
+        }
+
         return await failMatchedPlanStep(
           handoffDenialForOutcome(outcome),
           // Only a confirmed failure stops the plan; an action that is still
@@ -1234,7 +2122,9 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
 
       if ((effectiveMode === 'action_plan' || effectiveMode === 'hybrid_plan') && session.activePlanId) {
         const match = matchPlanStep(session, toolName, input);
-        if (match.matches && guardrailCheck.tier < 3 && !isSecretBearingTool(toolName)) {
+        // #10428 W06: a step that now conflicts with a standing instruction
+        // takes the card below (the plan's approval never saw the banner).
+        if (match.matches && guardrailCheck.tier < 3 && !isSecretBearingTool(toolName) && !standingConflict) {
           const liveDenial = await refreshTier2Authority(
             'Authorization changed after plan approval; the action was not executed.',
           );
@@ -1260,6 +2150,7 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
                   status: 'executing',
                 })
             );
+            ledger.rowWritten = true;
           } catch (err) {
             console.error('[AI-SDK] Failed to create plan-step audit record:', toolName, err);
             return { allowed: false, error: 'Failed to create audit record. Please try again.' };
@@ -1327,6 +2218,7 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
               .returning()
         );
         approvalExec = row;
+        if (row) ledger.rowWritten = true;
       } catch (err) {
         console.error('[AI-SDK] Failed to create approval record:', toolName, err);
         return await failMatchedPlanStep({ allowed: false, error: 'Failed to create approval record' });
@@ -1418,16 +2310,23 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
       // proposal-backed run_script carries a trimmed summary on the event.
       // Non-fatal and null for every other tool.
       const scriptProposal = toolName === 'run_script'
-        ? await loadProposalApprovalSummary(input as Record<string, unknown>, session.orgId)
+        ? await loadProposalApprovalSummary(input as Record<string, unknown>, intentOrgId)
         : null;
 
-      const baseDescription = guardrailCheck.description ?? `Execute ${toolName}`;
+      const namedDescription = specialistOrgName
+        ? describeSpecialistRequest(input, specialistOrgName)
+        : guardrailCheck.description ?? `Execute ${toolName}`;
+      const baseDescription = designCardDetail ? `${namedDescription} ${designCardDetail}` : namedDescription;
       // Appended to the DESCRIPTION (not only to the SSE field) so it reaches
       // every surface that renders one: the chat card, the durable intent's
       // stored reason, the /approvals queue, and the mobile push.
-      const description = scriptRunContext
+      const contextDescription = scriptRunContext
         ? `${baseDescription}. ${describeScriptRunContext(scriptRunContext)}`
         : baseDescription;
+      // #10428 W06: the conflict leads the description, for the same reason.
+      const description = standingConflict
+        ? standingConflictDescription(standingConflict.text, contextDescription)
+        : contextDescription;
 
       if (guardrailCheck.tier >= 3) {
         // Hoisted above the try below (unlike `intent`, which stays
@@ -1475,18 +2374,32 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           // old direct approval_requests insert + dispatchApprovalPushToTokens
           // call: createActionIntent is now the single place that does both.
           let intent: Awaited<ReturnType<typeof createActionIntent>>;
+          // W5 PR C (#5220): a Tier-3 FLOW tool binds the intent to the flow +
+          // publication this gate resolved (immutable `invoked_flow_id` /
+          // `flowpub:<id>`); its arguments are the COERCED call and its org
+          // the run org. Released only by the durable worker (durableRelease).
+          const flowBinding = flowTool && flowCall
+            ? (await import('./flows/flowToolGate')).flowToolIntentBinding(flowTool, flowCall, session.orgId)
+            : null;
           try {
             intent = await createActionIntent(session.auth, {
               toolName,
-              input: input as Record<string, unknown>,
+              input: flowBinding ? flowBinding.input : input as Record<string, unknown>,
               source: 'chat',
               reason: riskSummary,
               actionLabel: riskSummary,
-              orgId: session.orgId,
+              // #10193: a Wisp session's approval is Wisp's; otherwise the
+              // intent service's chat default ("Breeze AI") applies.
+              ...(session.wispGrant ? { requestingClientLabel: chatApprovalClientLabel(session) } : {}),
+              orgId: flowBinding ? flowBinding.orgId : intentOrgId,
+              ...(flowBinding ? { invokedFlow: flowBinding.invokedFlow } : {}),
               // #6475 — a supervised chat intent expires with the org's
               // configured interactive approval window, not a fixed 5 min,
               // so the wait below is not cut short by the intent's own expiry.
               chatApprovalWindowMs: session.approvalWaitBudgetMs,
+              // #6354 W05 — the chat session id the caller-verification gate
+              // matches a fresh verification against (protected M365 actions).
+              m365SessionId: session.breezeSessionId,
               // Tool catalog W01 PR B (#5216): a tenant (BYO MCP) tool binds
               // the intent to the exact tool row + revision this session
               // resolved, so release revalidation reloads THAT row and fails
@@ -1504,8 +2417,17 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
                 : {}),
             });
           } catch (err) {
-            console.error('[AI-SDK] Failed to create action intent:', toolName, err);
-            return await failMatchedPlanStep({ allowed: false, error: intentCreationRefusal(toolName, input, err) });
+            // A typed caller-verification refusal is the gate's answer, not a
+            // fault: carry its payload intact instead of the generic wording.
+            const refusal = callerRefusal(err);
+            const denial = refusal
+              ? { allowed: false as const, error: refusal.error, requiresCallerVerification: refusal.requiresCallerVerification }
+              : { allowed: false as const, error: intentCreationRefusal(toolName, input, err) };
+            if (!refusal) console.error('[AI-SDK] Failed to create action intent:', toolName, err);
+            // #10411: no intent exists, so nothing will ever decide this
+            // call's `pending` ledger row — close it with the refusal.
+            await closePendingLedgerRowAsRefused(session, approvalExec.id, denial.error);
+            return await failMatchedPlanStep(denial);
           }
 
           // Stamp the intent link onto the ledger row so handleApproval (web
@@ -1553,16 +2475,26 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           // Topology M4-D3 (#6000): the approver must read the PINNED effect —
           // the server-materialized arguments and approval text the digest
           // binds — never the model's raw input.
+          // #8600: same rule for a device-group run_script — the intent froze
+          // the group's resolved deviceIds (plus a count + id hash in its
+          // reason), and THAT is what the approver must read, not `{groupId}`.
           const pinnedCard = toolName === 'diagnose_connectivity'
-            ? await loadPinnedApprovalCard(session.orgId, intent.id)
-            : null;
+            ? await loadPinnedApprovalCard(intentOrgId, intent.id, 'Run one approved topology connectivity check')
+            : toolName === 'run_script' && (input as Record<string, unknown>).groupId != null
+              ? await loadPinnedApprovalCard(
+                intentOrgId,
+                intent.id,
+                'Device-group script run: the resolved device list could not be loaded here. Review it in the Approvals queue before approving.',
+              )
+              : null;
           // Emit approval_required event via session event bus. `intentBacked:
           // true` always means the four-eyes waiting state UNLESS
           // selfApprovalRequestId is also set — in that case the sole-operator
           // branch applies and the card offers an inline WebAuthn self-approve
           // for that one row (an L3 proof satisfying, not bypassing, the decide
           // handler's gate).
-          session.eventBus.publish({
+          // #9427: tracked until the decision wait below ends.
+          publishPendingCard(session, approvalCardKey(approvalExec.id), {
             type: 'approval_required',
             executionId: approvalExec.id,
             approvalRequestId: intent.approvalRequestIds[0],
@@ -1598,7 +2530,11 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
             input: pinnedCard ? pinnedCard.input : input,
             description: pinnedCard ? pinnedCard.description : description,
             deviceContext,
+            ...(standingConflict ? { standingInstructionConflict: standingConflict } : {}),
             intentBacked: true,
+            // #10416: the requester can decide only an intent that fanned a
+            // row out to them; otherwise someone else must (four-eyes).
+            waitingOn: intent.requesterApprovalRequestId ? 'you' : 'other_approvers',
           });
           }
 
@@ -1612,16 +2548,25 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           // — and the durable release worker (jobs/intentReleaseWorker.ts) will
           // execute it — after this session has moved on or died. This is the
           // new durable capability the design adds (spec §6.1).
-          const approvalWait = beginApprovalWait(session);
           let decisionStatus: Awaited<ReturnType<typeof waitForIntentDecision>>;
+          // #9431: how the card's wait ended, for every other listener.
+          let intentOutcome: AiApprovalOutcome = 'ended';
           try {
-            decisionStatus = await waitForIntentDecision(
-              intent.id,
-              approvalWait.timeoutMs,
-              approvalWait.signal,
-            );
+            const approvalWait = beginApprovalWait(session);
+            try {
+              decisionStatus = await waitForIntentDecision(
+                intent.id,
+                approvalWait.timeoutMs,
+                approvalWait.signal,
+              );
+              intentOutcome = intentDecisionOutcome(decisionStatus);
+              approvalWaitMs = Date.now() - approvalWait.startedAt;
+            } finally {
+              approvalWait.end();
+            }
           } finally {
-            approvalWait.end();
+            // A no-op for the unattended-release branch, which recorded no card.
+            resolveApprovalCard(session, approvalExec.id, intentOutcome);
           }
 
           if (decisionStatus === 'pending_approval') {
@@ -1705,7 +2650,7 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           // `approved -> executing` CAS below, so the worker's claim remains
           // available and the intent is never stranded in `executing`.
           if (requiresDurableRelease(toolName)) {
-            return await releaseHandoffDenial(intent.id);
+            return await releaseHandoffDenial(intent.id, approvalExec.id);
           }
 
           // COORDINATION INVARIANT (CRITICAL — prevents double execution): the
@@ -1735,9 +2680,10 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
             // owns the ledger write and the intent's final result/error_code.
             //
             // Same APPROVAL HANDOFF as the durable-release branch above, and
-            // the one that actually fires today (DURABLE_RELEASE_ONLY_TOOLS is
-            // still empty, so a human-approved intent reaches the user as
-            // "FAILED" through THIS exit — #5107's recording). Losing the CAS
+            // the one that fires for most tools (DURABLE_RELEASE_ONLY_TOOLS is
+            // still empty — only flow tools, W5 PR C, take the branch above —
+            // so a human-approved intent reaches the user as "FAILED" through
+            // THIS exit — #5107's recording). Losing the CAS
             // is the mutual-exclusion working, not an error: the action is
             // approved and running under the worker. `handoff` is what stops
             // the chat painting it deny-red.
@@ -1745,7 +2691,7 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
             // Nothing about the invariant changes: the CAS was attempted and
             // lost, we still refuse to execute inline, and we still do not
             // touch the intent (the winner owns every subsequent transition).
-            return await releaseHandoffDenial(intent.id);
+            return await releaseHandoffDenial(intent.id, approvalExec.id);
           }
 
           // Won the CAS: record the intent id so the outer catch can
@@ -1786,17 +2732,29 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
 
           const revalidation = await revalidateApprovedIntentForRelease(intentRow, winningApproval);
           if (!revalidation.ok) {
+            // Only the typed caller-verification payload is surfaced; the rest
+            // of `details` is never exposed for any other code.
+            const requiresCallerVerification =
+              revalidation.errorCode === CALLER_VERIFICATION_REQUIRED_CODE
+                ? (revalidation.details?.requiresCallerVerification as CallerRefusalPayload | undefined)
+                : undefined;
+            const callerRefusalResult = requiresCallerVerification
+              ? callerRefusalFromPayload(requiresCallerVerification)
+              : undefined;
             const revalidationCasWon = await transitionIntentAndPublish(
               intent.id,
               'failed',
-              { errorCode: revalidation.errorCode },
-              session.orgId,
+              {
+                errorCode: revalidation.errorCode,
+                ...(callerRefusalResult ? { result: callerRefusalResult } : {}),
+              },
+              intentOrgId,
               'intent_failed',
             );
             if (!revalidationCasWon) {
               reportLostTerminalCas({
                 intentId: intent.id,
-                orgId: session.orgId,
+                orgId: intentOrgId,
                 toolName,
                 intendedStatus: 'failed',
                 casLabel: 'ai_sdk_inline_revalidation_failed',
@@ -1806,10 +2764,50 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
             console.error(
               `[AI-SDK] inline release revalidation failed for intent ${intent.id}: ${revalidation.errorCode}`,
             );
+            // Wisp W04 (Review Focus 2): a Wisp ceiling refusal at release
+            // (services/wisp/releaseCeiling.ts) carries fixed user-facing copy
+            // in details.reason; only `wisp_*` codes may surface it, and the
+            // standing-instruction refusal (#10428 W06), which uses the same seam.
+            const wispReleaseReason =
+              (revalidation.errorCode.startsWith('wisp_') || revalidation.errorCode === 'standing_instruction_denied')
+              && typeof revalidation.details?.reason === 'string'
+                ? revalidation.details.reason
+                : undefined;
             return await failMatchedPlanStep({
               allowed: false,
-              error: 'Authorization for this action could no longer be verified; it was not executed.',
+              error: callerRefusalResult?.error
+                ?? wispReleaseReason
+                ?? 'Authorization for this action could no longer be verified; it was not executed.',
+              ...(requiresCallerVerification ? { requiresCallerVerification } : {}),
             });
+          }
+
+          // Wisp W04: the approval wait can outlive the grant. Re-read the
+          // ceiling before the release runs; a refusal terminalizes the
+          // intent we just claimed (it never runs) and tells the user why.
+          if (session.wispGrant) {
+            const recheck = await runWispCeilingGate(session, toolName, input, tenant);
+            if (!recheck.ok) {
+              const wispCasWon = await transitionIntentAndPublish(
+                intent.id,
+                'failed',
+                { errorCode: 'wisp_ceiling_refused' },
+                intentOrgId,
+                'intent_failed',
+              );
+              if (!wispCasWon) {
+                reportLostTerminalCas({
+                  intentId: intent.id,
+                  orgId: intentOrgId,
+                  toolName,
+                  intendedStatus: 'failed',
+                  casLabel: 'ai_sdk_inline_wisp_ceiling_refused',
+                  executed: false,
+                });
+              }
+              return await failMatchedPlanStep(recheck.denial);
+            }
+            wispCall.current = recheck.state;
           }
 
           // Effect-digest revalidation (tier3-supervised-four-eyes design §4.1,
@@ -1841,18 +2839,18 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           // every pinned release would have been content_changed). One
           // predicate, one behavior, in one place.
           // Mandatory pin (M4-D3): same explicit refusal as the durable worker.
-          if (!hasPinnedDigest(intentRow) && requiresPinnedEffectDigest(intentRow.actionName)) {
+          if (!hasPinnedDigest(intentRow) && requiresPinnedEffectDigest(intentRow.actionName, intentRow.arguments as Record<string, unknown> | null)) {
             const requiredCasWon = await transitionIntentAndPublish(
               intent.id,
               'failed',
               { errorCode: 'digest_required' },
-              session.orgId,
+              intentOrgId,
               'intent_failed',
             );
             if (!requiredCasWon) {
               reportLostTerminalCas({
                 intentId: intent.id,
-                orgId: session.orgId,
+                orgId: intentOrgId,
                 toolName,
                 intendedStatus: 'failed',
                 casLabel: 'ai_sdk_inline_digest_required',
@@ -1867,7 +2865,7 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           if (hasPinnedDigest(intentRow)) {
             const recomputed = await runOutsideDbContext(() =>
               withSystemDbAccessContext(() =>
-                computeEffectDigestForRelease(intentRow.actionName, intentRow.arguments, db),
+                computeEffectDigestForRelease(intentRow.actionName, intentRow.arguments, db, { intentOrgId: intentRow.orgId }),
               ),
             );
             if (recomputed.digest !== intentRow.effectDigest) {
@@ -1875,13 +2873,13 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
                 intent.id,
                 'failed',
                 { errorCode: 'content_changed' },
-                session.orgId,
+                intentOrgId,
                 'intent_failed',
               );
               if (!digestCasWon) {
                 reportLostTerminalCas({
                   intentId: intent.id,
-                  orgId: session.orgId,
+                  orgId: intentOrgId,
                   toolName,
                   intendedStatus: 'failed',
                   casLabel: 'ai_sdk_inline_content_changed',
@@ -1914,13 +2912,13 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
               intent.id,
               'failed',
               { errorCode: 'checkpoint_unavailable' },
-              session.orgId,
+              intentOrgId,
               'intent_failed',
             );
             if (!checkpointCasWon) {
               reportLostTerminalCas({
                 intentId: intent.id,
-                orgId: session.orgId,
+                orgId: intentOrgId,
                 toolName,
                 intendedStatus: 'failed',
                 casLabel: 'ai_sdk_inline_checkpoint_unavailable',
@@ -1945,12 +2943,14 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           verifiedToolContext = {
             ...verifiedToolContext,
             releaseDecision: { approvalScope: intentRow.approvalScope, decidedVia: intentRow.decidedVia ?? null },
+            // #6268: which surface filed the approval (ioc_hunt sweep origin).
+            intentSource: intentRow.source,
           };
 
           // Won the release: track the intent id so createSessionPostToolUse can
           // CAS it executing -> completed|failed once the inline tool call
           // actually finishes (see pendingIntentBySession above).
-          pendingIntentBySession.set(session, intent.id);
+          pendingIntentBySession.set(session, { intentId: intent.id, orgId: intentOrgId });
           createdIntentId = intent.id;
 
           // The step is now genuinely authorized: the intent was approved, we
@@ -1996,13 +2996,13 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
                 wonIntentId,
                 'failed',
                 { errorCode: 'execution_error' },
-                session.orgId,
+                intentOrgId,
                 'intent_failed',
               );
               if (!selfHealCasWon) {
                 reportLostTerminalCas({
                   intentId: wonIntentId,
-                  orgId: session.orgId,
+                  orgId: intentOrgId,
                   toolName,
                   intendedStatus: 'failed',
                   casLabel: 'ai_sdk_inline_self_heal',
@@ -2136,7 +3136,7 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
                   .values({
                     userId: session.auth.user.id,
                     executionId: approvalExec!.id,
-                    requestingClientLabel: 'Breeze AI',
+                    requestingClientLabel: chatApprovalClientLabel(session),
                     requestingMachineLabel: null,
                     actionLabel,
                     actionToolName: stripMcpPrefix(toolName),
@@ -2163,6 +3163,9 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           }
 
           // Best-effort push notification to the user's mobile device(s).
+          // #10416: the card says whether at least one push was accepted for
+          // delivery by a push provider (not proof the phone received it).
+          let pushedToPhone = false;
           if (approvalRequestId) {
             try {
               // Token read happens INSIDE the org DB context; the push network
@@ -2178,18 +3181,21 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
                 },
                 () => getUserPushTokens(session.auth.user.id),
               );
-              await dispatchApprovalPushToTokens(tokens, {
+              const push = await dispatchApprovalPushToTokens(tokens, {
                 approvalId: approvalRequestId,
                 actionLabel,
-                requestingClientLabel: 'Breeze AI',
+                requestingClientLabel: chatApprovalClientLabel(session),
               });
+              pushedToPhone = (push?.dispatched ?? 0) > 0;
             } catch (err) {
               console.error('[AI-SDK] Failed to dispatch approval push notification:', err);
             }
           }
 
           // Emit approval_required event via session event bus → UI shows Approve/Reject
-          session.eventBus.publish({
+          // #9427: tracked until the wait below ends, however it ends.
+          const cardKey = approvalCardKey(approvalExec.id);
+          publishPendingCard(session, cardKey, {
             type: 'approval_required',
             executionId: approvalExec.id,
             approvalRequestId,
@@ -2204,16 +3210,27 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
             deviceContext,
             scriptRunContext,
             ...(scriptProposal ? { scriptProposal } : {}),
+            ...(standingConflict ? { standingInstructionConflict: standingConflict } : {}),
+            pushedToPhone,
+            waitingOn: 'you',
           });
 
           // Block until user clicks Approve/Reject, the cycle's shared approval
           // wait budget (the org's interactive approval timeout) elapses, or the wait is settled early
           // (session teardown / new user message / interrupt — #3089).
-          approved = await waitForApproval(
-            approvalExec.id,
-            approvalWait.timeoutMs,
-            approvalWait.signal,
-          );
+          // #9431: how the card's wait ended, for every other listener.
+          let cardOutcome: AiApprovalOutcome = 'ended';
+          try {
+            approved = await waitForApproval(
+              approvalExec.id,
+              approvalWait.timeoutMs,
+              approvalWait.signal,
+            );
+            cardOutcome = approvalWaitOutcome(approved, approvalWait.signal);
+            approvalWaitMs = Date.now() - approvalWait.startedAt;
+          } finally {
+            resolveApprovalCard(session, approvalExec.id, cardOutcome);
+          }
         } finally {
           approvalWait.end();
         }
@@ -2265,14 +3282,10 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
             captureException(err instanceof Error ? err : new Error(String(err)));
             console.error('[AI-SDK] Failed to close out settled approval record:', approvalExec.id, err);
           }
-          // Not reachable with a non-null matchedPlanStepIndex today (both
-          // secret-bearing tools are statically tier 3, so the only way to
-          // land in this tier<3 legacy branch with a matched-but-declined
-          // plan step — a tier-2 secret-bearing tool — is dead code). Wrap
-          // anyway: it costs nothing (failMatchedPlanStep no-ops when
-          // matchedPlanStepIndex is null) and removes a latent trap that is
-          // currently safe only by the coincidence of two other files'
-          // static tier assignments.
+          // A matched plan step lands in this tier<3 branch when a standing
+          // instruction warned on it (#10428 W06) and declined the plan
+          // shortcut; a step nobody approved stops the plan.
+          // failMatchedPlanStep no-ops when matchedPlanStepIndex is null.
           return await failMatchedPlanStep({ allowed: false, error: 'Tool execution was rejected or timed out' });
         }
 
@@ -2291,6 +3304,37 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
             captureException(err instanceof Error ? err : new Error(String(err)));
           }
           return liveDenial;
+        }
+
+        // #10428 W06 (quorum): this in-session card never becomes an intent,
+        // so no release re-check would see an instruction confirmed while it
+        // waited. Check again before running; a refusal now stops the call.
+        if (wispCall.current && !flowTool && !tenant) {
+          const standing = await standingInstructionCheck(session, wispCall.current, toolName, input);
+          if (standing.action === 'refuse') {
+            try {
+              await withDbAccessContext(
+                { scope: 'organization', orgId: session.orgId, accessibleOrgIds: [session.orgId] },
+                () => db.update(aiToolExecutions)
+                  .set({ status: 'rejected', errorMessage: standing.error })
+                  .where(eq(aiToolExecutions.id, approvalExec!.id)),
+              );
+            } catch (err) {
+              captureException(err instanceof Error ? err : new Error(String(err)));
+            }
+            return await failMatchedPlanStep({ allowed: false, error: standing.error }, ' The plan has been stopped.');
+          }
+        }
+
+        // A warned plan step that took this card (W06) is authorized now.
+        if (matchedPlanStepIndex !== null && session.activePlanId) {
+          session.eventBus.publish({
+            type: 'plan_step_start',
+            planId: session.activePlanId,
+            stepIndex: matchedPlanStepIndex,
+            toolName,
+          });
+          session.currentPlanStepIndex = matchedPlanStepIndex + 1;
         }
 
         // Mark as executing
@@ -2314,17 +3358,16 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
       // decided: the durable tier-3 intent flow (approver via the approvals
       // surface, or the requester self-deciding a SUPERVISED intent — Task 6)
       // or the tier-2 lightweight card (user clicked Approve).
-      lastApprovalBySession.set(session, {
-        toolName,
-        method:
-          guardrailCheck.tier >= 3
-            ? guardrailCheck.approvalScope === 'supervised'
-              ? 'supervised_self'
-              : 'action_intent'
-            : 'per_step_user',
-      });
+      lastApprovalBySession.set(session, { toolName, method: decidedApprovalMethod(guardrailCheck) });
     }
-    return { allowed: true, intentId: createdIntentId, context: verifiedToolContext };
+    // #10416: a Wisp session's handler adds the wait to the tool result
+    // (aiAgentSdkTools withApprovalWait); every other session is unchanged.
+    return {
+      allowed: true,
+      intentId: createdIntentId,
+      context: verifiedToolContext,
+      ...(session.wispGrant && approvalWaitMs !== undefined ? { approvalWaitMs } : {}),
+    };
   };
 }
 
@@ -2354,26 +3397,63 @@ function isScriptApplyTool(toolName: string): boolean {
  * attachProposalToSession, so a foreign-org id in the output cannot be claimed.
  * Best-effort: a failure here must not break the tool_result the UI already
  * received. Exported for its unit test.
+ *
+ * #10384: the org is the PROPOSAL's, resolved within the session's tool reach,
+ * not `session.orgId`. propose_script files a proposal under its target
+ * device's org, which for a partner-scope session can be any org the session
+ * reaches; pinning the update to the session org left every such proposal
+ * unattributed. A proposal outside that reach is never claimed.
  */
 export async function attachChatProposalToSession(
-  session: Pick<ActiveSession, 'orgId' | 'breezeSessionId'>,
+  session: Pick<ActiveSession, 'orgId' | 'breezeSessionId' | 'toolAuth'>,
   parsedOutput: Record<string, unknown>,
 ): Promise<void> {
   const proposalId = parsedOutput.proposalId;
   if (typeof proposalId !== 'string' || proposalId.length === 0) return;
   try {
+    const orgId = await resolveProposalOrgInReach(proposalId, (id) => session.toolAuth.canAccessOrg(id));
+    if (orgId === null) {
+      // The id came from this session's own propose_script output, so a
+      // proposal that is missing or outside the session's reach is a wiring
+      // fault, not a benign retry: keep it distinguishable from the warn below.
+      console.error(`[AI-SDK] script proposal ${proposalId} from session ${session.breezeSessionId} is missing or outside the session's reach; not attributed`);
+      return;
+    }
     const attached = await withDbAccessContext(
-      { scope: 'organization', orgId: session.orgId, accessibleOrgIds: [session.orgId] },
-      () => attachProposalToSession(proposalId, session.orgId, session.breezeSessionId),
+      { scope: 'organization', orgId, accessibleOrgIds: [orgId] },
+      () => attachProposalToSession(proposalId, orgId, session.breezeSessionId),
     );
     if (!attached) {
-      // Not an error (an idempotent retry lands here too), but a proposal the
-      // handler just created that is NOT attributable is worth a trace: it
-      // means the id in the output and the session's org disagree.
-      console.warn(`[AI-SDK] script proposal ${proposalId} not attributed to session ${session.breezeSessionId} (foreign org or already attributed)`);
+      // Not an error: an idempotent retry of an already-attributed proposal
+      // lands here.
+      console.warn(`[AI-SDK] script proposal ${proposalId} not attributed to session ${session.breezeSessionId} (already attributed)`);
     }
   } catch (err) {
     console.error('[AI-SDK] Failed to attach script proposal to session:', err instanceof Error ? err.message : err);
+    captureException(err, undefined, { service: 'aiAgentSdk', orgId: session.orgId });
+  }
+}
+
+const FLOW_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Tool Catalog W03 (#5218): chat provenance for a saved flow draft. Same shape
+ * as attachChatProposalToSession — the draft_flow handler never sees the
+ * Breeze session id, so it is back-filled here from the authenticated session,
+ * never from tool input. Best-effort.
+ */
+export async function attachChatFlowToSession(
+  session: Pick<ActiveSession, 'orgId' | 'breezeSessionId'>,
+  parsedOutput: Record<string, unknown>,
+): Promise<void> {
+  if (parsedOutput.saved !== true) return;
+  const flowId = (parsedOutput.flow as { id?: unknown } | undefined)?.id;
+  if (typeof flowId !== 'string' || !FLOW_ID_RE.test(flowId)) return;
+  try {
+    const { attachFlowToChatSession } = await import('./flows/service');
+    await attachFlowToChatSession(flowId, session.breezeSessionId, session.orgId);
+  } catch (err) {
+    console.error('[AI-SDK] Failed to attach flow draft to session:', err instanceof Error ? err.message : err);
     captureException(err, undefined, { service: 'aiAgentSdk', orgId: session.orgId });
   }
 }
@@ -2386,19 +3466,27 @@ export async function attachChatProposalToSession(
  */
 /**
  * The stored (immutable) arguments and approval text of a pinned-effect intent
- * (topology M4-D3). A read failure yields an EMPTY input and a fixed text —
+ * (topology M4-D3), or of a device-group run_script whose group the intent
+ * resolved and froze (#8600). A read failure yields an EMPTY input and a fixed text —
  * never the model's input — the approval stays bound to the pinned digest
  * server-side either way.
  */
-async function loadPinnedApprovalCard(orgId: string, intentId: string): Promise<{ input: Record<string, unknown>; description: string }> {
-  const fallback = { input: {}, description: 'Run one approved topology connectivity check' };
+async function loadPinnedApprovalCard(
+  orgId: string,
+  intentId: string,
+  fallbackDescription: string,
+): Promise<{ input: Record<string, unknown>; description: string }> {
+  const fallback = { input: {}, description: fallbackDescription };
   try {
     const [row] = await withDbAccessContext(
       { scope: 'organization', orgId, accessibleOrgIds: [orgId] },
       () => db.select({ arguments: actionIntents.arguments, reason: actionIntents.reason })
         .from(actionIntents).where(eq(actionIntents.id, intentId)).limit(1),
     );
-    if (!row || !row.arguments || typeof row.arguments !== 'object') return fallback;
+    if (!row || !row.arguments || typeof row.arguments !== 'object') {
+      console.error('[AI-SDK] Pinned approval effect missing for intent', intentId);
+      return fallback;
+    }
     return { input: row.arguments as Record<string, unknown>, description: typeof row.reason === 'string' && row.reason ? row.reason : fallback.description };
   } catch (err) {
     console.error('[AI-SDK] Failed to read the pinned approval effect:', err instanceof Error ? err.message : err);
@@ -2424,7 +3512,7 @@ function approvedTopologyRun(toolName: string, output: string, isError: boolean)
   return { runId, state };
 }
 
-async function topologyPostToolUse(session: ActiveSession, toolName: string, input: Record<string, unknown>, output: string, isError: boolean, durationMs: number, sdkToolUseId: string | undefined): Promise<void> {
+async function topologyPostToolUse(session: ActiveSession, toolName: string, input: Record<string, unknown>, output: string, isError: boolean, durationMs: number, sdkToolUseId: string | undefined, refusalLedgered: boolean): Promise<void> {
   session.pendingTurnToolExecutionCount += 1;
   // No tool row is written here, but the call must stop being pending or the
   // dropped-call fallback would misreport it (#7931).
@@ -2432,6 +3520,8 @@ async function topologyPostToolUse(session: ActiveSession, toolName: string, inp
   session.eventBus.publish({ type: 'topology_progress', phase: 'analyzing' });
   const run = approvedTopologyRun(toolName, output, isError);
   if (run) session.eventBus.publish({ type: 'topology_diagnostic_run', ...run });
+  // #10411: the pre hook already wrote this refused call's row.
+  if (refusalLedgered) return;
   try {
     await withDbAccessContext(
       { scope: 'organization', orgId: session.orgId, accessibleOrgIds: [session.orgId] },
@@ -2452,6 +3542,9 @@ async function topologyPostToolUse(session: ActiveSession, toolName: string, inp
 
 export function createSessionPostToolUse(session: ActiveSession): PostToolUseCallback {
   return async (toolName, input, output, isError, durationMs, sealed, handoff, sdkToolUseId) => {
+    // #10411: the echo of a refusal whose ledger row the pre hook already
+    // wrote — no second row, and no UPDATE of a same-name sibling's row.
+    const refusalLedgered = takeLedgeredRefusal(session, toolName, output, isError, sdkToolUseId);
     // A timed-out topology turn (C1): its gate is gone, so a tool that was
     // still in flight must not fall through to the generic path and persist
     // its raw output. It did run, though, so it must stop being pending —
@@ -2462,7 +3555,7 @@ export function createSessionPostToolUse(session: ActiveSession): PostToolUseCal
       return;
     }
     if (session.topologyInvestigation) {
-      await topologyPostToolUse(session, toolName, input, output, isError, durationMs, sdkToolUseId);
+      await topologyPostToolUse(session, toolName, input, output, isError, durationMs, sdkToolUseId, refusalLedgered);
       return;
     }
     // Count this tool call toward the turn's tool_execution_count rollup
@@ -2470,6 +3563,11 @@ export function createSessionPostToolUse(session: ActiveSession): PostToolUseCal
     // whether the DB writes below succeed — postToolUse only fires for a tool
     // that actually ran, which is the event the counter tracks.
     session.pendingTurnToolExecutionCount += 1;
+    // #10428 (W05): a Wisp turn keeps what its tools did for the turn-end hooks
+    // (wisp/turnEnd.ts: the `remember` calls the instruction capture skips).
+    if (session.wispGrant && session.currentTurn) {
+      recordWispToolOutcome(session.currentTurn, { toolName, input, isError, output });
+    }
     // Pair this result with its own tool_use by the id the SDK sent with the
     // call, never by queue position (#7931). Claiming also tells the
     // dropped-call fallback (#3094) this call ran, whichever of this and its
@@ -2484,8 +3582,24 @@ export function createSessionPostToolUse(session: ActiveSession): PostToolUseCal
     // Canonical session org (always set) — `auth.orgId` is null for partner-
     // scope logins, which left tool audit rows without an org attribution.
     const orgId = session.orgId;
-    const guardrailContext = chatGuardrailContext(session, await loadProposalGuardrailContext(input, session.orgId));
-    const guardrailCheck = checkGuardrails(toolName, input, guardrailContext);
+    // W5 PR C (#5220): a flow tool is not in the core registry (the
+    // classifier would answer tier 4); its tier is the one the pre hook GATED
+    // the call on, and an ungated flow call is treated as Tier 3.
+    const guardrailCheck: { tier: number } = isFlowToolName(toolName)
+      ? { tier: session.flowToolGatedTiers?.get(toolName) ?? 3 }
+      // #10384: a run_script proposal is resolved by reach, as in the pre hook.
+      // A session-org lookup would answer `proposal_not_found` for a proposal
+      // in another org, which checkGuardrails fails closed to tier 4, and the
+      // audit event below would record a tier-4 call that ran at tier 3. Only
+      // `.tier` is read here, for a call the pre hook already gated under the
+      // narrowed per-call reach, so the session tool auth is enough.
+      : checkGuardrails(toolName, input, chatGuardrailContext(
+        session,
+        toolName === 'run_script'
+          ? (await loadProposalGuardrailContextInReach(input, (orgId) => session.toolAuth.canAccessOrg(orgId))).context
+          : await loadProposalGuardrailContext(input, session.orgId),
+        { unattendedReads: unattendedReadInputs.has(input) },
+      ));
 
     // Script-builder "apply" tools deliver their payload (code / metadata) to
     // the editor via this SSE tool_result event, NOT the chat transcript.
@@ -2551,6 +3665,9 @@ export function createSessionPostToolUse(session: ActiveSession): PostToolUseCal
     if (toolName === 'propose_script' && !isError) {
       await attachChatProposalToSession(session, parsedOutput);
     }
+    if (toolName === 'draft_flow' && !isError) {
+      await attachChatFlowToSession(session, parsedOutput);
+    }
 
     // 2a. Save tool_result to aiMessages
     try {
@@ -2586,7 +3703,9 @@ export function createSessionPostToolUse(session: ActiveSession): PostToolUseCal
         : (typeof sealed?.sealedResult.delegantToolCallId === 'string'
           ? sealed.sealedResult.delegantToolCallId
           : undefined);
-    if (guardrailCheck.tier < 2) {
+    if (refusalLedgered) {
+      // #10411: the pre hook wrote this refused call's one row.
+    } else if (guardrailCheck.tier < 2) {
       try {
         await withDbAccessContext(
           { scope: 'organization', orgId: session.orgId, accessibleOrgIds: [session.orgId] },
@@ -2640,7 +3759,14 @@ export function createSessionPostToolUse(session: ActiveSession): PostToolUseCal
       // execution is authorized would be wrong, since the tool hasn't run
       // yet at that point. A lost CAS here just means a reaper or the worker
       // already terminalized the intent first; nothing more to do.
-      const pendingIntentId = sealed?.intentId ?? pendingIntentBySession.get(session);
+      const pending = pendingIntentBySession.get(session);
+      const pendingIntentId = sealed?.intentId ?? pending?.intentId;
+      // #10384: the intent's own org (a cross-org run_script proposal's intent
+      // lives in the proposal's org), recorded when the pre hook won the
+      // release. A sealed id the map does not hold falls back to the session
+      // org: `sealed` comes only from secret-bearing tools, never run_script,
+      // and every chat intent other than a cross-org proposal run lives there.
+      const pendingIntentOrgId = pending && pending.intentId === pendingIntentId ? pending.orgId : session.orgId;
       if (pendingIntentId) {
         pendingIntentBySession.delete(session);
         // Secret-bearing tools (Task 1/5) hand back a `sealed` result whose
@@ -2698,7 +3824,7 @@ export function createSessionPostToolUse(session: ActiveSession): PostToolUseCal
               pendingIntentId,
               'failed',
               { executedAt: new Date(), errorCode: SECRET_SEAL_INVARIANT_VIOLATED_ERROR_CODE },
-              session.orgId,
+              pendingIntentOrgId,
               'intent_failed',
             );
             if (!guardCasWon) {
@@ -2708,7 +3834,7 @@ export function createSessionPostToolUse(session: ActiveSession): PostToolUseCal
               // the guard trip. Loudest possible case for the marker.
               reportLostTerminalCas({
                 intentId: pendingIntentId,
-                orgId: session.orgId,
+                orgId: pendingIntentOrgId,
                 toolName,
                 intendedStatus: 'failed',
                 casLabel: 'ai_sdk_inline_plaintext_guard',
@@ -2740,10 +3866,17 @@ export function createSessionPostToolUse(session: ActiveSession): PostToolUseCal
                 // release worker's vocabulary); the raw tool error text is
                 // unbounded free-form and belongs in `result`, not `error_code`.
                 ...(isError
-                  ? { errorCode: INLINE_TOOL_EXECUTION_FAILED_ERROR_CODE, result: sizedResult }
+                  ? {
+                      // A handler-thrown caller refusal (the backend dispatch
+                      // guard) arrives here as the adapter's refusal object.
+                      errorCode: isCallerRefusalResult(sizedResult)
+                        ? CALLER_VERIFICATION_REQUIRED_CODE
+                        : INLINE_TOOL_EXECUTION_FAILED_ERROR_CODE,
+                      result: sizedResult,
+                    }
                   : { result: sizedResult }),
               },
-              session.orgId,
+              pendingIntentOrgId,
               isError ? 'intent_failed' : 'intent_completed',
             );
             if (!completionCasWon) {
@@ -2754,7 +3887,7 @@ export function createSessionPostToolUse(session: ActiveSession): PostToolUseCal
               // would double-execute the side effect.
               reportLostTerminalCas({
                 intentId: pendingIntentId,
-                orgId: session.orgId,
+                orgId: pendingIntentOrgId,
                 toolName,
                 intendedStatus: isError ? 'failed' : 'completed',
                 casLabel: 'ai_sdk_inline_completion',
@@ -2872,7 +4005,8 @@ export function createSessionPostToolUse(session: ActiveSession): PostToolUseCal
             : {}),
         details: {
           sessionId,
-          toolInput: input,
+          // #6268: per-tool input summary (ioc_hunt IOC values never reach audit_logs).
+          toolInput: summarizeToolInputForAudit(toolName, input),
           durationMs,
           tier: guardrailCheck.tier,
           ...(handoffStatus ? { toolOutcome: handoffStatus } : {}),

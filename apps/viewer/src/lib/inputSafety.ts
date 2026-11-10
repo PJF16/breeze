@@ -31,16 +31,23 @@ export function defaultRemapCmdCtrl(viewerOs: ViewerOs, remoteOs: string | null)
   return viewerIsMac !== remoteIsMac;
 }
 
+export type AgentMouseButton = 'left' | 'middle' | 'right' | 'back' | 'forward';
+
 /**
- * DOM MouseEvent.button → agent button name. Back (3) and forward (4) have no
- * agent equivalent yet; returning null drops them instead of the old fallback,
- * which sent them as a left click (M1).
+ * DOM MouseEvent.button → agent button name. Back (3) and forward (4) map only
+ * when the agent advertised support for them (W2c); otherwise null drops them
+ * instead of the old fallback, which sent them as a left click (M1).
  */
-export function mouseButtonName(button: number): 'left' | 'middle' | 'right' | null {
+export function mouseButtonName(
+  button: number,
+  opts: { extraButtons?: boolean } = {},
+): AgentMouseButton | null {
   switch (button) {
     case 0: return 'left';
     case 1: return 'middle';
     case 2: return 'right';
+    case 3: return opts.extraButtons ? 'back' : null;
+    case 4: return opts.extraButtons ? 'forward' : null;
     default: return null;
   }
 }
@@ -97,6 +104,18 @@ export function chordRouting(input: ChordRoutingInput): 'key_press' | 'held' {
   if (viewerOs === 'macos' && physicalMeta) return 'key_press';
   if (remapActive && modifiers.includes('meta')) return 'key_press';
   return modifiers.every((m) => heldKeys.has(m)) ? 'held' : 'key_press';
+}
+
+/**
+ * The modifiers a key_press released on the remote, which the viewer must stop
+ * treating as held. An agent that reports `releasesHeldInput` (W2a, #8251)
+ * keeps a held modifier out of the chord and leaves it down, so none were
+ * released: forgetting them anyway meant their key_up was never sent and the
+ * modifier stayed down on the remote for good (#9595). Older agents pressed
+ * and released every chord modifier.
+ */
+export function modifiersReleasedByKeyPress(modifiers: string[], agentKeepsHeldModifiers: boolean): string[] {
+  return agentKeepsHeldModifiers ? [] : modifiers;
 }
 
 /**

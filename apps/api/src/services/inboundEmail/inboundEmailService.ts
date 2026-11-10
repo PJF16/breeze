@@ -34,9 +34,10 @@ import {
 function isPolledProvider(p: string): p is PolledMailboxProvider {
   return (POLLED_MAILBOX_PROVIDERS as readonly string[]).includes(p);
 }
-import { TICKET_TOKEN_RE, findTicketInPartner, findClosedTicketInPartner, type SenderResolver } from './threadMatcher';
+import { stripTicketTokens, findTicketInPartner, findClosedTicketInPartner, type SenderResolver } from './threadMatcher';
 import { claimMessageLink, findLinkByMessageId, normalizeMessageId } from '../ticketEmailLinks';
 import { ownOutboundReason, ticketCreationLoopReason } from './loopPrevention';
+import { TicketMergedError } from '../ticketMerge/errors';
 
 // Synthetic actor for the inbound pipeline. Its userId is only ever written to
 // audit_logs.actor_id (NOT NULL, but no FK to users — same pattern as
@@ -52,7 +53,6 @@ const SYSTEM_ACTOR: TicketActor = {
 };
 
 // Per-partner ticket display number, e.g. T-2026-0001.
-const TOKEN_RE = TICKET_TOKEN_RE;
 
 async function logInbound(
   n: NormalizedInboundEmail,
@@ -402,8 +402,13 @@ export async function processInboundEmail(
     // known-portal-user match must NOT be trusted to append a PUBLIC comment, reopen a
     // ticket, or create a ticket as a trusted sender unless the sender's domain is
     // authenticated. We rely on the verdicts the provider already computed at its MX
-    // boundary (aligned SPF+DKIM, or DMARC pass). When NOT verified, route the message to
-    // the EXISTING quarantine/review path instead of auto-acting — mail is never dropped.
+    // boundary (aligned SPF+DKIM, or DMARC pass). On a Microsoft 365 mailbox three more
+    // sources count (senderAuth.source, normalizeGraphMessage): Exchange's intra-tenant
+    // stamp ('exchange-internal', #8299), Exchange's own DMARC stamp on external mail
+    // ('exchange-online') and a trusted ARC sealer's verdict ('trusted-arc-sealer',
+    // #10862). When NOT verified, route the
+    // message to the EXISTING quarantine/review path instead of auto-acting — mail is
+    // never dropped.
     if (!n.senderAuth?.verified) {
       // A `senderAuthDiagnostic` means we're acting NOT because of a genuine DMARC fail but
       // because no usable provider verdict could be read — the silent mass-quarantine (or, when
@@ -421,8 +426,9 @@ export async function processInboundEmail(
           }
         );
       }
-      const reason = gap
-        ? `unverified sender (SPF/DKIM/DMARC): ${gap}`
+      const reasonDetail = gap ?? n.senderAuthConsulted;
+      const reason = reasonDetail
+        ? `unverified sender (SPF/DKIM/DMARC): ${reasonDetail}`
         : 'unverified sender (SPF/DKIM/DMARC)';
       // Default: route to the review queue. If the partner opted into dropping
       // unverified mail, silently ignore it instead (audit row only, no review
@@ -498,7 +504,7 @@ export async function processInboundEmail(
       await dependencies.afterTicketMatchLock?.(closedOriginal.id);
       // No requester and NO acknowledgement: a reply to a closed ticket spawns a
       // linked ticket, it is not a fresh submission (spec §5).
-      const t = await createFromEmail(n, partnerId, closedOriginal.orgId, closedOriginal.emailThreadKey, closedOriginal.internalNumber, null, false, policy.defaultAssigneeUserId);
+      const t = await createFromEmail(n, partnerId, closedOriginal.orgId, closedOriginal.emailThreadKey, closedOriginal.internalNumber, null, false, policy.defaultAssigneeUserId, closedOriginal.id);
       await logCreated(n, partnerId, t);
       return;
     }
@@ -568,8 +574,11 @@ export async function processInboundEmail(
 
     // (6) Sender domain mapped to a customer org (Phase 5) -> ALWAYS create the
     // ticket; optionally onboard a password-less contact so future replies
-    // thread + attribute. This sits behind the senderAuth.verified (DMARC) gate
-    // above, so a forged From: @customer.com can't file into the customer's org.
+    // thread + attribute. This sits behind the senderAuth.verified gate above, so a
+    // forged From: @customer.com from outside can't file into the customer's org.
+    // The one exception is mail verified as intra-tenant on a Microsoft 365 mailbox
+    // (source 'exchange-internal', #8299): that proves the mail came from inside the
+    // mailbox's own tenant, not that the From domain is genuine.
     const domainMatch = await senderResolver.domainOrg();
     if (domainMatch) {
       // `autoCreateContact` is the partner's "onboard people from this domain"
@@ -618,6 +627,11 @@ export async function processInboundEmail(
     // (8) 'quarantine' (default) -> review queue for manual handling.
     await logInbound(n, partnerId, 'quarantined', null);
   } catch (err) {
+    // #8972: the matched ticket was merged between the (unlocked) match and the
+    // comment's ticket lock. Not a failure of this message: rethrow so the outer
+    // transaction rolls back and BullMQ retries — the re-run matches through
+    // merged_into_ticket_id and lands the reply on the survivor.
+    if (err instanceof TicketMergedError) throw err;
     // (9) Any guard/error after partner resolution -> failed, logged under the
     // RESOLVED partner. Never a cross-tenant write.
     //
@@ -836,7 +850,10 @@ async function createFromEmail(
   priorNumber: string | null,
   requester: EmailTicketRequester,
   autoresponse: boolean,
-  defaultAssigneeUserId: string | null
+  defaultAssigneeUserId: string | null,
+  // #8883 W5 (Gate B14): the closed ticket this one continues; passed only on
+  // the closed-continuation path, so createTicket skips routing for it.
+  continuationOfTicketId: string | null = null
 ) {
   // GUARD (spec §6 layer 2): the resolved org MUST belong to the resolved partner before create.
   const orgOk = await db
@@ -851,13 +868,14 @@ async function createFromEmail(
   const ticket = await createTicket(
     {
       orgId,
-      subject: n.subject.replace(TOKEN_RE, '').trim() || '(no subject)',
+      subject: stripTicketTokens(n.subject) || '(no subject)',
       description,
       source: 'email',
       submitterEmail: n.from,
       submitterName: n.fromName,
       submittedBy: requester?.kind === 'portal' ? requester.portalUserId : undefined,
-      requesterContactId: requester?.kind === 'contact' ? requester.contactId : undefined
+      requesterContactId: requester?.kind === 'contact' ? requester.contactId : undefined,
+      ...(continuationOfTicketId ? { continuationOfTicketId } : {})
     },
     SYSTEM_ACTOR
   );

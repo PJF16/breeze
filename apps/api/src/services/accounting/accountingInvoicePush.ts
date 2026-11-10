@@ -47,7 +47,7 @@
  */
 
 import { and, eq, isNull, notInArray, or } from 'drizzle-orm';
-import { db, runOutsideDbContext } from '../../db';
+import { db, runOutsideDbContext, withDbTransaction } from '../../db';
 import { accountingEntityMappings, invoiceLines, invoices } from '../../db/schema';
 import type { AccountingEntityMapping as AccountingEntityMappingRow } from '../../db/schema';
 import { assertNoAmbientDbContext, type DbContextRunner } from './dbContextGuard';
@@ -83,6 +83,10 @@ import {
 import { AccountingInvoicePushError, type AccountingInvoicePushErrorCode } from './accountingInvoicePushErrors';
 import { assertPushedLinesMatchSubtotal, computeRemoteVariance, pushedLineAmounts } from './accountingInvoiceTotals';
 import { invoicePushMessages } from './accountingInvoicePushMessages';
+import {
+  invoiceLineText, lineWorkedVsBilled, resolveInvoiceLineDetail, type InvoiceLineDetail,
+} from '@breeze/shared';
+import { documentLabelsFor } from '@breeze/shared/documents';
 
 export { AccountingInvoicePushError, type AccountingInvoicePushErrorCode } from './accountingInvoicePushErrors';
 
@@ -290,7 +294,9 @@ async function persistInvoicePreflightErrorInOwnContext(
       }
 
       try {
-        await db.insert(accountingEntityMappings).values({
+        // In a savepoint, or the caught conflict is rethrown when this context's
+        // transaction ends and reported anyway (#11203).
+        await withDbTransaction(async () => db.insert(accountingEntityMappings).values({
           integrationId: conn.id,
           partnerId,
           breezeEntityType: 'invoice',
@@ -299,7 +305,7 @@ async function persistInvoicePreflightErrorInOwnContext(
           linkStatus: 'create_new',
           syncStatus: 'error',
           lastError: message,
-        }).returning();
+        }).returning());
       } catch (err) {
         // A concurrent push (or a concurrent currency-error write for the
         // same invoice) claimed the row first between our read and this
@@ -595,24 +601,51 @@ async function persistInvoiceRemoteRef(params: {
 // byte-for-byte (no locale concept for this export) and every other
 // renderer's condition: empty for a non-time-entry line or when the two
 // quantities agree.
-function accountingLineNote(line: { quantity: string; workedMinutes: number | null }): string {
-  if (line.workedMinutes == null) return '';
-  const worked = (line.workedMinutes / 60).toFixed(2);
-  const billed = Number(line.quantity).toFixed(2);
-  if (worked === billed) return '';
-  return ` — ${worked} h worked, ${billed} h billed`;
+//
+// #8604 W03: gated by the invoice's frozen `showWorkedTime`, like every other
+// surface — a withheld disclosure must not reach the accounting copy either.
+function accountingLineNote(
+  line: { quantity: string; workedMinutes: number | null },
+  detail: InvoiceLineDetail,
+): string {
+  if (!detail.showWorkedTime) return '';
+  const wb = lineWorkedVsBilled(line);
+  return wb ? ` — ${wb.worked} h worked, ${wb.billed} h billed` : '';
 }
 
-function buildLinePayload(line: InvoiceLineRow): AccountingInvoiceLinePayload {
-  // Legacy-line fallback mirrors invoiceService/invoicePdf's own
-  // name-then-description title resolution.
-  const title = line.name ?? line.description ?? '';
+/**
+ * #8604 W03: the line title under the invoice's frozen `showNote`. The shared
+ * `invoiceLineText` decides whether the technician's note is withheld (title
+ * `null`: an unnamed time-entry line with the note off); the generic label is
+ * the English one, matching this export's plain-English convention. When the
+ * note is shown the legacy `name ?? description` resolution is kept verbatim
+ * (no trimming, no '—' placeholder) so default pushes are byte-identical.
+ */
+function accountingLineTitle(line: InvoiceLineRow, detail: InvoiceLineDetail): string {
+  if (invoiceLineText(line, detail).title === null) return documentLabelsFor('en').laborLine;
+  return line.name ?? line.description ?? '';
+}
+
+function buildLinePayload(line: InvoiceLineRow, detail: InvoiceLineDetail): AccountingInvoiceLinePayload {
+  // Untrimmed name-then-description title (see accountingLineTitle: unlike the
+  // PDF there is no trim / '—' placeholder, keeping default pushes unchanged).
+  const title = accountingLineTitle(line, detail);
   // #7161: a hidden line is KEPT with its description and quantity but pushed
   // at zero — see pushedLineAmounts (accountingInvoiceTotals.ts).
   const { unitPrice, lineTotal } = pushedLineAmounts(line);
+  const note = accountingLineNote(line, detail);
+  // #8605 W04: the work date travels as structured data — only under the
+  // invoice's frozen showDate, and only for a line that has one (held or
+  // block-drawn entries never become dated lines). Unlike the PDF, per-day
+  // grouping does not move the date to a header: each accounting line is
+  // standalone, so it keeps its own date.
+  const serviceDate = detail.showDate ? line.workDate ?? null : null;
   return {
     invoiceLineId: line.id,
-    description: `${title}${accountingLineNote(line)}`,
+    description: `${title}${note}`,
+    // The disclosure is the suffix a provider cap must keep whole.
+    ...(note ? { descriptionSuffix: note } : {}),
+    ...(serviceDate ? { serviceDate } : {}),
     quantity: line.quantity,
     unitPrice,
     lineTotal,
@@ -761,7 +794,10 @@ export async function pushInvoiceToAccounting(
       // #7161 totals guard, same placement rationale as the currency guard:
       // before any org/item sync, token refresh or provider call. Asserted on
       // the exact line payloads that get pushed below, not a re-derivation.
-      const linePayloads = lines.map(buildLinePayload);
+      // #8604 W03: a pushable invoice is issued, so this reads ONLY the line
+      // detail frozen at issue (partner `null`); pre-W03 rows get the defaults.
+      const lineDetail = resolveInvoiceLineDetail(inv, null);
+      const linePayloads = lines.map((line) => buildLinePayload(line, lineDetail));
       assertPushedLinesMatchSubtotal(inv, linePayloads, label);
 
       // Xero W04: provider-specific refusals that need no I/O (a missing Xero

@@ -34,6 +34,9 @@ const groupMembershipMock = vi.hoisted(() => ({
 }));
 vi.mock('../groupMembership', () => groupMembershipMock);
 
+const groupReevalMock = vi.hoisted(() => ({ requestDeviceGroupReevaluationAfterCommit: vi.fn() }));
+vi.mock('../../jobs/deviceGroupJobs', () => groupReevalMock);
+
 const peripheralJobsMock = vi.hoisted(() => ({ schedulePeripheralPolicyDevice: vi.fn(async () => undefined) }));
 vi.mock('../../jobs/peripheralJobs', () => peripheralJobsMock);
 
@@ -454,10 +457,15 @@ describe('applyFleetDesign — step 5 (role corrections)', () => {
     expect(roleUpdate!.set).toMatchObject({ deviceRole: 'server', deviceRoleSource: 'ai' });
     expect(ledgerMock.recordApplied).toHaveBeenCalledWith(expect.objectContaining({
       itemRef: 'roleCorrections:d1', itemKind: 'role_correction', step: 5,
+      // What rollback's "still ours" check reads.
+      createdRefs: { deviceRole: 'server' },
       beforeImage: { deviceRole: 'workstation', deviceRoleSource: 'discovered' },
     }), transactionState.tx);
     expect(auditMock.writeAuditEvent).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ action: 'device.role.ai_correction' }));
     expect(result.applied).toContain('roleCorrections:d1');
+    expect(groupReevalMock.requestDeviceGroupReevaluationAfterCommit).toHaveBeenCalledWith(expect.objectContaining({
+      deviceId: 'd1', orgId: ORG, eventType: 'device.updated', changedFields: ['deviceRole'], reason: 'fleet_design_apply',
+    }));
   });
 });
 

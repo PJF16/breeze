@@ -21,6 +21,7 @@
 import { pageEnvelope, pageParamSchema, readPageArgs } from './aiToolPagination';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import {
+  actionIntents,
   devices,
   organizations,
   scripts,
@@ -29,8 +30,9 @@ import {
   scriptExecutions,
   executionStatusEnum,
 } from '../db/schema';
-import { eq, and, desc, sql, ilike, inArray, isNull, or, SQL } from 'drizzle-orm';
-import { isAiAgentPrincipal, type AuthContext } from '../middleware/auth';
+import { eq, and, desc, gte, sql, ilike, inArray, isNull, or, SQL } from 'drizzle-orm';
+import type { AuthContext } from '../middleware/auth';
+import { isAutomationPrincipal } from '../middleware/principalKind';
 import { escapeLike } from '../utils/sql';
 import type { AiTool } from './aiTools';
 // Type-only: the runtime import stays dynamic inside the handler.
@@ -51,6 +53,8 @@ import { isAgentConfigPath, isDeniedRegistryTarget } from '../routes/systemTools
 import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 import { inToolDbPhase } from './aiToolDbContext';
 import { aiPathRefusal, PATH_BLOCKED_MESSAGE } from './aiPathRestriction';
+import { findProfilePathInScript } from './aiScriptProfilePathScan';
+import { resolveDevicePolicyForGate } from './aiDevicePathPolicy';
 
 // Fix 4b: headroom under MAX_TOOL_RESULT_CHARS (8000) for the rest of the
 // get_script_execution envelope once stdout/stderr are counted at their
@@ -244,10 +248,82 @@ function callerMayUseVerifiedScript(
 }
 
 /**
+ * #8600 (device-group targets W03): a `run_script { groupId }` call runs only
+ * as the release of an approved action intent, and executes that intent's
+ * FROZEN arguments. `createActionIntent` resolved the group to concrete
+ * `deviceIds` before the approval was requested, so the approved set is the
+ * executed set. The handler NEVER resolves a group: membership that moved
+ * after approval must not reach the run.
+ *
+ * Why the row and not the raw input: the inline chat release executes with the
+ * model's own tool input (`makeToolHandler` hands `executeTool` the same args
+ * the preToolUse gate saw), which still says `groupId`. The durable release
+ * worker already passes the row's `arguments`, which carry no `groupId` and
+ * never reach this branch.
+ *
+ * Read under a system context like the other release-time reads; the caller's
+ * own authority is re-checked (`canAccessOrg` here, and per device by
+ * `verifyDeviceAccess` in the dispatch loops below).
+ */
+async function loadFrozenGroupTargetArguments(
+  input: Record<string, unknown>,
+  auth: AuthContext,
+  actionIntentId: string | undefined,
+): Promise<{ ok: true; args: Record<string, unknown> } | { ok: false; reason: string }> {
+  // One message back to the model for every mismatch (it can act on none of
+  // them differently); the specific cause is logged for the operator, since a
+  // refusal here on a genuine release would mean a release-path bug.
+  const refused = (reason: string, cause?: string) => {
+    if (cause) {
+      console.warn('[aiToolsScripts] run_script group release refused', { actionIntentId: actionIntentId ?? null, cause });
+    }
+    return { ok: false as const, reason };
+  };
+  if (!actionIntentId) {
+    return refused('a device-group run must be approved first; it executes only as the release of its approved action');
+  }
+  const [row] = await runOutsideDbContext(() => withSystemDbAccessContext(() => db
+    .select({
+      id: actionIntents.id,
+      orgId: actionIntents.orgId,
+      actionName: actionIntents.actionName,
+      status: actionIntents.status,
+      arguments: actionIntents.arguments,
+    })
+    .from(actionIntents)
+    .where(eq(actionIntents.id, actionIntentId))
+    .limit(1)));
+  const mismatch = 'the approved action does not match this call';
+  if (!row) return refused(mismatch, 'intent_missing');
+  if (row.actionName !== 'run_script') return refused(mismatch, 'intent_other_tool');
+  if (row.status !== 'executing') return refused(mismatch, `intent_status_${row.status}`);
+  if (!auth.canAccessOrg(row.orgId)) return refused(mismatch, 'intent_org_inaccessible');
+  const args = row.arguments && typeof row.arguments === 'object' ? row.arguments as Record<string, unknown> : null;
+  if (!args || args.groupId !== undefined) return refused(mismatch, 'intent_args_not_frozen');
+  const deviceIds = args.deviceIds;
+  if (!Array.isArray(deviceIds) || deviceIds.length === 0 || !deviceIds.every((id) => typeof id === 'string')) {
+    return refused(mismatch, 'intent_args_no_device_ids');
+  }
+  if ((args.scriptId ?? null) !== (input.scriptId ?? null) || (args.proposalId ?? null) !== (input.proposalId ?? null)) {
+    return refused(mismatch, 'intent_script_mismatch');
+  }
+  return { ok: true, args };
+}
+
+/**
  * The run_script handler, at module scope so the proposal branch is directly
  * testable through `__testOnly.runScriptHandler`. Registered below.
  */
 const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
+  // ---- #8600: device-group target — execute the approved, frozen list -------
+  if (input.groupId !== undefined && input.groupId !== null) {
+    const frozen = await loadFrozenGroupTargetArguments(input, auth, context?.actionIntentId);
+    if (!frozen.ok) {
+      return JSON.stringify({ error: `group_target_not_released: ${frozen.reason}` });
+    }
+    input = frozen.args;
+  }
+
   // ---- AI script authoring (spec §4.2): run_script { proposalId } ----------
   if (typeof input.proposalId === 'string') {
     if (!aiScriptAuthoringEnabled()) {
@@ -276,6 +352,37 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
       return JSON.stringify({ error: `proposal_not_runnable: ${runnable.reason}`, proposalId: input.proposalId });
     }
     const snapshot = proposalDispatchSnapshot(runnable.proposal, proposalDeviceIds);
+    // AI data policy (spec 2026-10-15 §2, best effort): an AI-authored
+    // proposal whose content names a user-profile path is refused unless the
+    // org of every target device that passes verifyDeviceAccess allows
+    // any_with_approval (a device that fails it is never dispatched below; none
+    // verified resolves as unresolved and refuses). Resolved with the
+    // executeTool gate's own resolver, so an unestablished partner refuses here
+    // too. Library scripts (scriptId) are human-authored
+    // and exempt; proposals take no parameters (runnable.ts), so the content
+    // is all there is to scan. Literal spellings only: a constructed path is
+    // not caught, and `off` does not make arbitrary scripts document-proof.
+    const profileHit = findProfilePathInScript(typeof runnable.proposal.content === 'string' ? runnable.proposal.content : '');
+    if (profileHit) {
+      const policy = await inToolDbPhase(auth, async () => {
+        const verified: Array<{ orgId: string }> = [];
+        for (const deviceId of proposalDeviceIds) {
+          const access = await verifyDeviceAccess(deviceId, auth);
+          if ('device' in access) verified.push(access.device);
+        }
+        return resolveDevicePolicyForGate(verified);
+      });
+      if (policy.deviceFileReadLevel !== 'any_with_approval') {
+        const level = policy.deviceFileReadLevel;
+        const source = policy.source.deviceFileReadLevel;
+        return JSON.stringify({
+          error: `This script proposal reads a user profile path (${profileHit}), which the AI data policy refuses (level: ${level}, set by: ${source}). Rewrite the script without it${level === 'no_user_profiles' ? ', or ask an administrator for a diagnostic access grant and read the file with diagnostic_read_file' : ''}.`,
+          condition: 'policy_denied',
+          policy: { level, source },
+          proposalId: input.proposalId,
+        });
+      }
+    }
     // #5645 — spec §4.1 `approval_method` is DERIVED from the releasing
     // intent's decision record (§4.6), which both release paths put on the
     // context next to `actionIntentId`. Resolved once per call, never per
@@ -374,7 +481,9 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
   // has no human review and no revalidation behind it at all. Ignore both
   // for this principal; dispatch falls back to the SAVED script's own
   // `runAs` (its `targetSessionId`, unset, already defaults to none).
-  const isUnattendedAgentDispatch = isAiAgentPrincipal(auth);
+  // A flow run (W04 #5219) is the same unattended case: the saved script's
+  // own run context wins over a caller-supplied runAs / targetSessionId.
+  const isUnattendedAgentDispatch = isAutomationPrincipal(auth);
 
   // #4888 — an assistant-chosen run context clears the SAME gate a human
   // one does. Not a copy of the rules, the actual object the HTTP route
@@ -790,13 +899,14 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
     selfManagedDbContext: true,
     definition: {
       name: 'run_script',
-      description: "Run a saved scriptId or reviewed proposalId from propose_script on devices; never both. A pending proposalId is refused with proposal_review_pending — poll get_script_proposal until it finishes, then retry. Maintenance-window suppression is deferred, not failure. Approval is required.",
+      description: "Run a saved scriptId or reviewed proposalId (from propose_script) on deviceIds or one groupId, max 10 devices; give one of each pair. A pending proposalId returns proposal_review_pending: poll get_script_proposal, then retry. Maintenance-window deferral is not failure. Needs approval.",
       input_schema: {
         type: 'object' as const,
         properties: {
           scriptId: { type: 'string', description: 'UUID of an existing library script to run' },
           proposalId: { type: 'string', description: 'UUID of a REVIEWED AI-authored proposal from propose_script; mutually exclusive with scriptId. If pending, poll get_script_proposal until done, then retry.' },
-          deviceIds: { type: 'array', items: { type: 'string' }, description: 'Device UUIDs to run on' },
+          deviceIds: { type: 'array', items: { type: 'string' }, description: 'Device UUIDs to run on (max 10). Give exactly one of deviceIds or groupId.' },
+          groupId: { type: 'string', description: 'Saved device group UUID to run on instead of deviceIds. Its members are frozen when approval is requested and that list runs; refused above 10 devices.' },
           parameters: { type: 'object', description: 'Script parameters (library scripts only)' },
           expectedContentSha256: { type: 'string', description: 'Optional: contentSha256 from get_script_details. If the script changed, nothing runs and it returns error script_content_mismatch.' },
           // #4888 — see services/scriptRunRequest.ts. Shared with the three
@@ -804,7 +914,9 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
           // express a run context on every surface, not just some of them.
           ...AI_RUN_CONTEXT_JSON_SCHEMA_PROPERTIES
         },
-        required: ['deviceIds']
+        // Exactly one of deviceIds / groupId; toolInputSchemas.run_script
+        // enforces it, so neither is listed as required here (#8600).
+        required: []
       }
     },
     handler: runScriptHandler,
@@ -1278,39 +1390,71 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
   registerTool({
     tier: 1,
     domain: 'scripts',
-    searchHint: 'script run history, status, exit codes, stdout, stderr and timing',
+    searchHint: 'script run history per script or per device; did it run, status, exit codes, stdout, stderr and timing',
+    // #10417: deviceId routes through the central verifyDeviceAccess gate
+    // (helper lock, exact-device membership, org, site) before the handler runs.
+    deviceArgs: ['deviceId'],
     definition: {
       name: 'get_script_execution_history',
-      description: 'Get past execution results for a script. Shows status, exit codes, stdout/stderr, and timing information.',
+      description: 'Past script runs, newest first: for one script (scriptId), on one device (deviceId: every script run there), or both. Shows script name, status, exit code, stdout/stderr and timing.',
       input_schema: {
         type: 'object' as const,
         properties: {
-          scriptId: { type: 'string', description: 'UUID of the script to get execution history for' },
+          scriptId: { type: 'string', description: 'Script UUID; omit with deviceId to list every script run on that device' },
+          deviceId: { type: 'string', description: 'Device UUID: runs on this device only' },
+          since: { type: 'string', description: 'ISO 8601 time: only runs created at or after it' },
           limit: { type: 'number', description: 'Max results to return (default 10, max 50)' },
         },
-        required: ['scriptId'],
       },
     },
     handler: async (input, auth) => {
-      // Verify the script belongs to the user's org before returning execution
-      // data. Partner-wide/system scripts have org_id NULL — same guard as
-      // run_script, or the history of the repo's default ownership shape would
-      // read as "Script not found".
-      const scriptConditions: SQL[] = [eq(scripts.id, input.scriptId as string), isNull(scripts.deletedAt)];
-      const orgCondition = auth.orgCondition(scripts.orgId);
-      if (orgCondition) scriptConditions.push(or(isNull(scripts.orgId), orgCondition)!);
+      // A supplied-but-malformed id is refused, never dropped: dropping a bad
+      // scriptId next to a deviceId would silently widen to every script.
+      for (const key of ['scriptId', 'deviceId'] as const) {
+        if (input[key] !== undefined && (typeof input[key] !== 'string' || input[key] === '')) {
+          return JSON.stringify({ error: `${key} must be a non-empty UUID string`, code: 'VALIDATION_ERROR' });
+        }
+      }
+      const scriptId = input.scriptId as string | undefined;
+      const deviceId = input.deviceId as string | undefined;
+      if (!scriptId && !deviceId) {
+        return JSON.stringify({ error: 'Provide scriptId or deviceId', code: 'VALIDATION_ERROR' });
+      }
+      let since: Date | undefined;
+      if (input.since !== undefined && input.since !== null && input.since !== '') {
+        since = new Date(String(input.since));
+        if (Number.isNaN(since.getTime())) {
+          return JSON.stringify({ error: 'since must be an ISO 8601 time', code: 'VALIDATION_ERROR' });
+        }
+      }
 
-      const [script] = await db
-        .select({ id: scripts.id })
-        .from(scripts)
-        .where(and(...scriptConditions))
-        .limit(1);
+      if (scriptId) {
+        // Verify the script belongs to the user's org before returning execution
+        // data. Partner-wide/system scripts have org_id NULL — same guard as
+        // run_script, or the history of the repo's default ownership shape would
+        // read as "Script not found".
+        const scriptConditions: SQL[] = [eq(scripts.id, scriptId), isNull(scripts.deletedAt)];
+        const orgCondition = auth.orgCondition(scripts.orgId);
+        if (orgCondition) scriptConditions.push(or(isNull(scripts.orgId), orgCondition)!);
 
-      if (!script) return JSON.stringify({ error: 'Script not found' });
+        const [script] = await db
+          .select({ id: scripts.id })
+          .from(scripts)
+          .where(and(...scriptConditions))
+          .limit(1);
+
+        if (!script) return JSON.stringify({ error: 'Script not found' });
+      }
 
       const limit = Math.min(Math.max(1, Number(input.limit) || 10), 50);
 
-      const executionConditions: SQL[] = [eq(scriptExecutions.scriptId, input.scriptId as string)];
+      // Tenancy rides the execution's own denormalised org_id (NOT NULL for
+      // every source kind) and the device's CURRENT site, exactly as for the
+      // scriptId path; the deviceId predicate only narrows further.
+      const executionConditions: SQL[] = [];
+      if (scriptId) executionConditions.push(eq(scriptExecutions.scriptId, scriptId));
+      if (deviceId) executionConditions.push(eq(scriptExecutions.deviceId, deviceId));
+      if (since) executionConditions.push(gte(scriptExecutions.createdAt, since));
       const executionOrgCondition = auth.orgCondition(scriptExecutions.orgId);
       if (executionOrgCondition) executionConditions.push(executionOrgCondition);
       if (auth.allowedDeviceIds !== undefined) {
@@ -1323,20 +1467,32 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
       const results = await db
         .select({
           id: scriptExecutions.id,
+          scriptId: scriptExecutions.scriptId,
+          // Technician-authored library name; NULL for a proposal-backed run
+          // (no library script) or a script the caller's RLS does not show.
+          scriptName: scripts.name,
+          sourceKind: scriptExecutions.sourceKind,
+          triggerType: scriptExecutions.triggerType,
+          deviceId: scriptExecutions.deviceId,
           status: scriptExecutions.status,
           exitCode: scriptExecutions.exitCode,
           stdout: sql<string | null>`left(${scriptExecutions.stdout}, 16385)`,
           stderr: sql<string | null>`left(${scriptExecutions.stderr}, 8193)`,
+          errorMessage: scriptExecutions.errorMessage,
           createdAt: scriptExecutions.createdAt,
+          startedAt: scriptExecutions.startedAt,
           completedAt: scriptExecutions.completedAt,
         })
         .from(scriptExecutions)
         .innerJoin(devices, eq(devices.id, scriptExecutions.deviceId))
+        .leftJoin(scripts, eq(scripts.id, scriptExecutions.scriptId))
         .where(and(...executionConditions))
         .orderBy(desc(scriptExecutions.createdAt))
-        .limit(limit);
+        // One extra row tells the model more runs exist (narrow with since).
+        .limit(limit + 1);
 
-      const executions = results.map((execution) => ({
+      const hasMore = results.length > limit;
+      const executions = results.slice(0, limit).map((execution) => ({
         ...execution,
         ...(execution.stdout && execution.stdout.length > 16_384
           ? { stdout: execution.stdout.slice(0, 16_384), stdoutTruncated: true }
@@ -1345,7 +1501,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
           ? { stderr: execution.stderr.slice(0, 8_192), stderrTruncated: true }
           : {}),
       }));
-      return JSON.stringify({ executions, count: executions.length });
+      return JSON.stringify({ executions, count: executions.length, hasMore });
     },
   });
 

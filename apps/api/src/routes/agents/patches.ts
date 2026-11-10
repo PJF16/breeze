@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import type { z } from 'zod';
+import { OEM_LANES, type OemLane } from '@breeze/shared';
 import { zValidator } from '../../lib/validation';
 import { and, eq, sql } from 'drizzle-orm';
 import { db, type Database } from '../../db';
@@ -148,6 +149,45 @@ function narrowReportedSeverity(
     : null;
 }
 
+/** Values of `device_patches.reported_severity_source` (#9387; DB CHECK device_patches_reported_severity_source_chk). */
+const REPORTED_SEVERITY_SOURCES = ['vendor', 'derived'] as const;
+type ReportedSeveritySource = (typeof REPORTED_SEVERITY_SOURCES)[number];
+
+/**
+ * Narrow the agent-reported provenance of `reportedSeverity` (#9387) to a
+ * known value or null. Only a real rating carries a provenance: an absent or
+ * 'unknown' severity never gets one, so a "derived unknown" cannot be stored.
+ */
+function narrowReportedSeveritySource(
+  reportedSeverity: string | null,
+  value: string | null | undefined
+): ReportedSeveritySource | null {
+  if (!reportedSeverity || reportedSeverity === 'unknown' || !value) return null;
+  return (REPORTED_SEVERITY_SOURCES as readonly string[]).includes(value)
+    ? (value as ReportedSeveritySource)
+    : null;
+}
+
+/** Values of `device_patches.reported_update_type` (#11073; DB CHECK device_patches_reported_update_type_chk). */
+const REPORTED_UPDATE_TYPES = ['driver', 'firmware', 'quality', 'feature', 'definition', 'other'] as const;
+type ReportedUpdateType = (typeof REPORTED_UPDATE_TYPES)[number];
+
+/**
+ * Narrow the agent's report to a known value or null. A value this API has never
+ * heard of is refused here, before it can trip the CHECK and abort the scan. Null
+ * is the safe reading: a NULL row is never left to a vendor lane.
+ */
+function narrowReportedUpdateType(value: string | null | undefined): ReportedUpdateType | null {
+  if (!value) return null;
+  return (REPORTED_UPDATE_TYPES as readonly string[]).includes(value) ? (value as ReportedUpdateType) : null;
+}
+
+/** Values of `device_patches.reported_update_owner` (#11073; DB CHECK device_patches_reported_update_owner_chk). */
+function narrowReportedUpdateOwner(value: string | null | undefined): OemLane | null {
+  if (!value) return null;
+  return (OEM_LANES as readonly string[]).includes(value) ? (value as OemLane) : null;
+}
+
 // Derive vendor from package id; ignore agent-supplied vendor for winget-style ids.
 function deriveVendor(packageId: string | null | undefined, fallback: string | null | undefined): string | null {
   if (packageId && /^[^.]+\.[^.]+/.test(packageId)) {
@@ -269,7 +309,13 @@ async function upsertPendingPatches(
     // for any other tenant. See services/patchSeverityOverlay.ts for how this
     // is read back as an effective severity/category fallback.
     const reportedSeverity = narrowReportedSeverity(patchData.severity ?? null);
+    // Whether that severity is the vendor's rating or one the agent derived
+    // from the update's classification (#9387). Travels with the severity:
+    // see the conflict-update below.
+    const reportedSeveritySource = narrowReportedSeveritySource(reportedSeverity, patchData.severitySource);
     const reportedCategory = category ?? null;
+    const reportedUpdateType = narrowReportedUpdateType(patchData.reportedUpdateType);
+    const reportedUpdateOwner = reportedUpdateType ? narrowReportedUpdateOwner(patchData.reportedUpdateOwner) : null;
 
     const [patch] = await executor
       .insert(patches)
@@ -350,7 +396,10 @@ async function upsertPendingPatches(
         scope: patchData.scope ?? null,
         availableVersion: version,
         reportedSeverity: reportedSeverity,
+        reportedSeveritySource: reportedSeveritySource,
         reportedCategory: reportedCategory,
+        reportedUpdateType: reportedUpdateType,
+        reportedUpdateOwner: reportedUpdateOwner,
         lastCheckedAt: new Date()
       })
       .onConflictDoUpdate({
@@ -368,7 +417,24 @@ async function upsertPendingPatches(
           // this is per-device/per-org so it can be freely refreshed, raised
           // or lowered by this device's own later scans.
           reportedSeverity: updateIfReported(devicePatches.reportedSeverity, reportedSeverity),
+          // The provenance moves with the severity as a pair: when this scan
+          // reported a severity, its provenance (possibly NULL, from an agent
+          // that sends none) replaces the stored one, so a real rating never
+          // sits beside a stale 'derived' flag; when it reported none, both
+          // keep their stored values.
+          reportedSeveritySource: reportedSeverity === null
+            ? sql`${devicePatches.reportedSeveritySource}`
+            : reportedSeveritySource,
           reportedCategory: updateIfReported(devicePatches.reportedCategory, reportedCategory),
+          // A pair from one report. A scan that says nothing keeps them. One that
+          // says something replaces them both, so a value this API does not know
+          // clears a stale `driver` rather than leaving the patch with a lane.
+          reportedUpdateType: patchData.reportedUpdateType === undefined
+            ? sql`${devicePatches.reportedUpdateType}`
+            : reportedUpdateType,
+          reportedUpdateOwner: patchData.reportedUpdateType === undefined
+            ? sql`${devicePatches.reportedUpdateOwner}`
+            : reportedUpdateOwner,
           lastCheckedAt: new Date(),
           updatedAt: new Date()
         }
@@ -464,7 +530,20 @@ async function upsertInstalledPatches(
     // A Date bound inside a raw sql`` fragment bypasses drizzle's column
     // mapper and postgres.js cannot serialize it (TypeError at query time) —
     // bind the ISO string with an explicit cast instead.
-    const installedAtParam = installedAt ? sql`${installedAt.toISOString()}::timestamp` : sql`NULL::timestamp`;
+    //
+    // A report that omits installedAt keeps the date already stored (#9723):
+    // providers send it only when the OS has one, and a provider can miss it
+    // on one scan (a failed history or registry read), so writing NULL would
+    // wipe a known date. The date is kept only while the installed version is
+    // unchanged: a stored date belongs to the version installed then, so a
+    // new version without a date reads unknown rather than wrong. Outside a
+    // preserved pending row (below), a reported date replaces the stored one,
+    // so a reinstall moves it. (SET expressions read the row's pre-update
+    // values, so installed_version here is the stored one.)
+    const keepStoredInstalledAt = sql`CASE WHEN ${devicePatches.installedVersion} IS NOT DISTINCT FROM ${version}::varchar THEN ${devicePatches.installedAt} ELSE NULL::timestamp END`;
+    const installedAtParam = installedAt
+      ? sql`${installedAt.toISOString()}::timestamp`
+      : keepStoredInstalledAt;
     // Installed inventory must not downgrade an actionable 'pending' row on the
     // normal paired-submit flow. Package managers report a pending upgrade and
     // the installed package under the SAME (source, externalId) — `winget list`
@@ -527,7 +606,7 @@ async function upsertInstalledPatches(
             : sql`CASE WHEN ${devicePatches.status} = 'pending' THEN ${devicePatches.status} ELSE 'installed' END`,
           installedAt: installedMeetsTarget
             ? installedAtParam
-            : sql`CASE WHEN ${devicePatches.status} = 'pending' THEN ${devicePatches.installedAt} ELSE ${installedAtParam} END`,
+            : sql`CASE WHEN ${devicePatches.status} = 'pending' THEN ${keepStoredInstalledAt} ELSE ${installedAtParam} END`,
           installedVersion: version,
           reportedCategory: updateIfReported(devicePatches.reportedCategory, reportedCategory),
           lastCheckedAt: new Date(),

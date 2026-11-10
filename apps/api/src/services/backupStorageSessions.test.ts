@@ -73,7 +73,13 @@ type FakeState = {
   snapshots: StorageSnapshotRow[];
   config: { provider: string; providerConfig: Record<string, unknown> } | null;
   indexed: Map<string, string[]>;
-  origins: Array<{ originSnapshotId: string; originOrgId: string; originDeviceId: string; originStorageIdentity: string }>;
+  origins: Array<{
+    originSnapshotId: string;
+    originOrgId: string;
+    originDeviceId: string;
+    originStorageIdentity: string;
+    originKeyRoot?: { keyLayout: string; keyPrefix: string | null };
+  }>;
   sessions: Map<string, StorageSessionRow>;
   command: { status: string; deviceId: string } | null;
   revoked: Array<{ id: string; reason: string }>;
@@ -114,6 +120,7 @@ function baseSnapshot(overrides: Partial<StorageSnapshotRow> = {}): StorageSnaps
     snapshotId: SNAP,
     storageIdentity: IDENTITY,
     keyLayout: 'legacy_flat',
+    keyPrefix: null,
     fileIndexStatus: 'complete',
     fileIndexManifestSha256: MANIFEST_SHA,
     fileIndexError: null,
@@ -1077,6 +1084,108 @@ describe('storage session object resolution', () => {
   });
 });
 
+describe('a write session queued behind another backup (#11012)', () => {
+  const agent = { deviceId: EXEC_DEVICE, orgId: ORG };
+
+  /** A write session as dispatch mints it for one job of a schedule batch, never used yet. */
+  async function mintWriteSession(state: FakeState) {
+    const { desc, row } = await mintSession(state);
+    const stored = state.sessions.get(row.id)!;
+    Object.assign(stored, {
+      scope: 'snapshot_write',
+      commandId: null,
+      snapshotId: null,
+      jobId: '77777777-7777-4777-8777-777777777777',
+      reservationSnapshotId: 'snapshot-queued',
+      reservationGeneration: 1,
+      // Dispatch grants a full write deadline; the lease is the short window.
+      deadline: new Date(NOW.getTime() + 24 * 3600_000),
+      callCount: 0,
+      lastUsedAt: null,
+      urlHorizonAt: null,
+      resumedAt: null,
+    });
+    return { desc, stored };
+  }
+  /** The moment the helper finally starts the parked job: lease long gone, deadline far away. */
+  const afterLongWait = (stored: StorageSessionRow) => new Date(stored.expiresAt.getTime() + 3 * 3600_000);
+  const auth = (desc: SessionDescriptor, deps: BrokeredReadDeps) =>
+    authenticateStorageSession({ sessionId: desc.sessionId, token: desc.token, agent }, deps);
+
+  it('accepts an unused write session whose lease lapsed before its deadline, and renew issues a fresh lease from now', async () => {
+    const state = makeState();
+    const { desc, stored } = await mintWriteSession(state);
+    const startedAt = afterLongWait(stored);
+    const deps = makeDeps(state, { now: () => startedAt });
+
+    const result = await auth(desc, deps);
+    expect(result).toMatchObject({ ok: true });
+    if (!result.ok) return;
+
+    const renewed = await renewStorageSession(result.session, deps);
+    expect(renewed.status).toBe(200);
+    if (renewed.status !== 200) return;
+    expect(Date.parse(renewed.body.expiresAt)).toBe(startedAt.getTime() + STORAGE_SESSION_LEASE_MS);
+    expect(renewed.body.expiresIn).toBe(STORAGE_SESSION_LEASE_MS / 1000);
+    expect(state.sessions.get(desc.sessionId)!.callCount).toBe(1);
+
+    // From here the lease is a liveness window as for any running session.
+    expect(await auth(desc, deps)).toMatchObject({ ok: true });
+    const lapsedAgain = makeDeps(state, { now: () => new Date(startedAt.getTime() + STORAGE_SESSION_LEASE_MS + 1) });
+    expect(await auth(desc, lapsedAgain)).toMatchObject({ ok: false, status: 410 });
+  });
+
+  it('only a renew re-arms the lease: a different first call spends the exemption and the next call is refused', async () => {
+    // The helper renews any lease with under a third left before each call
+    // (storagesession ensureLease), so its first call here is always a renew.
+    const state = makeState();
+    const { desc, stored } = await mintWriteSession(state);
+    const deps = makeDeps(state, { now: () => afterLongWait(stored) });
+    expect(await auth(desc, deps)).toMatchObject({ ok: true });
+    // Any charged write call raises call_count (backupStorageWriteSessions consume()).
+    expect(await deps.store.consumeBudget(desc.sessionId, { calls: 1, objects: 0 }, afterLongWait(stored))).toMatchObject({ kind: 'granted' });
+    expect(await auth(desc, deps)).toMatchObject({ ok: false, status: 410, error: 'Storage session has expired' });
+  });
+
+  it.each([
+    ['has made a call', { callCount: 1 }],
+    ['has a recorded use', { lastUsedAt: NOW }],
+    ['has resumed a snapshot', { resumedAt: NOW }],
+    ['has issued upload URLs', { urlHorizonAt: NOW }],
+  ])('refuses a lapsed lease once the session %s', async (_name, used) => {
+    const state = makeState();
+    const { desc, stored } = await mintWriteSession(state);
+    Object.assign(stored, used);
+    const deps = makeDeps(state, { now: () => afterLongWait(stored) });
+    expect(await auth(desc, deps)).toMatchObject({ ok: false, status: 410, error: 'Storage session has expired' });
+  });
+
+  it('refuses an unused write session once its deadline has passed', async () => {
+    const state = makeState();
+    const { desc, stored } = await mintWriteSession(state);
+    const deps = makeDeps(state, { now: () => new Date(stored.deadline.getTime() + 1) });
+    expect(await auth(desc, deps)).toMatchObject({ ok: false, status: 410 });
+  });
+
+  it('refuses an unused write session that was revoked', async () => {
+    const state = makeState();
+    const { desc, stored } = await mintWriteSession(state);
+    stored.revokedAt = NOW;
+    const deps = makeDeps(state, { now: () => afterLongWait(stored) });
+    expect(await auth(desc, deps)).toMatchObject({ ok: false, status: 410, error: 'Storage session has been revoked' });
+  });
+
+  it('leaves read sessions unchanged: an unused read session still expires with its lease', async () => {
+    const state = makeState();
+    const { desc, row } = await mintSession(state);
+    const stored = state.sessions.get(row.id)!;
+    stored.deadline = new Date(NOW.getTime() + 24 * 3600_000);
+    expect(stored.callCount).toBe(0);
+    const deps = makeDeps(state, { now: () => new Date(stored.expiresAt.getTime() + 1) });
+    expect(await auth(desc, deps)).toMatchObject({ ok: false, status: 410, error: 'Storage session has expired' });
+  });
+});
+
 describe('storage session renewal', () => {
   it('charges one call and no objects against the session budget', async () => {
     const state = makeState();
@@ -1692,5 +1801,92 @@ describe('restore integrity enforcement at delivery', () => {
     const outcome = deliverBrokeredReadCommand(shape(restorePayload()), ctx({ type }), deps);
     await expect(outcome).rejects.toThrow('statement timeout');
     await expect(outcome).rejects.not.toBeInstanceOf(CommandDeliveryRefusedError);
+  });
+});
+
+// #7081: a read session composes physical keys from the snapshot's recorded
+// key root; external refs must resolve under the same root (I4).
+describe('snapshot key root (#7081)', () => {
+  const PREFIX = 'msp/acme';
+  const P_PAIR = { keyLayout: 'prefixed_flat', keyPrefix: PREFIX };
+  const LEGACY_PAIR = { keyLayout: 'legacy_flat', keyPrefix: null };
+
+  function prefixedState(): FakeState {
+    const state = makeState();
+    // The helper's attestation describes the logical layout (I6).
+    state.snapshots = [makeSnapshot({
+      keyLayout: 'prefixed_flat',
+      keyPrefix: PREFIX,
+      integrityStatus: 'attested',
+      attestation: makeAttestation({ keyLayout: 'legacy_flat' }),
+    })];
+    return state;
+  }
+
+  const presigned = (deps: { presignGet: { mock: { calls: unknown[][] } } }) =>
+    deps.presignGet.mock.calls.map((c) => (c[0] as { key: string }).key);
+
+  it('presigns a prefixed snapshot\'s own keys under its root and answers logical keys', async () => {
+    const state = prefixedState();
+    const { deps, row } = await mintSession(state);
+    const keys = [`snapshots/${SNAP}/manifest.json`, `snapshots/${SNAP}/files/a.txt`];
+    const result = await resolveStorageSessionObjects(row, keys, deps);
+    expect(result).toMatchObject({ status: 200, body: { denied: [] } });
+    if (result.status !== 200) return;
+    expect(result.body.objects.map((o) => o.key)).toEqual(keys);
+    expect(presigned(deps)).toEqual(keys.map((k) => `${PREFIX}/${k}`));
+  });
+
+  it('grants an external ref of a prefixed snapshot only when its origin has the same root', async () => {
+    const external = 'snapshots/snap-older/files/c.txt';
+    for (const [originKeyRoot, granted] of [[P_PAIR, true], [LEGACY_PAIR, false], [{ keyLayout: 'prefixed_flat', keyPrefix: 'msp/other' }, false], [undefined, false]] as const) {
+      const state = prefixedState();
+      state.origins[0]!.originKeyRoot = originKeyRoot;
+      const { deps, row } = await mintSession(state);
+      const result = await resolveStorageSessionObjects(row, [external], deps);
+      expect(result.status).toBe(200);
+      if (result.status !== 200) continue;
+      expect(result.body.objects.map((o) => o.key)).toEqual(granted ? [external] : []);
+      expect(presigned(deps)).toEqual(granted ? [`${PREFIX}/${external}`] : []);
+    }
+  });
+
+  it('denies an external ref of a legacy snapshot whose recorded origin root differs, and keeps granting one with no row left', async () => {
+    const external = 'snapshots/snap-older/files/c.txt';
+    const state = makeState();
+    state.origins[0]!.originKeyRoot = P_PAIR;
+    const { deps, row } = await mintSession(state);
+    expect(await resolveStorageSessionObjects(row, [external], deps))
+      .toMatchObject({ status: 200, body: { objects: [], denied: [external] } });
+
+    const unchanged = makeState();
+    const second = await mintSession(unchanged);
+    const result = await resolveStorageSessionObjects(second.row, [external], second.deps);
+    expect(result).toMatchObject({ status: 200, body: { denied: [] } });
+    expect(presigned(second.deps)).toEqual([external]);
+  });
+
+  it.each([
+    ['a prefixed row without a prefix', { keyLayout: 'prefixed_flat', keyPrefix: null }],
+    ['a prefix that is not in normalized form', { keyLayout: 'prefixed_flat', keyPrefix: '/msp/acme/' }],
+    ['a reserved prefix segment', { keyLayout: 'prefixed_flat', keyPrefix: 'x/snapshots' }],
+  ])('refuses delivery for %s (key_layout_unsupported)', async (_name, pair) => {
+    const state = makeState();
+    state.snapshots = [makeSnapshot({ ...pair, attestation: makeAttestation({ keyLayout: 'legacy_flat' }), integrityStatus: 'attested' })];
+    const deps = makeDeps(state);
+    await expect(deliverBrokeredReadCommand(restorePayload(), ctx(), deps))
+      .rejects.toThrow('This backup was written in a storage format this server version cannot read.');
+    expect(deps.recordDispatch).toHaveBeenCalledWith('backup_restore', 'refused', 'key_layout_unsupported');
+    expect(state.sessions.size).toBe(0);
+  });
+
+  it('ends a session whose snapshot root became unreadable', async () => {
+    const state = prefixedState();
+    const { deps, row } = await mintSession(state);
+    state.snapshots = [{ ...state.snapshots[0]!, keyPrefix: 'x/snapshots' }];
+    const result = await resolveStorageSessionObjects(row, [`snapshots/${SNAP}/manifest.json`], deps);
+    expect(result).toMatchObject({ status: 410 });
+    expect(state.revoked).toEqual([{ id: row.id, reason: 'storage_changed' }]);
+    expect(deps.presignGet).not.toHaveBeenCalled();
   });
 });

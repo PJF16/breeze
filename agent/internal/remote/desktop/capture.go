@@ -77,16 +77,9 @@ type CaptureProbeReport struct {
 	ScreenCaptureKitCalls int
 }
 
-// ProbeCaptureAccess is the permission-check probe: one real capture attempt
-// that reports whether a frame came back. On macOS it never calls
-// ScreenCaptureKit (#8058); see CaptureProbeOptions.
-func ProbeCaptureAccess(config CaptureConfig) (bool, error) {
-	report, err := ProbeCapture(config, CaptureProbeOptions{})
-	return report.Granted, err
-}
-
 // ProbeCapture performs a real capture attempt and reports which backend, if
-// any, produced a frame.
+// any, produced a frame. Only the CLI probe calls it: the helper's permission
+// checks use CheckCaptureAccess, which never captures (#8390).
 //
 // By default that is a single attempt with the backend NewScreenCapturer
 // selects. A platform can install platformCaptureProbePlan to choose the
@@ -236,6 +229,37 @@ type lastCaptureErrorReporter interface {
 	// LastCaptureError returns the most recent error the capturer reported as a
 	// nil frame, or nil if it has not swallowed one.
 	LastCaptureError() error
+}
+
+// captureWarningReporter is implemented by capturers that can deliver frames
+// they cannot vouch for: the Windows GDI capturer, when its thread could not
+// confirm it was on the input desktop, so a frame may be black or show the
+// wrong desktop (#8434). That is not a capture failure, and it is kept apart
+// from LastCaptureError on purpose: the no-video stop reason and the startup
+// probe read LastCaptureError to say why frames stopped, and frames that are
+// still arriving are not that.
+type captureWarningReporter interface {
+	// CaptureWarning returns why the frames being delivered may be wrong, or
+	// nil once a frame is clean.
+	CaptureWarning() error
+}
+
+// captureWarningText returns capturer's current CaptureWarning text, or ""
+// when it has none, does not implement captureWarningReporter, or is nil. The
+// periodic metrics line carries it, so a technician looking at a black picture
+// can find the reason in Agent Logs while the session runs.
+func captureWarningText(capturer ScreenCapturer) string {
+	if capturer == nil {
+		return ""
+	}
+	reporter, ok := capturer.(captureWarningReporter)
+	if !ok {
+		return ""
+	}
+	if warning := reporter.CaptureWarning(); warning != nil {
+		return warning.Error()
+	}
+	return ""
 }
 
 // describeCaptureFailure augments a probe failure with the last error the
